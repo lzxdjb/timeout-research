@@ -18,11 +18,13 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
 import json
 import os
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pprint import pprint
 from typing import Any, Optional
 
@@ -49,6 +51,11 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.swe_image_prefetch import (
+    _SWETrainingImagePrefetcher,
+    _SWEValidationImagePrefetcher,
+    _validate_swe_training_prefetch_modes,
+)
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
@@ -73,6 +80,29 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def _get_validation_metric_sources(non_tensor_batch: dict, batch_size: int) -> np.ndarray:
+    """Use dataset-specific metric labels without changing reward dispatch labels."""
+    fallback = np.asarray(
+        non_tensor_batch.get("data_source", ["unknown"] * batch_size),
+        dtype=object,
+    )
+    metric_sources = non_tensor_batch.get("metric_data_source")
+    if metric_sources is None:
+        return fallback
+
+    metric_sources = np.asarray(metric_sources, dtype=object)
+    if metric_sources.shape != fallback.shape:
+        return fallback
+
+    return np.asarray(
+        [
+            metric if metric not in (None, "") else source
+            for metric, source in zip(metric_sources, fallback, strict=True)
+        ],
+        dtype=object,
+    )
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -237,14 +267,19 @@ def compute_advantage(
         grpo_calculation_mask = data.batch["response_mask"]
 
         # Call compute_grpo_outcome_advantage with parameters matching its definition
+        grpo_metrics: dict[str, float] = {}
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+            diagnostics=grpo_metrics,
+            expected_group_size=num_repeat if num_repeat > 1 else None,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        data.meta_info["grpo_metrics"] = grpo_metrics
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -280,6 +315,346 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     return data
+
+
+def _apply_per_sample_infrastructure_filter(data: DataProto) -> dict[str, float]:
+    """Mask infrastructure-failed PPO samples without removing rollout rows.
+
+    PPO uses one response per prompt, so the GRPO prompt-group evidence
+    threshold is not applicable.  Keep every row for diagnostics and rollout
+    dumps, but mask failed rows out of both actor and critic losses.
+    """
+    batch_size = len(data.batch)
+    enabled = _task_filter_enabled()
+    infra_values = np.asarray(
+        data.non_tensor_batch.get("infrastructure_failure", np.full(batch_size, np.nan, dtype=object)),
+        dtype=object,
+    ).reshape(-1)
+    code_values = np.asarray(
+        data.non_tensor_batch.get("infrastructure_failure_code", np.full(batch_size, np.nan, dtype=object)),
+        dtype=object,
+    ).reshape(-1)
+    if len(infra_values) != batch_size or len(code_values) != batch_size:
+        raise ValueError("Infrastructure-filter metadata length does not match training batch size")
+
+    def as_int(value: Any) -> int | None:
+        try:
+            if value is None or (isinstance(value, float) and not np.isfinite(value)):
+                return None
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    excluded = np.zeros(batch_size, dtype=np.int8)
+    for index in range(batch_size):
+        is_failure = as_int(infra_values[index]) == 1
+        if enabled and is_failure:
+            excluded[index] = 1
+
+    keep = excluded == 0
+    data.batch["train_sample_mask"] = torch.as_tensor(keep, dtype=torch.bool)
+    data.non_tensor_batch["task_filter_excluded"] = excluded
+    data.non_tensor_batch["task_filter_ratio"] = excluded.astype(np.float32)
+    data.non_tensor_batch["task_filter_failure_count"] = excluded.astype(np.int32)
+    all_excluded = bool(batch_size > 0 and not keep.any())
+    data.meta_info["task_filter_all_excluded"] = all_excluded
+    uid_values = data.non_tensor_batch.get("uid", np.arange(batch_size))
+    active_groups = len({uid_values[index] for index in range(batch_size) if keep[index]})
+    active_tokens = int((data.batch["response_mask"] * data.batch["train_sample_mask"].unsqueeze(-1)).sum().item())
+    total_tokens = int(data.batch["response_mask"].sum().item())
+    return {
+        "task_filter/enabled": float(enabled),
+        "task_filter/mode_per_sample": 1.0,
+        "task_filter/groups_seen": float(len(set(uid_values))),
+        "task_filter/groups_with_sufficient_evidence": 0.0,
+        "task_filter/groups_excluded": float(len({uid_values[index] for index in range(batch_size) if excluded[index]})),
+        "task_filter/trajectories_excluded": float(excluded.sum()),
+        "task_filter/active_group_count": float(active_groups),
+        "task_filter/active_token_fraction": float(active_tokens / total_tokens) if total_tokens else 0.0,
+        "task_filter/all_groups_excluded": float(all_excluded),
+        "task_filter/queue_failures_included": 1.0,
+    }
+
+
+def apply_training_task_filter(
+    data: DataProto,
+    *,
+    per_sample_infrastructure_filter: bool = False,
+) -> dict[str, float]:
+    """Build a per-step loss mask from infrastructure failures.
+
+    Filtering is deliberately prompt-group scoped and non-destructive: all
+    rollout rows remain in ``data`` for diagnostics, while excluded groups get
+    ``train_sample_mask=0`` and therefore contribute no actor/critic loss.
+    """
+    if per_sample_infrastructure_filter:
+        return _apply_per_sample_infrastructure_filter(data)
+
+    enabled = _task_filter_enabled()
+    batch_size = len(data.batch)
+    keep = np.ones(batch_size, dtype=np.bool_)
+    if not enabled or batch_size == 0 or "uid" not in data.non_tensor_batch:
+        group_count = (
+            len(set(data.non_tensor_batch["uid"]))
+            if batch_size and "uid" in data.non_tensor_batch
+            else 0
+        )
+        data.batch["train_sample_mask"] = torch.ones(batch_size, dtype=torch.bool)
+        data.non_tensor_batch["task_filter_excluded"] = np.zeros(batch_size, dtype=np.int8)
+        data.non_tensor_batch["task_filter_ratio"] = np.zeros(batch_size, dtype=np.float32)
+        data.non_tensor_batch["task_filter_failure_count"] = np.zeros(batch_size, dtype=np.int32)
+        data.meta_info["task_filter_all_excluded"] = False
+        return {
+            "task_filter/enabled": float(enabled),
+            "task_filter/groups_seen": float(group_count),
+            "task_filter/groups_excluded": 0.0,
+            "task_filter/trajectories_excluded": 0.0,
+            "task_filter/active_group_count": float(group_count),
+            "task_filter/active_token_fraction": 1.0,
+            "task_filter/all_groups_excluded": 0.0,
+        }
+
+    try:
+        threshold = float(os.getenv("SWE_AGENT_TASK_FILTER_INFRA_RATIO_THRESHOLD", "0.25"))
+    except ValueError as exc:
+        raise ValueError("SWE_AGENT_TASK_FILTER_INFRA_RATIO_THRESHOLD must be numeric") from exc
+    try:
+        min_attempts = max(1, int(os.getenv("SWE_AGENT_TASK_FILTER_MIN_GROUP_ATTEMPTS", "8")))
+    except ValueError as exc:
+        raise ValueError("SWE_AGENT_TASK_FILTER_MIN_GROUP_ATTEMPTS must be an integer") from exc
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("SWE_AGENT_TASK_FILTER_INFRA_RATIO_THRESHOLD must be between 0 and 1")
+    include_queue = os.getenv("SWE_AGENT_TASK_FILTER_INCLUDE_QUEUE_FAILURES", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    infra_values = data.non_tensor_batch.get("infrastructure_failure")
+    code_values = data.non_tensor_batch.get("infrastructure_failure_code")
+    if infra_values is None:
+        infra_values = np.full(batch_size, np.nan, dtype=np.float32)
+    else:
+        infra_values = np.asarray(infra_values, dtype=object).reshape(-1)
+    if code_values is None:
+        code_values = np.full(batch_size, np.nan, dtype=np.float32)
+    else:
+        code_values = np.asarray(code_values, dtype=object).reshape(-1)
+    if len(infra_values) != batch_size or len(code_values) != batch_size:
+        raise ValueError("Task filter metadata length does not match training batch size")
+
+    def as_int(value: Any) -> int | None:
+        try:
+            if value is None or (isinstance(value, float) and not np.isfinite(value)):
+                return None
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    groups: dict[Any, list[int]] = defaultdict(list)
+    for position, uid in enumerate(data.non_tensor_batch["uid"]):
+        groups[uid].append(position)
+
+    excluded = np.zeros(batch_size, dtype=np.int8)
+    ratios = np.zeros(batch_size, dtype=np.float32)
+    failure_counts = np.zeros(batch_size, dtype=np.int32)
+    excluded_groups = 0
+    classified_groups = 0
+    for uid, positions in groups.items():
+        classified = [(index, as_int(infra_values[index]), as_int(code_values[index])) for index in positions]
+        classified = [item for item in classified if item[1] in (0, 1)]
+        if len(classified) < min_attempts:
+            continue
+        classified_groups += 1
+        failures = 0
+        for _index, is_failure, code in classified:
+            if not is_failure:
+                continue
+            if code == 1 and not include_queue:
+                continue
+            failures += 1
+        ratio = failures / len(classified)
+        for index in positions:
+            ratios[index] = ratio
+            failure_counts[index] = failures
+        if ratio > threshold:
+            excluded_groups += 1
+            for index in positions:
+                keep[index] = False
+                excluded[index] = 1
+
+    data.batch["train_sample_mask"] = torch.as_tensor(keep, dtype=torch.bool)
+    data.non_tensor_batch["task_filter_excluded"] = excluded
+    data.non_tensor_batch["task_filter_ratio"] = ratios
+    data.non_tensor_batch["task_filter_failure_count"] = failure_counts
+    all_excluded = bool(excluded_groups > 0 and not keep.any())
+    active_groups = sum(1 for uid, positions in groups.items() if keep[positions[0]])
+    active_tokens = int((data.batch["response_mask"] * data.batch["train_sample_mask"].unsqueeze(-1)).sum().item())
+    total_tokens = int(data.batch["response_mask"].sum().item())
+    data.meta_info["task_filter_all_excluded"] = all_excluded
+    return {
+        "task_filter/enabled": 1.0,
+        "task_filter/groups_seen": float(len(groups)),
+        "task_filter/groups_with_sufficient_evidence": float(classified_groups),
+        "task_filter/groups_excluded": float(excluded_groups),
+        "task_filter/trajectories_excluded": float(excluded.sum()),
+        "task_filter/active_group_count": float(active_groups),
+        "task_filter/active_token_fraction": float(active_tokens / total_tokens) if total_tokens else 0.0,
+        "task_filter/all_groups_excluded": float(all_excluded),
+        "task_filter/threshold": threshold,
+        "task_filter/min_group_attempts": float(min_attempts),
+        "task_filter/queue_failures_included": float(include_queue),
+    }
+
+
+def _task_filter_enabled() -> bool:
+    return os.getenv("SWE_AGENT_TASK_FILTER_TRAINING_ENABLED", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _grpo_checks_enabled() -> bool:
+    return os.getenv("VERL_GRPO_INVARIANT_CHECK", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def _validate_grpo_response_batch(data: DataProto, reward_tensor: Any) -> dict[str, float]:
+    responses = data.batch.get("responses")
+    response_mask = data.batch.get("response_mask")
+    attention_mask = data.batch.get("attention_mask")
+    if not all(isinstance(value, torch.Tensor) for value in (responses, response_mask, attention_mask)):
+        raise TypeError("GRPO requires tensor responses, response_mask, and attention_mask")
+    if response_mask.shape != responses.shape:
+        raise ValueError(
+            f"GRPO response_mask shape {tuple(response_mask.shape)} does not match responses {tuple(responses.shape)}"
+        )
+    response_width = responses.shape[1]
+    response_attention = attention_mask[:, -response_width:] if response_width else attention_mask[:, :0]
+    if response_attention.shape != response_mask.shape:
+        raise ValueError(
+            "GRPO response attention shape does not match response_mask: "
+            f"attention={tuple(response_attention.shape)}, mask={tuple(response_mask.shape)}"
+        )
+
+    binary_mask = (response_mask == 0) | (response_mask == 1)
+    nonbinary_count = int((~binary_mask).sum().item())
+    if nonbinary_count:
+        raise ValueError(
+            "GRPO response_mask must be binary before log-probability computation: "
+            f"invalid_count={nonbinary_count}, min={response_mask.min().item()}, max={response_mask.max().item()}"
+        )
+    binary_attention = (response_attention == 0) | (response_attention == 1)
+    if not binary_attention.all():
+        invalid_count = int((~binary_attention).sum().item())
+        raise ValueError(f"GRPO response attention mask must be binary: invalid_count={invalid_count}")
+    outside_attention = (response_mask == 1) & (response_attention == 0)
+    if outside_attention.any():
+        raise ValueError(
+            "GRPO response_mask contains active tokens outside response attention: "
+            f"invalid_count={int(outside_attention.sum().item())}"
+        )
+    if not isinstance(reward_tensor, torch.Tensor) or reward_tensor.shape != response_mask.shape:
+        reward_shape = (
+            tuple(reward_tensor.shape) if isinstance(reward_tensor, torch.Tensor) else type(reward_tensor).__name__
+        )
+        raise ValueError(
+            f"GRPO reward tensor must match response_mask shape {tuple(response_mask.shape)}, got {reward_shape}"
+        )
+    if not torch.isfinite(reward_tensor).all():
+        raise FloatingPointError("GRPO reward tensor contains non-finite values")
+
+    response_token_counts = response_attention.sum(dim=-1)
+    generated_token_counts = response_mask.sum(dim=-1)
+    sequence_rewards = reward_tensor.sum(dim=-1)
+    empty_responses = response_token_counts == 0
+    invalid_empty_rewards = empty_responses & (sequence_rewards != 0)
+    if invalid_empty_rewards.any():
+        invalid_rows = torch.nonzero(invalid_empty_rewards, as_tuple=False).flatten().tolist()
+        raise ValueError(f"GRPO found nonzero rewards on empty responses: rows={invalid_rows[:32]}")
+
+    return {
+        "grpo/nonbinary_mask_tokens": 0.0,
+        "grpo/response_mask_active_tokens": float(generated_token_counts.sum().item()),
+        "grpo/zero_generation_trajectories": float((generated_token_counts == 0).sum().item()),
+        "grpo/empty_response_trajectories": float(empty_responses.sum().item()),
+    }
+
+
+def _compact_tensor_fingerprint(tensor: Any) -> tuple[str, dict[str, Any]]:
+    if not isinstance(tensor, torch.Tensor):
+        value_type = type(tensor).__name__
+        return f"non-tensor:{value_type}", {"type": value_type}
+
+    detached = tensor.detach()
+    if detached.ndim > 1:
+        compact = detached.reshape(detached.shape[0], -1).sum(dim=-1, dtype=torch.float64)
+    else:
+        compact = detached.to(dtype=torch.float64)
+    compact_cpu = compact.to(device="cpu").contiguous()
+    digest = hashlib.sha256(compact_cpu.numpy().tobytes()).hexdigest()[:16]
+    finite = torch.isfinite(compact_cpu)
+    summary: dict[str, Any] = {
+        "shape": tuple(detached.shape),
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+        "finite": bool(finite.all()),
+    }
+    if compact_cpu.numel():
+        summary.update(
+            {
+                "min": float(compact_cpu.min().item()),
+                "max": float(compact_cpu.max().item()),
+                "sum": float(compact_cpu.sum().item()),
+            }
+        )
+    return digest, summary
+
+
+def _uid_fingerprint(uid: Any) -> tuple[str, dict[str, Any]]:
+    values = np.asarray(uid, dtype=object).reshape(-1).tolist()
+    encoded = "\n".join(f"{type(value).__name__}:{value!r}" for value in values).encode(
+        "utf-8", errors="backslashreplace"
+    )
+    return hashlib.sha256(encoded).hexdigest()[:16], {"count": len(values)}
+
+
+def _capture_grpo_boundary(data: DataProto, reward_tensor: Any = None) -> dict[str, Any]:
+    rewards = reward_tensor if reward_tensor is not None else data.batch.get("token_level_scores")
+    reward_fingerprint, reward_summary = _compact_tensor_fingerprint(rewards)
+    mask_fingerprint, mask_summary = _compact_tensor_fingerprint(data.batch.get("response_mask"))
+    uid_fingerprint, uid_summary = _uid_fingerprint(data.non_tensor_batch.get("uid", []))
+    return {
+        "reward": reward_fingerprint,
+        "uid": uid_fingerprint,
+        "response_mask": mask_fingerprint,
+        "summary": {"reward": reward_summary, "uid": uid_summary, "response_mask": mask_summary},
+    }
+
+
+def _check_grpo_boundary(
+    stage: str,
+    snapshot: dict[str, Any],
+    baseline: dict[str, Any],
+    metrics: dict[str, Any],
+) -> None:
+    changed_fields = [key for key in ("reward", "uid", "response_mask") if snapshot[key] != baseline[key]]
+    changed = bool(changed_fields)
+    metrics[f"grpo/boundary_{stage}_changed"] = float(changed)
+    metrics["grpo/boundary_mutations"] = metrics.get("grpo/boundary_mutations", 0.0) + float(changed)
+
+    diagnostic_log = os.getenv("VERL_GRPO_DIAGNOSTICS", "0").strip().lower() not in {"0", "false", "no"}
+    if diagnostic_log:
+        print(
+            f"[GRPO boundary] stage={stage} changed={changed_fields or 'none'} "
+            f"reward={snapshot['reward']} uid={snapshot['uid']} mask={snapshot['response_mask']} "
+            f"summary={snapshot['summary']}",
+            flush=True,
+        )
+    if changed and os.getenv("VERL_GRPO_INVALID_GROUP_POLICY", "zero").strip().lower() == "raise":
+        raise RuntimeError(f"GRPO inputs changed at boundary {stage}: {', '.join(changed_fields)}")
 
 
 @deprecated("Legacy trainer is deprecated, and wil be removed in v0.9.0. Please use `trainer.use_v1=True` instead.")
@@ -367,9 +742,39 @@ class RayPPOTrainer:
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        _validate_swe_training_prefetch_modes()
+        self._swe_training_image_prefetcher = _SWETrainingImagePrefetcher()
+        self._swe_validation_image_prefetcher = _SWEValidationImagePrefetcher()
+        self._dataloader_state_dict_override = None
 
         self.checkpoint_manager = None
         self._init_dump_executor()
+
+    @staticmethod
+    def _iter_batches_with_lookahead(dataloader, *, enabled: bool, capture_state: bool = False):
+        if not enabled:
+            for current in dataloader:
+                yield current, None, None
+            return
+        iterator = iter(dataloader)
+        try:
+            current = next(iterator)
+        except StopIteration:
+            return
+        while True:
+            state_after_current = deepcopy(dataloader.state_dict()) if capture_state else None
+            try:
+                following = next(iterator)
+            except StopIteration:
+                following = None
+            yield current, following, state_after_current
+            if following is None:
+                return
+            current = following
+
+    def _close_swe_prefetchers(self) -> None:
+        self._swe_training_image_prefetcher.close()
+        self._swe_validation_image_prefetcher.close()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -535,6 +940,11 @@ class RayPPOTrainer:
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+            if "uid" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump.setdefault(
+                    "uid",
+                    batch.non_tensor_batch["uid"].tolist(),
+                )
 
             self._dump_generations(
                 inputs=inputs,
@@ -544,6 +954,128 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    def _write_task_filter_decisions(self, batch: DataProto, step: int) -> None:
+        """Persist one JSONL decision per prompt group for reproducible filtering."""
+        if not _task_filter_enabled() or "task_filter_excluded" not in batch.non_tensor_batch:
+            return
+        configured_dir = os.getenv("SWE_AGENT_TASK_FILTER_REPORT_DIR")
+        if configured_dir:
+            output_dir = configured_dir
+        else:
+            rollout_dir = self.config.trainer.get("rollout_data_dir", None)
+            output_dir = os.path.join(
+                rollout_dir or self.config.trainer.default_local_dir,
+                "task_filter",
+            )
+        os.makedirs(output_dir, exist_ok=True)
+        uid_values = list(batch.non_tensor_batch.get("uid", []))
+        excluded_values = np.asarray(batch.non_tensor_batch["task_filter_excluded"]).reshape(-1)
+        ratio_values = np.asarray(batch.non_tensor_batch.get("task_filter_ratio", np.zeros(len(uid_values))))
+        failure_values = np.asarray(
+            batch.non_tensor_batch.get("task_filter_failure_count", np.zeros(len(uid_values)))
+        )
+        code_values = np.asarray(
+            batch.non_tensor_batch.get("infrastructure_failure_code", np.zeros(len(uid_values))), dtype=object
+        )
+        task_values = np.asarray(batch.non_tensor_batch.get("task_id", [""] * len(uid_values)), dtype=object)
+        records = []
+        seen: set[Any] = set()
+        for index, uid in enumerate(uid_values):
+            if uid in seen:
+                continue
+            seen.add(uid)
+            try:
+                failure_code = int(code_values[index])
+            except (TypeError, ValueError, OverflowError):
+                failure_code = None
+            records.append(
+                {
+                    "step": int(step),
+                    "uid": str(uid),
+                    "task_id": str(task_values[index]) if index < len(task_values) else "",
+                    "group_size": int(sum(group_uid == uid for group_uid in uid_values)),
+                    "infrastructure_failures": int(failure_values[index]),
+                    "infrastructure_failure_code": failure_code,
+                    "infrastructure_ratio": float(ratio_values[index]),
+                    "excluded": bool(excluded_values[index]),
+                }
+            )
+        report_path = os.path.join(output_dir, "training_task_filter_decisions.jsonl")
+        with open(report_path, "a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+
+    def _write_trajectory_diagnostic_records(
+        self,
+        non_tensor_batch: dict[str, Any],
+        *,
+        step: int,
+        phase: str,
+    ) -> None:
+        """Write compact per-trajectory diagnostics without tool transcripts."""
+        enabled = os.getenv("SWE_AGENT_DIAGNOSTIC_REPORT_ENABLED", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not enabled:
+            return
+        uid_values = non_tensor_batch.get("uid", [])
+        count = len(uid_values)
+        if count == 0:
+            return
+        configured_dir = os.getenv("SWE_AGENT_DIAGNOSTIC_REPORT_DIR")
+        output_dir = configured_dir or os.path.join(self.config.trainer.default_local_dir, "diagnostics")
+        os.makedirs(output_dir, exist_ok=True)
+        fields = (
+            "task_id", "observed_infrastructure_failure", "observed_infrastructure_failure_reason",
+            "observed_infrastructure_failure_code", "verification_status",
+            "oom_killed", "oom_event_count", "oom_memory_limit_bytes", "oom_peak_memory_bytes", "oom_exit_code",
+            "raw_score", "shaped_score", "infra_raw_score", "infra_shaped_score",
+            "noninfra_raw_score", "noninfra_shaped_score", "infra_trajectory_seconds",
+            "noninfra_trajectory_seconds", "verification_attempt_count",
+            "verification_total_seconds", "verification_time_fraction", "verification_meaningful",
+            "verification_fresh", "verification_invalidated", "submission_signal_seen",
+            "submission_after_fresh_verification", "trajectory_elapsed_seconds", "trajectory_timeout",
+            "trajectory_max_turn", "trajectory_response_length_limit", "trajectory_terminal_tool_failure",
+            "public_patch_changed_files", "public_patch_changed_bytes", "public_patch_added_lines",
+            "public_patch_deleted_lines", "public_verification_tests_executed",
+            "public_verification_tests_passed", "public_verification_test_pass_rate", "hidden_patch_valid",
+            "hidden_tests_started", "hidden_failure_phase", "hidden_failure_phase_code", "hidden_pass",
+            "diagnostic_outcome_code",
+            "task_filter_excluded",
+        )
+
+        def item_at(name: str, index: int) -> Any:
+            source = non_tensor_batch.get(name)
+            if source is None:
+                return None
+            try:
+                value = source[index]
+            except (IndexError, KeyError, TypeError):
+                return None
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, torch.Tensor):
+                return value.item() if value.ndim == 0 else value.tolist()
+            return value
+
+        report_path = os.path.join(output_dir, "trajectory_diagnostics.jsonl")
+        with open(report_path, "a", encoding="utf-8") as handle:
+            for index in range(count):
+                record = {
+                    "schema_version": 1,
+                    "phase": phase,
+                    "step": int(step),
+                    "uid": str(item_at("uid", index) or ""),
+                }
+                for field in fields:
+                    value = item_at(field, index)
+                    if value is not None:
+                        record[field] = value
+                handle.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -605,7 +1137,24 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
 
-        for test_data in self.val_dataloader:
+        validation_prefetcher = self._swe_validation_image_prefetcher
+        for batch_index, (test_data, next_test_data, _) in enumerate(
+            self._iter_batches_with_lookahead(
+                self.val_dataloader,
+                enabled=validation_prefetcher.enabled and validation_prefetcher.lookahead_batches > 0,
+            )
+        ):
+            validation_prefetcher.advance_batch(batch_index)
+            validation_prefetcher.submit_batch(
+                test_data, batch_index=batch_index, label=f"validation-{batch_index}"
+            )
+            if next_test_data is not None and validation_prefetcher.lookahead_batches > 0:
+                validation_prefetcher.submit_batch(
+                    next_test_data,
+                    batch_index=batch_index + 1,
+                    label=f"validation-{batch_index + 1}",
+                )
+            validation_prefetcher.raise_completed_errors()
             test_batch = DataProto.from_single_dict(test_data)
 
             if "uid" not in test_batch.non_tensor_batch:
@@ -688,8 +1237,18 @@ class RayPPOTrainer:
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            data_source_lst.append(
+                _get_validation_metric_sources(test_batch.non_tensor_batch, reward_tensor.shape[0])
+            )
 
+        validation_prefetcher.raise_completed_errors()
+        validation_diagnostics = dict(reward_extra_infos_dict)
+        validation_diagnostics["uid"] = sample_uids
+        self._write_trajectory_diagnostic_records(
+            validation_diagnostics,
+            step=self.global_steps,
+            phase="validation",
+        )
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump generations
@@ -1030,7 +1589,7 @@ class RayPPOTrainer:
         # save dataloader
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
-        dataloader_state_dict = self.train_dataloader.state_dict()
+        dataloader_state_dict = self._dataloader_state_dict_override or self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
@@ -1326,6 +1885,12 @@ class RayPPOTrainer:
             )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        active_sample_count = (
+            int(batch.batch["train_sample_mask"].sum().item())
+            if "train_sample_mask" in batch.batch
+            else ppo_mini_batch_size
+        )
+        effective_global_batch_size = max(1, active_sample_count)
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
@@ -1334,7 +1899,7 @@ class RayPPOTrainer:
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
             distillation_only=distillation_only,
-            global_batch_size=ppo_mini_batch_size,
+            global_batch_size=effective_global_batch_size,
             mini_batch_size=ppo_mini_batch_size,
             epochs=ppo_epochs,
             seed=seed,
@@ -1356,12 +1921,18 @@ class RayPPOTrainer:
         batch_td = left_right_2_no_padding(batch_td)
         ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        active_sample_count = (
+            int(batch.batch["train_sample_mask"].sum().item())
+            if "train_sample_mask" in batch.batch
+            else ppo_mini_batch_size
+        )
+        effective_global_batch_size = max(1, active_sample_count)
         ppo_epochs = self.config.critic.ppo_epochs
         seed = self.config.critic.data_loader_seed
         shuffle = self.config.critic.shuffle
         tu.assign_non_tensor(
             batch_td,
-            global_batch_size=ppo_mini_batch_size,
+            global_batch_size=effective_global_batch_size,
             mini_batch_size=ppo_mini_batch_size,
             epochs=ppo_epochs,
             seed=seed,
@@ -1416,6 +1987,7 @@ class RayPPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._close_swe_prefetchers()
                 self._shutdown_dump_executor()
                 return
 
@@ -1437,8 +2009,26 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        training_prefetcher = self._swe_training_image_prefetcher
+        training_lookahead = training_prefetcher.enabled and training_prefetcher.lookahead_batches > 0
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for batch_dict, next_batch_dict, state_after_current in self._iter_batches_with_lookahead(
+                self.train_dataloader,
+                enabled=training_lookahead,
+                capture_state=training_lookahead,
+            ):
+                self._dataloader_state_dict_override = state_after_current
+                training_prefetcher.advance_batch(self.global_steps)
+                training_prefetcher.submit_batch(
+                    batch_dict, batch_index=self.global_steps, label=f"step-{self.global_steps}"
+                )
+                if next_batch_dict is not None and training_prefetcher.lookahead_batches > 0:
+                    training_prefetcher.submit_batch(
+                        next_batch_dict,
+                        batch_index=self.global_steps + 1,
+                        label=f"step-{self.global_steps + 1}",
+                    )
+                training_prefetcher.raise_completed_errors()
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -1542,6 +2132,21 @@ class RayPPOTrainer:
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
+                    grpo_boundary_baseline = None
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO:
+                        metrics.update(_validate_grpo_response_batch(batch, reward_tensor))
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO and _grpo_checks_enabled():
+                        grpo_boundary_baseline = _capture_grpo_boundary(batch, reward_tensor=reward_tensor)
+                        _check_grpo_boundary(
+                            "reward_extraction", grpo_boundary_baseline, grpo_boundary_baseline, metrics
+                        )
+                        _check_grpo_boundary(
+                            "before_old_log_prob",
+                            _capture_grpo_boundary(batch, reward_tensor=reward_tensor),
+                            grpo_boundary_baseline,
+                            metrics,
+                        )
+
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1590,6 +2195,13 @@ class RayPPOTrainer:
                                 metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    if grpo_boundary_baseline is not None:
+                        _check_grpo_boundary(
+                            "after_old_log_prob",
+                            _capture_grpo_boundary(batch, reward_tensor=reward_tensor),
+                            grpo_boundary_baseline,
+                            metrics,
+                        )
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
@@ -1603,6 +2215,13 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
+                        if grpo_boundary_baseline is not None:
+                            _check_grpo_boundary(
+                                "before_advantage",
+                                _capture_grpo_boundary(batch, reward_tensor=reward_tensor),
+                                grpo_boundary_baseline,
+                                metrics,
+                            )
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         batch.batch["token_level_scores"] = reward_tensor
@@ -1634,6 +2253,24 @@ class RayPPOTrainer:
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
+                        task_filter_metrics = apply_training_task_filter(
+                            batch,
+                            per_sample_infrastructure_filter=(
+                                self.config.algorithm.adv_estimator == AdvantageEstimator.GAE
+                                and int(self.config.actor_rollout_ref.rollout.n) == 1
+                            ),
+                        )
+                        metrics.update(task_filter_metrics)
+                        for key in ("task_filter_excluded", "task_filter_ratio", "task_filter_failure_count"):
+                            if key in batch.non_tensor_batch:
+                                reward_extra_infos_dict[key] = batch.non_tensor_batch[key].tolist()
+                        self._write_task_filter_decisions(batch, self.global_steps)
+                        self._write_trajectory_diagnostic_records(
+                            batch.non_tensor_batch,
+                            step=self.global_steps,
+                            phase="training",
+                        )
+
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
@@ -1648,21 +2285,41 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        metrics.update(batch.meta_info.pop("grpo_metrics", {}))
+                        if grpo_boundary_baseline is not None:
+                            _check_grpo_boundary(
+                                "after_advantage",
+                                _capture_grpo_boundary(batch),
+                                grpo_boundary_baseline,
+                                metrics,
+                            )
                     # update critic
-                    if self.use_critic:
+                    task_filter_all_excluded = bool(batch.meta_info.get("task_filter_all_excluded", False))
+                    if self.use_critic and not task_filter_all_excluded:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
+                    elif self.use_critic and task_filter_all_excluded:
+                        metrics["task_filter/critic_update_skipped"] = 1.0
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup > self.global_steps:
+                    if task_filter_all_excluded:
+                        metrics["task_filter/actor_update_skipped"] = 1.0
+                    elif self.config.trainer.critic_warmup > self.global_steps:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
                         self.checkpoint_manager.update_weights(self.global_steps)
                     else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+                        if grpo_boundary_baseline is not None:
+                            _check_grpo_boundary(
+                                "after_actor_update",
+                                _capture_grpo_boundary(batch),
+                                grpo_boundary_baseline,
+                                metrics,
+                            )
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -1772,6 +2429,7 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    self._close_swe_prefetchers()
                     self._shutdown_dump_executor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
@@ -1784,4 +2442,5 @@ class RayPPOTrainer:
                     self.train_dataset.on_batch_end(batch=batch)
 
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
+        self._close_swe_prefetchers()
         self._shutdown_dump_executor()

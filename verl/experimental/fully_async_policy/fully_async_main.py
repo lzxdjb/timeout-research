@@ -215,6 +215,10 @@ class FullyAsyncTaskRunner:
                 ray.cancel(future)
             raise
         finally:
+            try:
+                ray.get(self.components["rollouter"].close_swe_prefetchers.remote())
+            except Exception as e:
+                print(f"[ASYNC MAIN] Failed to close SWE prefetchers cleanly: {e}")
             asyncio.run(self.components["message_queue_client"].clear_queue())
             print("[ASYNC MAIN] Training completed or interrupted")
 

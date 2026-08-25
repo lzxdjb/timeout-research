@@ -929,9 +929,51 @@ class DataProto:
             batch_lst.append(batch.batch)
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
 
-        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
-        for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
+        # Optional non-tensor fields can differ across rollout shards. Preserve
+        # their row alignment by padding shards that did not produce a field.
+        non_tensor_dicts = [d.non_tensor_batch or {} for d in data]
+        all_non_tensor_keys = dict.fromkeys(key for non_tensor in non_tensor_dicts for key in non_tensor)
+        non_tensor_batch = {}
+
+        def as_non_tensor_array(key: str, values: Any) -> np.ndarray:
+            if isinstance(values, np.ndarray):
+                array = values
+            elif isinstance(values, list | tuple):
+                array = np.asarray(values)
+            else:
+                raise TypeError(
+                    f"non-tensor key '{key}' must be a numpy array, list, or tuple; got {type(values).__name__}"
+                )
+            if array.ndim == 0:
+                raise ValueError(f"non-tensor key '{key}' must have a batch dimension")
+            return array
+
+        for key in all_non_tensor_keys:
+            template = as_non_tensor_array(
+                key,
+                next(non_tensor[key] for non_tensor in non_tensor_dicts if key in non_tensor),
+            )
+            tail_shape = template.shape[1:]
+            parts = []
+            for shard, non_tensor in zip(data, non_tensor_dicts, strict=True):
+                if key not in non_tensor:
+                    missing = np.full((len(shard), *tail_shape), None, dtype=object)
+                    parts.append(missing)
+                    continue
+
+                values = as_non_tensor_array(key, non_tensor[key])
+                if len(values) != len(shard):
+                    raise ValueError(
+                        f"non-tensor key '{key}' has {len(values)} rows, expected {len(shard)} for its shard"
+                    )
+                if values.shape[1:] != tail_shape:
+                    raise ValueError(
+                        f"non-tensor key '{key}' has incompatible trailing shape {values.shape[1:]}; "
+                        f"expected {tail_shape}"
+                    )
+                parts.append(values)
+
+            non_tensor_batch[key] = np.concatenate(parts, axis=0)
 
         # Merge meta_info with special handling for metrics
         merged_meta_info = {}
@@ -948,6 +990,14 @@ class DataProto:
                                 all_metrics.append(v)
                     else:
                         if k in merged_meta_info:
+                            if k == "reward_extra_keys":
+                                # This is a schema descriptor, not a scalar
+                                # config value.  Equivalent key sets may have
+                                # arrived in different orders from workers.
+                                merged_keys = set(merged_meta_info[k] or [])
+                                merged_keys.update(v or [])
+                                merged_meta_info[k] = sorted(merged_keys)
+                                continue
                             # Ensure consistency for overlapping non-metric keys
                             assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
                         else:

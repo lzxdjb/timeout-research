@@ -28,6 +28,7 @@ from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
     assemble_batch_from_rollout_samples,
+    is_known_param_version,
 )
 from verl.experimental.fully_async_policy.dynamic_schedule import DynamicScheduleContext
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
@@ -1036,7 +1037,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """
         if hasattr(batch, "meta_info") and batch.meta_info:
             trajectory_param_versions = batch.meta_info["trajectory_param_versions"]
-            stale_traj_count = sum(1 for v in trajectory_param_versions if self.current_param_version - v >= 1)
+            stale_traj_count = sum(
+                1
+                for version in trajectory_param_versions
+                if is_known_param_version(version) and self.current_param_version - version >= 1
+            )
             self.stale_trajectory_processed += stale_traj_count
             metrics.update(
                 {

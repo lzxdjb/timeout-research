@@ -280,6 +280,104 @@ def test_grpo_vectorized_matches_original_for_low_variance_rewards():
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
 
 
+def test_grpo_full_length_sparse_binary_rewards_are_bounded_and_do_not_mutate_inputs():
+    batch_size, response_length, group_size = 32, 40_000, 8
+    token_level_rewards = torch.zeros(batch_size, response_length, dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    token_level_rewards[::group_size, -1] = 1.0
+    index = np.array([f"prompt-{i // group_size}" for i in range(batch_size)], dtype=object)
+    original_rewards = token_level_rewards.clone()
+    original_mask = response_mask.clone()
+    diagnostics = {}
+
+    advantages, returns = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        diagnostics=diagnostics,
+    )
+
+    expected_bound = (group_size - 1) / np.sqrt(group_size)
+    assert torch.isfinite(advantages).all()
+    assert advantages.abs().max().item() <= expected_bound + 1e-5
+    assert returns.data_ptr() == advantages.data_ptr()
+    assert torch.equal(token_level_rewards, original_rewards)
+    assert torch.equal(response_mask, original_mask)
+    assert diagnostics["grpo/mixed_groups"] == batch_size / group_size
+    assert diagnostics["grpo/invalid_groups"] == 0
+    assert diagnostics["grpo/input_mutation_detected"] == 0
+
+
+def test_grpo_shuffled_uids_and_constant_groups():
+    rewards = torch.tensor([[0.0], [1.0], [1.0], [0.0], [0.0], [1.0], [0.0], [1.0]])
+    response_mask = torch.ones_like(rewards)
+    index = np.array(["zero", "mixed", "one", "mixed", "zero", "mixed", "zero", "one"], dtype=object)
+    diagnostics = {}
+
+    advantages, _ = compute_grpo_outcome_advantage(rewards, response_mask, index, diagnostics=diagnostics)
+
+    assert torch.equal(advantages[[0, 2, 4, 6, 7]], torch.zeros(5, 1))
+    assert torch.allclose(advantages[[1, 3, 5]].sum(), torch.tensor(0.0), atol=1e-6)
+    assert diagnostics["grpo/constant_groups"] == 2
+    assert diagnostics["grpo/mixed_groups"] == 1
+    assert diagnostics["grpo/max_abs_advantage"] <= 2 / np.sqrt(3) + 1e-5
+
+
+def test_grpo_invalid_group_is_zeroed(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VERL_GRPO_INVALID_GROUP_POLICY", "zero")
+    rewards = torch.tensor([[0.0], [float("nan")], [0.0], [1.0]])
+    response_mask = torch.ones_like(rewards)
+    index = np.array(["bad", "bad", "good", "good"], dtype=object)
+    diagnostics = {}
+
+    advantages, _ = compute_grpo_outcome_advantage(rewards, response_mask, index, diagnostics=diagnostics)
+
+    assert torch.equal(advantages[:2], torch.zeros(2, 1))
+    assert torch.isfinite(advantages).all()
+    assert diagnostics["grpo/invalid_groups"] == 1
+    assert diagnostics["grpo/recomputed_groups"] == 1
+    assert diagnostics["grpo/zeroed_groups"] == 1
+
+
+def test_grpo_invalid_group_strict_mode_raises(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VERL_GRPO_INVALID_GROUP_POLICY", "raise")
+    rewards = torch.tensor([[float("inf")], [0.0]])
+    response_mask = torch.ones_like(rewards)
+    index = np.array(["bad", "bad"], dtype=object)
+
+    with pytest.raises(FloatingPointError, match="Invalid GRPO group"):
+        compute_grpo_outcome_advantage(rewards, response_mask, index)
+
+
+def test_grpo_unexpected_group_size_is_zeroed(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VERL_GRPO_INVALID_GROUP_POLICY", "zero")
+    rewards = torch.tensor([[0.0], [1.0], [0.0]])
+    response_mask = torch.ones_like(rewards)
+    index = np.array(["short", "short", "short"], dtype=object)
+    diagnostics = {}
+
+    advantages, _ = compute_grpo_outcome_advantage(
+        rewards,
+        response_mask,
+        index,
+        diagnostics=diagnostics,
+        expected_group_size=8,
+    )
+
+    assert torch.equal(advantages, torch.zeros_like(advantages))
+    assert diagnostics["grpo/invalid_groups"] == 1
+    assert diagnostics["grpo/zeroed_groups"] == 1
+
+
+def test_grpo_rejects_nonbinary_response_mask():
+    rewards = torch.tensor([[0.0], [1.0]])
+    response_mask = torch.tensor([[248044], [1]])
+    index = np.array(["prompt", "prompt"], dtype=object)
+
+    with pytest.raises(ValueError, match="response_mask must be binary"):
+        compute_grpo_outcome_advantage(rewards, response_mask, index)
+
+
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_groups,seed",
     [

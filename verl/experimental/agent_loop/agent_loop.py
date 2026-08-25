@@ -704,7 +704,11 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            # Runtime-only metadata lets custom loops distinguish validation
+            # without adding a private field to every dataset row.
+            runtime_kwargs = dict(kwargs)
+            runtime_kwargs["_agent_loop_validate"] = bool(trajectory.get("validate", False))
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, **runtime_kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
@@ -714,33 +718,50 @@ class AgentLoopWorker:
         max_length: int,
         padding_side: str,
         return_attention_mask: bool,
+        pad_value: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Right/left pad a flat list of token ids to a ``(1, max_length)`` tensor."""
-        # tokenizer.pad() with empty input returns dict with list values
-        # instead of tensors, which breaks downstream .dim() calls.
-        if not tokens:
-            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-            result = {"input_ids": torch.full((1, max_length), pad_id, dtype=torch.long)}
-            if return_attention_mask:
-                result["attention_mask"] = torch.zeros((1, max_length), dtype=torch.long)
-            return result
-        self.tokenizer.padding_side = padding_side
-        padded = self.tokenizer.pad(
-            {"input_ids": tokens},
-            padding="max_length",
-            max_length=max_length,
-            return_tensors="pt",
-            return_attention_mask=return_attention_mask,
-        )
-        if padded["input_ids"].dim() == 1:
-            padded["input_ids"] = padded["input_ids"].unsqueeze(0)
-            if return_attention_mask:
-                padded["attention_mask"] = padded["attention_mask"].unsqueeze(0)
-        return padded
+        """Pad a flat integer sequence without mutating tokenizer state."""
+        if padding_side not in {"left", "right"}:
+            raise ValueError(f"Unsupported padding side: {padding_side!r}")
+        if len(tokens) > max_length:
+            raise ValueError(f"Cannot pad {len(tokens)} values to shorter maximum length {max_length}")
+
+        if pad_value is None:
+            pad_value = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        padded_values = torch.full((1, max_length), pad_value, dtype=torch.long)
+        attention_mask = torch.zeros((1, max_length), dtype=torch.long)
+        if tokens:
+            values = torch.tensor(tokens, dtype=torch.long)
+            start = max_length - len(tokens) if padding_side == "left" else 0
+            end = start + len(tokens)
+            padded_values[0, start:end] = values
+            attention_mask[0, start:end] = 1
+
+        result = {"input_ids": padded_values}
+        if return_attention_mask:
+            result["attention_mask"] = attention_mask
+        return result
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+
+        if len(output.response_ids) != len(output.response_mask):
+            raise ValueError(
+                "Rollout response ids are not aligned with the response mask: "
+                f"response_ids={len(output.response_ids)}, response_mask={len(output.response_mask)}"
+            )
+        invalid_mask_values = [value for value in output.response_mask if value not in (0, 1)]
+        if invalid_mask_values:
+            raise ValueError(
+                "Rollout response mask must be binary: "
+                f"invalid_count={len(invalid_mask_values)}, sample={invalid_mask_values[:8]}"
+            )
+        if output.response_logprobs is not None and len(output.response_logprobs) != len(output.response_mask):
+            raise ValueError(
+                "Rollout response log probabilities are not aligned with the response mask: "
+                f"logprobs={len(output.response_logprobs)}, response_mask={len(output.response_mask)}"
+            )
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -782,12 +803,29 @@ class AgentLoopWorker:
             max_length=self.rollout_config.response_length,
             padding_side="right",
             return_attention_mask=False,
+            pad_value=0,
         )
 
         response_logprobs = None
         if output.response_logprobs is not None:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+        elif bool(getattr(self.rollout_config, "calculate_log_probs", False)):
+            generated_tokens = sum(bool(value) for value in output.response_mask)
+            if generated_tokens:
+                failure_context = {
+                    key: output.extra_fields.get(key)
+                    for key in ("termination_reason", "swe_environment_failure", "swe_terminal_failure")
+                    if output.extra_fields.get(key) is not None
+                }
+                raise ValueError(
+                    "Rollout generated tokens without response log probabilities: "
+                    f"generated_tokens={generated_tokens}, failure_context={failure_context}"
+                )
+            response_logprobs = torch.zeros(
+                (1, self.rollout_config.response_length),
+                dtype=torch.float32,
+            )
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -1062,8 +1100,45 @@ class AgentLoopWorker:
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
         optional_outputs = {}
-        if inputs[0].response_logprobs is not None:
-            optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+        response_logprobs = [input.response_logprobs for input in inputs]
+        calculate_log_probs = bool(getattr(getattr(self, "rollout_config", None), "calculate_log_probs", False))
+        if calculate_log_probs or any(item is not None for item in response_logprobs):
+            reference = next((item for item in response_logprobs if item is not None), None)
+            normalized_logprobs = []
+            invalid_indices = []
+            for index, (input_item, logprobs) in enumerate(zip(inputs, response_logprobs, strict=True)):
+                if logprobs is None:
+                    if torch.count_nonzero(input_item.response_mask).item():
+                        invalid_indices.append(index)
+                        continue
+                    if reference is not None:
+                        logprobs = reference.new_zeros(input_item.response_mask.shape)
+                    else:
+                        logprobs = input_item.response_mask.new_zeros(
+                            input_item.response_mask.shape,
+                            dtype=torch.float32,
+                        )
+                if logprobs.shape != input_item.response_mask.shape:
+                    raise ValueError(
+                        "Rollout log-probability shape does not match response mask: "
+                        f"index={index}, logprobs_shape={tuple(logprobs.shape)}, "
+                        f"response_mask_shape={tuple(input_item.response_mask.shape)}"
+                    )
+                normalized_logprobs.append(logprobs)
+            if invalid_indices:
+                failure_context = {
+                    index: {
+                        key: inputs[index].extra_fields.get(key)
+                        for key in ("termination_reason", "swe_environment_failure", "swe_terminal_failure")
+                        if inputs[index].extra_fields.get(key) is not None
+                    }
+                    for index in invalid_indices
+                }
+                raise ValueError(
+                    "Rollout batch contains generated tokens without response log probabilities: "
+                    f"indices={invalid_indices}, failure_context={failure_context}"
+                )
+            optional_outputs["rollout_log_probs"] = torch.cat(normalized_logprobs, dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
@@ -1086,9 +1161,18 @@ class AgentLoopWorker:
         scores = [input.reward_score for input in inputs]
         if all(score is not None for score in scores):
             prompt_length = prompt_ids.size(1)
-            response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
+            response_token_counts = attention_mask[:, prompt_length:].sum(dim=1)
             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
-            rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
+            score_tensor = torch.tensor(scores, dtype=torch.float32)
+            empty_response = response_token_counts == 0
+            invalid_empty_reward = empty_response & (score_tensor != 0)
+            if invalid_empty_reward.any():
+                invalid_rows = torch.nonzero(invalid_empty_reward, as_tuple=False).flatten().tolist()
+                raise ValueError(f"Nonzero rewards cannot be attached to empty responses: rows={invalid_rows}")
+            nonempty_rows = torch.nonzero(~empty_response, as_tuple=False).flatten()
+            if nonempty_rows.numel():
+                reward_positions = response_token_counts.index_select(0, nonempty_rows) - 1
+                rm_scores[nonempty_rows, reward_positions] = score_tensor.index_select(0, nonempty_rows)
             batch["rm_scores"] = rm_scores
 
         non_tensor_batch = {
@@ -1099,9 +1183,12 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        # Reward paths (normal score, timeout, claim failure, etc.) may build
+        # equivalent dictionaries in different insertion orders.  Use the
+        # union and a deterministic order so worker metadata can be concatenated.
+        reward_extra_keys = sorted({key for info in reward_extra_infos for key in info})
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            non_tensor_batch[key] = np.array([info.get(key) for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

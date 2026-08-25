@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import warnings
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -30,6 +31,7 @@ from verl.experimental.agent_loop.agent_loop import (
     _InternalAgentLoopOutput,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import _merge_generation_extra_fields, _split_prompt_and_response_ids
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.workers.rollout.replica import TokenOutput
 
@@ -70,6 +72,7 @@ class _FakeServerManager:
 
 
 class _FakeTokenizer:
+    pad_token_id = 0
     padding_side = "right"
 
     def apply_chat_template(
@@ -126,6 +129,42 @@ def _pad_1d(ids: list[int], *, length: int, pad_id: int = 0) -> list[int]:
     return ids + [pad_id] * (length - len(ids))
 
 
+def test_generation_versions_merge_with_preexisting_agent_metadata_on_cpu():
+    agent_data = SimpleNamespace(
+        assistant_turns=0,
+        extra_fields={"swe_execution_claim": {"ok": True}},
+    )
+
+    _merge_generation_extra_fields(
+        agent_data,
+        {
+            "min_global_steps": 0,
+            "max_global_steps": 0,
+            "spec_num_draft_tokens": 2,
+        },
+    )
+
+    assert agent_data.extra_fields["swe_execution_claim"] == {"ok": True}
+    assert agent_data.extra_fields["min_global_steps"] == 0
+    assert agent_data.extra_fields["max_global_steps"] == 0
+
+    agent_data.assistant_turns = 1
+    _merge_generation_extra_fields(
+        agent_data,
+        {
+            "min_global_steps": 1,
+            "max_global_steps": 1,
+            "spec_num_draft_tokens": 3,
+            "spec_num_accepted_tokens": 1,
+        },
+    )
+
+    assert agent_data.extra_fields["min_global_steps"] == 0
+    assert agent_data.extra_fields["max_global_steps"] == 1
+    assert agent_data.extra_fields["spec_num_draft_tokens"] == 5
+    assert agent_data.extra_fields["spec_num_accepted_tokens"] == 1
+
+
 def _to_internal(
     *,
     output_prompt_ids: list[int],
@@ -136,6 +175,7 @@ def _to_internal(
     num_turns: int,
     prompt_len: int,
     response_len: int,
+    response_logprobs: torch.Tensor | None = None,
 ) -> _InternalAgentLoopOutput:
     prompt_ids = _pad_1d(output_prompt_ids, length=prompt_len, pad_id=0)
     response_ids = _pad_1d(output_response_ids, length=response_len, pad_id=0)
@@ -160,7 +200,7 @@ def _to_internal(
         attention_mask=t(attention_mask),
         input_ids=t(input_ids),
         position_ids=t(position_ids),
-        response_logprobs=None,
+        response_logprobs=response_logprobs,
         routed_experts=None,
         multi_modal_inputs=None,
         multi_modal_data=None,
@@ -169,6 +209,206 @@ def _to_internal(
         metrics=metrics,
         extra_fields=extra_fields,
     )
+
+
+class _AgentLoopPostprocessHarness:
+    _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+    _compute_position_ids = AgentLoopWorker._compute_position_ids
+    _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
+    _compute_score = AgentLoopWorker._compute_score
+    _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
+    _pad_token_ids = AgentLoopWorker._pad_token_ids
+    distillation_enabled = False
+
+    def __init__(self, *, calculate_log_probs: bool = True):
+        self.tokenizer = _FakeTokenizer()
+        self.rollout_config = OmegaConf.create(
+            {
+                "prompt_length": 4,
+                "response_length": 4,
+                "calculate_log_probs": calculate_log_probs,
+            }
+        )
+        self.processor = None
+        self.mm_processor_kwargs = {}
+        self.reward_loop_worker_handles = None
+
+
+@pytest.mark.asyncio
+async def test_empty_rollout_gets_masked_zero_log_probs_on_cpu():
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[],
+        response_mask=[],
+        response_logprobs=None,
+        reward_score=0.0,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"swe_environment_failure": {"stage": "claim"}},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        _AgentLoopPostprocessHarness(),
+        output,
+        validate=False,
+        raw_prompt=[{"role": "user", "content": "hi"}],
+    )
+
+    assert internal.response_logprobs is not None
+    assert internal.response_logprobs.shape == (1, 4)
+    assert torch.count_nonzero(internal.response_logprobs) == 0
+    assert torch.count_nonzero(internal.response_mask) == 0
+
+
+def test_zero_length_response_split_preserves_prompt_on_cpu():
+    prompt_ids, response_ids = _split_prompt_and_response_ids([101, 102, 103], 0)
+
+    assert prompt_ids == [101, 102, 103]
+    assert response_ids == []
+
+
+def test_semantic_mask_padding_uses_zero_without_mutating_tokenizer_on_cpu():
+    worker = _AgentLoopPostprocessHarness(calculate_log_probs=False)
+    worker.tokenizer = _FakeTokenizerCustomPad()
+    worker.tokenizer.padding_side = "left"
+
+    result = worker._pad_token_ids(
+        tokens=[1, 0],
+        max_length=4,
+        padding_side="right",
+        return_attention_mask=False,
+        pad_value=0,
+    )
+
+    torch.testing.assert_close(result["input_ids"], torch.tensor([[1, 0, 0, 0]]))
+    assert worker.tokenizer.padding_side == "left"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_rejects_response_mask_alignment_mismatch_on_cpu():
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[11],
+        response_mask=[],
+        response_logprobs=None,
+        reward_score=0.0,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"swe_environment_failure": {"stage": "claim"}},
+    )
+
+    with pytest.raises(ValueError, match="response ids are not aligned"):
+        await AgentLoopWorker._agent_loop_postprocess(
+            _AgentLoopPostprocessHarness(),
+            output,
+            validate=False,
+            raw_prompt=[{"role": "user", "content": "hi"}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_generated_tokens_without_log_probs_fail_before_batching_on_cpu():
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[11],
+        response_mask=[1],
+        response_logprobs=None,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"termination_reason": "unexpected_missing_logprobs"},
+    )
+
+    with pytest.raises(ValueError, match="generated_tokens=1"):
+        await AgentLoopWorker._agent_loop_postprocess(
+            _AgentLoopPostprocessHarness(),
+            output,
+            validate=False,
+            raw_prompt=[{"role": "user", "content": "hi"}],
+        )
+
+
+def _make_internal_logprob_output(*, empty: bool) -> _InternalAgentLoopOutput:
+    response_mask = [] if empty else [1]
+    response_logprobs = None if empty else torch.full((1, 4), -0.5, dtype=torch.float32)
+    return _to_internal(
+        output_prompt_ids=[101, 102],
+        output_response_ids=[] if empty else [11],
+        output_response_mask=response_mask,
+        metrics=AgentLoopMetrics(),
+        extra_fields={},
+        num_turns=1,
+        prompt_len=4,
+        response_len=4,
+        response_logprobs=response_logprobs,
+    )
+
+
+@pytest.mark.parametrize("empty_index", [0, 3, 7])
+def test_batch_log_probs_normalize_empty_rollout_in_any_position_on_cpu(empty_index: int):
+    inputs = [_make_internal_logprob_output(empty=index == empty_index) for index in range(8)]
+    worker = SimpleNamespace(
+        rollout_config=SimpleNamespace(calculate_log_probs=True),
+        reward_loop_worker_handles=None,
+        distillation_enabled=False,
+    )
+
+    output = AgentLoopWorker._postprocess(worker, inputs=inputs)
+
+    assert output.batch["rollout_log_probs"].shape == (8, 4)
+    assert torch.count_nonzero(output.batch["rollout_log_probs"][empty_index]) == 0
+    assert torch.count_nonzero(output.batch["response_mask"][empty_index]) == 0
+
+
+def test_batch_log_probs_support_all_empty_rollouts_on_cpu():
+    inputs = [_make_internal_logprob_output(empty=True) for _ in range(8)]
+    worker = SimpleNamespace(
+        rollout_config=SimpleNamespace(calculate_log_probs=True),
+        reward_loop_worker_handles=None,
+        distillation_enabled=False,
+    )
+
+    output = AgentLoopWorker._postprocess(worker, inputs=inputs)
+
+    assert output.batch["rollout_log_probs"].shape == (8, 4)
+    assert torch.count_nonzero(output.batch["rollout_log_probs"]) == 0
+
+
+def test_empty_response_reward_stays_zero_on_cpu():
+    inputs = [_make_internal_logprob_output(empty=True) for _ in range(2)]
+    for input_item in inputs:
+        input_item.reward_score = 0.0
+    worker = SimpleNamespace(
+        rollout_config=SimpleNamespace(calculate_log_probs=True),
+        reward_loop_worker_handles=None,
+        distillation_enabled=False,
+    )
+
+    output = AgentLoopWorker._postprocess(worker, inputs=inputs)
+
+    assert torch.count_nonzero(output.batch["rm_scores"]) == 0
+
+
+def test_nonzero_reward_on_empty_response_is_rejected_on_cpu():
+    inputs = [_make_internal_logprob_output(empty=True)]
+    inputs[0].reward_score = 1.0
+    worker = SimpleNamespace(
+        rollout_config=SimpleNamespace(calculate_log_probs=True),
+        reward_loop_worker_handles=None,
+        distillation_enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="Nonzero rewards cannot be attached to empty responses"):
+        AgentLoopWorker._postprocess(worker, inputs=inputs)
+
+
+def test_batch_log_probs_reject_missing_values_for_generated_tokens_on_cpu():
+    inputs = [_make_internal_logprob_output(empty=False) for _ in range(8)]
+    inputs[3].response_logprobs = None
+    worker = SimpleNamespace(
+        rollout_config=SimpleNamespace(calculate_log_probs=True),
+        reward_loop_worker_handles=None,
+        distillation_enabled=False,
+    )
+
+    with pytest.raises(ValueError, match=r"indices=\[3\]"):
+        AgentLoopWorker._postprocess(worker, inputs=inputs)
 
 
 @pytest.mark.asyncio

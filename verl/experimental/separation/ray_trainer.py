@@ -39,7 +39,17 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     compute_variance_proxy_metrics,
 )
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, apply_kl_penalty, compute_advantage, compute_response_mask
+from verl.trainer.ppo.ray_trainer import (
+    RayPPOTrainer,
+    _capture_grpo_boundary,
+    _check_grpo_boundary,
+    _grpo_checks_enabled,
+    _validate_grpo_response_batch,
+    apply_kl_penalty,
+    apply_training_task_filter,
+    compute_advantage,
+    compute_response_mask,
+)
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
@@ -497,11 +507,33 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             reward_tensor, reward_extra_infos_dict = extract_reward(batch)
             self.reward_tensor = reward_tensor
             self.reward_extra_infos_dict = reward_extra_infos_dict
+            self._grpo_boundary_baseline = None
+            if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO:
+                self.metrics.update(_validate_grpo_response_batch(batch, reward_tensor))
+                if _grpo_checks_enabled():
+                    self._grpo_boundary_baseline = _capture_grpo_boundary(
+                        batch,
+                        reward_tensor=reward_tensor,
+                    )
+                    _check_grpo_boundary(
+                        "reward_extraction",
+                        self._grpo_boundary_baseline,
+                        self._grpo_boundary_baseline,
+                        self.metrics,
+                    )
         return batch
 
     def _fit_compute_log_prob(self, batch: DataProto) -> DataProto:
         metrics = self.metrics
         timing_raw = self.timing_raw
+        grpo_boundary_baseline = getattr(self, "_grpo_boundary_baseline", None)
+        if grpo_boundary_baseline is not None:
+            _check_grpo_boundary(
+                "before_old_log_prob",
+                _capture_grpo_boundary(batch, reward_tensor=self.reward_tensor),
+                grpo_boundary_baseline,
+                metrics,
+            )
         # Operating Mode Selection:
         # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
         # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -548,6 +580,13 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                     metrics.update(calculate_debug_metrics(batch))
 
         assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+        if grpo_boundary_baseline is not None:
+            _check_grpo_boundary(
+                "after_old_log_prob",
+                _capture_grpo_boundary(batch, reward_tensor=self.reward_tensor),
+                grpo_boundary_baseline,
+                metrics,
+            )
         return batch
 
     def _fit_compute_ref_log_prob(self, batch: DataProto) -> DataProto:
@@ -571,8 +610,16 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         timing_raw = self.timing_raw
         reward_tensor = self.reward_tensor
         reward_extra_infos_dict = self.reward_extra_infos_dict
+        grpo_boundary_baseline = getattr(self, "_grpo_boundary_baseline", None)
 
         with marked_timer("adv", timing_raw, color="brown"):
+            if grpo_boundary_baseline is not None:
+                _check_grpo_boundary(
+                    "before_advantage",
+                    _capture_grpo_boundary(batch, reward_tensor=reward_tensor),
+                    grpo_boundary_baseline,
+                    metrics,
+                )
             # we combine with rule-based rm
             reward_extra_infos_dict: dict[str, list]
             batch.batch["token_level_scores"] = reward_tensor
@@ -606,6 +653,18 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 # IS and off-policy metrics already have rollout_corr/ prefix
                 metrics.update(is_metrics)
 
+            task_filter_metrics = apply_training_task_filter(batch)
+            metrics.update(task_filter_metrics)
+            for key in ("task_filter_excluded", "task_filter_ratio", "task_filter_failure_count"):
+                if key in batch.non_tensor_batch:
+                    reward_extra_infos_dict[key] = batch.non_tensor_batch[key].tolist()
+            self._write_task_filter_decisions(batch, self.global_steps)
+            self._write_trajectory_diagnostic_records(
+                batch.non_tensor_batch,
+                step=self.global_steps,
+                phase="training",
+            )
+
             # compute advantages, executed on the driver process
             norm_adv_by_std_in_grpo = self.config.algorithm.get(
                 "norm_adv_by_std_in_grpo", True
@@ -620,29 +679,49 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                 config=self.config.algorithm,
             )
+            metrics.update(batch.meta_info.pop("grpo_metrics", {}))
+            if grpo_boundary_baseline is not None:
+                _check_grpo_boundary(
+                    "after_advantage",
+                    _capture_grpo_boundary(batch),
+                    grpo_boundary_baseline,
+                    metrics,
+                )
         return batch
 
     def _fit_update_critic(self, batch: DataProto) -> DataProto:
         metrics = self.metrics
         timing_raw = self.timing_raw
-        if self.use_critic:
+        if self.use_critic and not bool(batch.meta_info.get("task_filter_all_excluded", False)):
             with marked_timer("update_critic", timing_raw, color="pink"):
                 critic_output = self._update_critic(batch)
             critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
             metrics.update(critic_output_metrics)
+        elif self.use_critic:
+            metrics["task_filter/critic_update_skipped"] = 1.0
         return batch
 
     def _fit_update_actor(self, batch: DataProto) -> DataProto:
         metrics = self.metrics
         timing_raw = self.timing_raw
         # implement critic warmup
-        if self.config.trainer.critic_warmup <= self.global_steps:
+        if bool(batch.meta_info.get("task_filter_all_excluded", False)):
+            metrics["task_filter/actor_update_skipped"] = 1.0
+        elif self.config.trainer.critic_warmup <= self.global_steps:
             # update actor
             with marked_timer("update_actor", timing_raw, color="red"):
                 actor_output = self._update_actor(batch)
 
             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
             metrics.update(actor_output_metrics)
+        grpo_boundary_baseline = getattr(self, "_grpo_boundary_baseline", None)
+        if grpo_boundary_baseline is not None:
+            _check_grpo_boundary(
+                "after_actor_update",
+                _capture_grpo_boundary(batch),
+                grpo_boundary_baseline,
+                metrics,
+            )
         return batch
 
     def _fit_update_weights(self):

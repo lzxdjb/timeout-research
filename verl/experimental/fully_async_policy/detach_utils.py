@@ -15,6 +15,7 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from numbers import Real
 from typing import Any
 
 import numpy as np
@@ -37,6 +38,31 @@ class RolloutSample:
 
     # Processing metadata
     rollout_status: dict[str, Any]
+
+
+def is_known_param_version(value: Any) -> bool:
+    """Return whether a rollout version can participate in numeric staleness metrics."""
+    return isinstance(value, Real) and not isinstance(value, bool) and bool(np.isfinite(value))
+
+
+def _compute_partial_rollout_stats(param_version_start, param_version_end) -> dict[str, float | int]:
+    version_pairs = list(zip(param_version_start, param_version_end, strict=False))
+    known_pairs = [
+        (start, end)
+        for start, end in version_pairs
+        if is_known_param_version(start) and is_known_param_version(end)
+    ]
+    param_version_diff = [abs(end - start) for start, end in known_pairs]
+    partial_num = sum(diff != 0 for diff in param_version_diff)
+    unknown_version_num = len(version_pairs) - len(known_pairs)
+
+    return {
+        "fully_async/partial/total_partial_num": partial_num,
+        "fully_async/partial/partial_ratio": partial_num / len(known_pairs) if known_pairs else 0.0,
+        "fully_async/partial/max_partial_span": max(param_version_diff, default=0),
+        "fully_async/partial/unknown_version_num": unknown_version_num,
+        "fully_async/partial/unknown_version_ratio": unknown_version_num / len(version_pairs) if version_pairs else 0.0,
+    }
 
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
@@ -76,8 +102,8 @@ def addition_process(output: DataProto):
     metrics = output.meta_info.pop("metrics")  # List[Dict[str, str]]
     processing_times_list = [item["generate_sequences"] for item in metrics]
     tool_calls_times_list = [item["tool_calls"] for item in metrics]
-    output.non_tensor_batch["processing_times"] = processing_times_list
-    output.non_tensor_batch["tool_calls_times"] = tool_calls_times_list
+    output.non_tensor_batch["processing_times"] = np.asarray(processing_times_list, dtype=np.float64)
+    output.non_tensor_batch["tool_calls_times"] = np.asarray(tool_calls_times_list, dtype=np.float64)
     return output
 
 
@@ -150,19 +176,16 @@ def assemble_batch_from_rollout_samples(
 
     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
-    param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
-    num_diff0 = param_version_diff.count(0)
-    partial_stats = {
-        "fully_async/partial/total_partial_num": len(param_version_diff) - num_diff0,
-        "fully_async/partial/partial_ratio": (len(param_version_diff) - num_diff0) / len(param_version_diff),
-        "fully_async/partial/max_partial_span": max(param_version_diff),
-    }
+    partial_stats = _compute_partial_rollout_stats(param_version_start, param_version_end)
     # add meta_info
     trajectory_param_versions = final_batch.non_tensor_batch["max_global_steps"]
+    known_trajectory_param_versions = [
+        version for version in trajectory_param_versions if is_known_param_version(version)
+    ]
 
     final_batch.meta_info.update(
         {
-            "param_version_diversity": len(set(trajectory_param_versions)),
+            "param_version_diversity": len(set(known_trajectory_param_versions)),
             "trajectory_param_versions": trajectory_param_versions,
             **processing_time_stats,
             **rollout_status,

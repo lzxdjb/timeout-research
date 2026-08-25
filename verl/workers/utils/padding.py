@@ -68,7 +68,20 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
 
     data["input_ids"] = input_ids_nested
     data["position_ids"] = position_ids_nested
-    data["loss_mask"] = data["response_mask"]
+    # ``train_sample_mask`` is an optional sequence-level mask used by the
+    # SWE infrastructure filter. Keep response_mask unchanged for rollout
+    # diagnostics, but exclude filtered samples from training normalization.
+    response_mask = data["response_mask"]
+    train_sample_mask = data.get("train_sample_mask")
+    if train_sample_mask is not None:
+        if train_sample_mask.ndim != 1 or train_sample_mask.shape[0] != response_mask.shape[0]:
+            raise ValueError(
+                "train_sample_mask must have shape [batch_size], got "
+                f"{tuple(train_sample_mask.shape)} for response_mask {tuple(response_mask.shape)}"
+            )
+        data["loss_mask"] = response_mask * train_sample_mask.to(dtype=response_mask.dtype).unsqueeze(-1)
+    else:
+        data["loss_mask"] = response_mask
 
     routed_experts = data.get("routed_experts", None)
     if routed_experts is not None and not routed_experts.is_nested:

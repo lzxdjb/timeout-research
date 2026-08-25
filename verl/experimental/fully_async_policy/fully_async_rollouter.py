@@ -34,6 +34,11 @@ from verl.experimental.fully_async_policy.message_queue import MessageQueueClien
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, ResourcePoolManager
+from verl.trainer.ppo.swe_image_prefetch import (
+    _SWETrainingImagePrefetcher,
+    _SWEValidationImagePrefetcher,
+    _validate_swe_training_prefetch_modes,
+)
 from verl.trainer.ppo.utils import (
     create_rl_dataset,
     create_rl_sampler,
@@ -474,6 +479,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # very first interval has a well-defined start; the capacity will be corrected to the
         # real value as soon as max_concurrent_samples is known (see set_max_required_samples).
         self._active_count_history: list[tuple[float, int, int]] = [(time.time(), 0, 0)]
+
+        _validate_swe_training_prefetch_modes()
+        self._swe_training_image_prefetcher = _SWETrainingImagePrefetcher()
+        self._swe_validation_image_prefetcher = _SWEValidationImagePrefetcher()
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -990,6 +999,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
+        training_prefetcher = self._swe_training_image_prefetcher
+        training_prefetcher.raise_completed_errors()
+        training_prefetcher.submit_batch_bounded(
+            rollout_sample.full_batch.non_tensor_batch,
+            batch_index=self.processed_sample_count + 1,
+            label=rollout_sample.sample_id,
+            max_pending_images=max(1, self.max_concurrent_samples or self.concurrent_samples_per_replica),
+        )
+
         # Calling asynchronous generation methods
         # Embed sample_id into prompts for skip management
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
@@ -1095,10 +1113,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
 
         try:
-            # Run build and monitoring tasks concurrently
-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+            await asyncio.gather(generation_task, monitor_task)
         except Exception as e:
             print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
+            raise
         finally:
             if not generation_task.done():
                 generation_task.cancel()
@@ -1109,6 +1127,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
 
         print("[FullyAsyncRollouter] Rollouter fit completed")
+
+    def close_swe_prefetchers(self) -> None:
+        self._swe_training_image_prefetcher.close()
+        self._swe_validation_image_prefetcher.close()
 
     async def _async_monitor_loop(self):
         """

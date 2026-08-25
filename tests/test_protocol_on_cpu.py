@@ -216,6 +216,107 @@ def test_chunk_concat():
     assert concat_data.meta_info == data.meta_info
 
 
+def test_concat_pads_optional_non_tensor_keys_across_shards():
+    shards = []
+    for shard_index in range(8):
+        start = shard_index * 32
+        non_tensors = {"shared_numeric": np.arange(start, start + 32, dtype=np.int64)}
+        if shard_index in {1, 6}:
+            failures = np.full(32, None, dtype=object)
+            failures[shard_index] = {"stage": "execute", "shard": shard_index}
+            non_tensors["swe_terminal_failure"] = failures
+        shards.append(
+            DataProto.from_dict(
+                tensors={"obs": torch.arange(start, start + 32)},
+                non_tensors=non_tensors,
+            )
+        )
+
+    result = DataProto.concat(shards)
+
+    assert len(result) == 256
+    assert result.non_tensor_batch["shared_numeric"].dtype == np.int64
+    assert np.array_equal(result.non_tensor_batch["shared_numeric"], np.arange(256))
+    failures = result.non_tensor_batch["swe_terminal_failure"]
+    assert failures.shape == (256,)
+    assert failures[32 + 1] == {"stage": "execute", "shard": 1}
+    assert failures[192 + 6] == {"stage": "execute", "shard": 6}
+    assert sum(failure is not None for failure in failures) == 2
+
+
+def test_concat_normalizes_reward_extra_key_order():
+    first = DataProto.from_dict(
+        tensors={"obs": torch.tensor([1, 2])},
+        non_tensors={"score": np.array([1.0, 0.0])},
+        meta_info={"reward_extra_keys": ["score", "raw_score"]},
+    )
+    first.non_tensor_batch["raw_score"] = np.array([1.0, 0.0])
+    second = DataProto.from_dict(
+        tensors={"obs": torch.tensor([3])},
+        non_tensors={"score": np.array([0.0]), "raw_score": np.array([0.0])},
+        meta_info={"reward_extra_keys": ["raw_score", "score"]},
+    )
+
+    result = DataProto.concat([first, second])
+
+    assert result.meta_info["reward_extra_keys"] == ["raw_score", "score"]
+
+
+def test_concat_pads_optional_non_tensor_key_missing_from_later_shard():
+    first = DataProto.from_dict(
+        tensors={"obs": torch.tensor([1, 2])},
+        non_tensors={"optional": np.array([{"id": 1}, None], dtype=object)},
+    )
+    second = DataProto.from_dict(tensors={"obs": torch.tensor([3, 4, 5])})
+
+    result = DataProto.concat([first, second])
+
+    assert result.non_tensor_batch["optional"].tolist() == [{"id": 1}, None, None, None, None]
+
+
+def test_concat_normalizes_legacy_list_non_tensor_columns():
+    first = DataProto.from_dict(tensors={"obs": torch.tensor([1, 2])})
+    second = DataProto.from_dict(tensors={"obs": torch.tensor([3, 4])})
+    first.non_tensor_batch["processing_times"] = [0.1, 0.2]
+    second.non_tensor_batch["processing_times"] = (0.3, 0.4)
+
+    result = DataProto.concat([first, second])
+
+    processing_times = result.non_tensor_batch["processing_times"]
+    assert isinstance(processing_times, np.ndarray)
+    assert processing_times.dtype == np.float64
+    assert np.allclose(processing_times, [0.1, 0.2, 0.3, 0.4])
+
+
+def test_concat_rejects_misaligned_non_tensor_shard():
+    first = DataProto.from_dict(
+        tensors={"obs": torch.tensor([1, 2])},
+        non_tensors={"optional": np.array(["a", "b"], dtype=object)},
+    )
+    second = DataProto.from_dict(
+        tensors={"obs": torch.tensor([3, 4])},
+        non_tensors={"optional": np.array(["c", "d"], dtype=object)},
+    )
+    second.non_tensor_batch["optional"] = np.array(["c"], dtype=object)
+
+    with pytest.raises(ValueError, match="has 1 rows, expected 2"):
+        DataProto.concat([first, second])
+
+
+def test_concat_rejects_incompatible_non_tensor_trailing_shapes():
+    first = DataProto.from_dict(
+        tensors={"obs": torch.tensor([1, 2])},
+        non_tensors={"matrix": np.ones((2, 2), dtype=np.float32)},
+    )
+    second = DataProto.from_dict(
+        tensors={"obs": torch.tensor([3, 4])},
+        non_tensors={"matrix": np.ones((2, 3), dtype=np.float32)},
+    )
+
+    with pytest.raises(ValueError, match="incompatible trailing shape"):
+        DataProto.concat([first, second])
+
+
 def test_concat_metrics_from_multiple_workers():
     """Test that concat() properly merges metrics from all workers in distributed training."""
     # Simulate 3 workers each with their own metrics

@@ -46,11 +46,31 @@ SPEC_DECODE_EXTRA_KEYS = (
 )
 
 
+def _merge_generation_extra_fields(agent_data: "AgentData", output_extra_fields: dict[str, Any]) -> None:
+    """Merge model-generation metadata without depending on unrelated agent metadata."""
+    if agent_data.assistant_turns == 0:
+        agent_data.extra_fields.update(output_extra_fields)
+        return
+
+    # Multi-round calls retain the first generation version and track the latest one.
+    max_global_steps = output_extra_fields.get("max_global_steps")
+    if max_global_steps is not None:
+        agent_data.extra_fields["max_global_steps"] = max_global_steps
+
+    for key in SPEC_DECODE_EXTRA_KEYS:
+        if key in output_extra_fields:
+            previous = agent_data.extra_fields.get(key, 0)
+            agent_data.extra_fields[key] = int(previous) + int(output_extra_fields[key])
+
+
 class AgentState(Enum):
     PENDING = "pending"
     GENERATING = "generating"
     PROCESSING_TOOLS = "processing_tools"
     TERMINATED = "terminated"
+    # Domain loops may record a completed verification before resuming
+    # generation. Verification is informational and does not finalize a run.
+    VERIFIED = "verified"
 
 
 class AgentData:
@@ -94,6 +114,16 @@ class AgentData:
 
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
+
+
+def _split_prompt_and_response_ids(token_ids: list[int], response_length: int) -> tuple[list[int], list[int]]:
+    """Split accumulated tokens without the ``[-0:]`` empty-slice trap."""
+    if response_length < 0 or response_length > len(token_ids):
+        raise ValueError(
+            f"Invalid response length {response_length} for accumulated token length {len(token_ids)}"
+        )
+    split_at = len(token_ids) - response_length
+    return token_ids[:split_at], token_ids[split_at:]
 
 
 @register("tool_agent")
@@ -169,13 +199,16 @@ class ToolAgentLoop(AgentLoopBase):
                 state = await self._handle_generating_state(agent_data, sampling_params)
             elif state == AgentState.PROCESSING_TOOLS:
                 state = await self._handle_processing_tools_state(agent_data)
+            elif state == AgentState.VERIFIED:
+                state = await self._handle_verified_state(agent_data)
             else:
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
 
         # Finalize output
-        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
-        prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
+        prompt_ids, response_ids = _split_prompt_and_response_ids(
+            agent_data.prompt_ids, len(agent_data.response_mask)
+        )
         multi_modal_data = {}
         if agent_data.image_data is not None:
             multi_modal_data["images"] = agent_data.image_data
@@ -222,6 +255,11 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.prompt_ids = prompt_ids
         return AgentState.GENERATING
 
+    async def _handle_verified_state(self, agent_data: AgentData) -> AgentState:
+        """Resume generation after a domain-specific verification event."""
+        del agent_data
+        return AgentState.GENERATING
+
     async def _handle_generating_state(
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
     ) -> AgentState:
@@ -232,15 +270,7 @@ class ToolAgentLoop(AgentLoopBase):
             sampling_params = {**sampling_params, "stop_token_ids": stop_token_ids}
 
         with simple_timer("generate_sequences", agent_data.metrics):
-            output: TokenOutput = await self.server_manager.generate(
-                request_id=agent_data.request_id,
-                prompt_ids=agent_data.prompt_ids,
-                sampling_params=sampling_params,
-                image_data=agent_data.image_data,
-                video_data=agent_data.video_data,
-                audio_data=agent_data.audio_data,
-                mm_processor_kwargs=agent_data.mm_processor_kwargs,
-            )
+            output: TokenOutput = await self._generate_model_tokens(agent_data, sampling_params)
         # first time to set num_preempted
         if agent_data.metrics.get("num_preempted") is None:
             agent_data.metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
@@ -248,16 +278,7 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             agent_data.metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
 
-        if not agent_data.extra_fields:
-            agent_data.extra_fields.update(output.extra_fields)
-        else:
-            # Multi-round calls, only update the maximum max_global_steps.
-            max_global_steps = output.extra_fields.get("max_global_steps", None)
-            if max_global_steps:
-                agent_data.extra_fields["max_global_steps"] = max_global_steps
-            for key in SPEC_DECODE_EXTRA_KEYS:
-                if key in output.extra_fields and key in agent_data.extra_fields:
-                    agent_data.extra_fields[key] = int(agent_data.extra_fields[key]) + int(output.extra_fields[key])
+        _merge_generation_extra_fields(agent_data, output.extra_fields)
 
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
@@ -303,6 +324,36 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.PROCESSING_TOOLS
         else:
             return AgentState.TERMINATED
+
+    async def _generate_model_tokens(
+        self,
+        agent_data: AgentData,
+        sampling_params: dict[str, Any],
+    ) -> TokenOutput:
+        """Submit one assistant turn; subclasses may wrap this for observability."""
+        if hasattr(agent_data, "audio_data") and hasattr(agent_data, "mm_processor_kwargs"):
+            return await self.server_manager.generate(
+                request_id=agent_data.request_id,
+                prompt_ids=agent_data.prompt_ids,
+                sampling_params=sampling_params,
+                image_data=agent_data.image_data,
+                video_data=agent_data.video_data,
+                audio_data=agent_data.audio_data,
+                mm_processor_kwargs=agent_data.mm_processor_kwargs,
+            )
+        return await self.server_manager.generate(
+            request_id=agent_data.request_id,
+            prompt_ids=agent_data.prompt_ids,
+            sampling_params=sampling_params,
+            image_data=agent_data.image_data,
+            video_data=agent_data.video_data,
+        )
+
+    @staticmethod
+    def _terminate(agent_data: AgentData, reason: str, **_metadata: Any) -> AgentState:
+        """Record a terminal reason for domain-specific agent-loop subclasses."""
+        agent_data.extra_fields["termination_reason"] = reason
+        return AgentState.TERMINATED
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""

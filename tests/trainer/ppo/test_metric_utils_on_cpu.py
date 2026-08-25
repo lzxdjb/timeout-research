@@ -29,6 +29,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.ray_trainer import _get_validation_metric_sources
 from verl.utils.metric import (
     reduce_metrics,
 )
@@ -69,6 +70,49 @@ class TestReduceMetrics(unittest.TestCase):
         result = reduce_metrics(metrics)
 
         self.assertEqual(result["single"], 5.0)
+
+
+class TestValidationMetricSources(unittest.TestCase):
+    def test_prefers_metric_data_source_and_falls_back_per_row(self):
+        sources = _get_validation_metric_sources(
+            {
+                "data_source": np.array(["swe_agent_verl"] * 3, dtype=object),
+                "metric_data_source": np.array(["swe_bench_pro", "", None], dtype=object),
+            },
+            batch_size=3,
+        )
+
+        np.testing.assert_array_equal(sources, ["swe_bench_pro", "swe_agent_verl", "swe_agent_verl"])
+
+    def test_falls_back_when_metric_data_source_is_missing_or_malformed(self):
+        batch = {"data_source": np.array(["swe_agent_verl"] * 2, dtype=object)}
+        np.testing.assert_array_equal(
+            _get_validation_metric_sources(batch, batch_size=2),
+            ["swe_agent_verl", "swe_agent_verl"],
+        )
+        malformed = {**batch, "metric_data_source": np.array(["only-one"], dtype=object)}
+        np.testing.assert_array_equal(
+            _get_validation_metric_sources(malformed, batch_size=2),
+            ["swe_agent_verl", "swe_agent_verl"],
+        )
+
+    def test_grouping_keeps_validation_datasets_separate(self):
+        sources = _get_validation_metric_sources(
+            {
+                "data_source": np.array(["swe_agent_verl"] * 2, dtype=object),
+                "metric_data_source": np.array(["swe_bench_pro", "swe_bench_verified"], dtype=object),
+            },
+            batch_size=2,
+        )
+        grouped = process_validation_metrics(
+            sources,
+            ["pro-task", "verified-task"],
+            {"reward": [1.0, 0.0]},
+        )
+
+        assert set(grouped) == {"swe_bench_pro", "swe_bench_verified"}
+        assert grouped["swe_bench_pro"]["reward"]["mean@1"] == 1.0
+        assert grouped["swe_bench_verified"]["reward"]["mean@1"] == 0.0
 
 
 class TestMetric(unittest.TestCase):
@@ -349,6 +393,29 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
 
+    def test_compute_data_metrics_exports_conditioned_diagnostics(self):
+        self.batch.non_tensor_batch = {
+            "observed_infrastructure_failure": np.array([1, 0]),
+            "observed_infrastructure_failure_code": np.array([3, 0]),
+            "infra_raw_score": np.array([0.0, None], dtype=object),
+            "infra_shaped_score": np.array([-0.1, None], dtype=object),
+            "noninfra_raw_score": np.array([None, 1.0], dtype=object),
+            "noninfra_shaped_score": np.array([None, 1.0], dtype=object),
+            "verification_attempt_count": np.array([2, 0]),
+            "diagnostic_outcome_code": np.array([1, 6]),
+            "hidden_failure_phase_code": np.array([8, 0]),
+        }
+
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+
+        self.assertEqual(metrics["protocol/infra/observed_rate"], 0.5)
+        self.assertEqual(metrics["protocol/infra/timeout_failure_rate"], 0.5)
+        self.assertEqual(metrics["protocol/infra_raw_score/mean"], 0.0)
+        self.assertEqual(metrics["protocol/noninfra_shaped_score/mean"], 1.0)
+        self.assertEqual(metrics["protocol/infra_rate_verification_2plus"], 1.0)
+        self.assertEqual(metrics["protocol/outcome/invalid_patch"], 0.5)
+        self.assertEqual(metrics["protocol/hidden/test_timeout_rate"], 0.5)
+
 
 class TestComputeTimingMetrics(unittest.TestCase):
     """Tests for the compute_timing_metrics function."""
@@ -567,6 +634,19 @@ class TestProcessValidationMetrics(unittest.TestCase):
 
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
+
+    def test_process_validation_metrics_ignores_missing_optional_values(self):
+        data_sources = ["source1", "source1", "source1"]
+        sample_inputs = ["prompt1", "prompt1", "prompt1"]
+        infos_dict = {
+            "score": [1.0, None, 0.0],
+            "optional_metric": [None, None, None],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertAlmostEqual(result["source1"]["score"]["mean@2"], 0.5)
+        self.assertNotIn("optional_metric", result["source1"])
 
 
 if __name__ == "__main__":

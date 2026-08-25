@@ -605,7 +605,181 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    # Protocol fields are emitted as numeric one-hot values by the SWE agent.
+    # Aggregate them for training as rates so W&B can show whether the strict
+    # submission/verification gate is actually being learned.
+    protocol_fields = (
+        "raw_score",
+        "shaped_score",
+        "verification_penalty",
+        "protocol_penalty",
+        "protocol_reason_code",
+        "reward_eligible",
+        "infrastructure_failure",
+        "hidden_pass",
+        "submission_signal_seen",
+        "verification_attempted",
+        "verification_passed",
+        "verification_meaningful",
+        "verification_fresh",
+        "verification_qualified",
+        "protocol_gate_passed",
+        "protocol_gate_failed",
+        "hidden_pass_with_fresh_verification",
+        "hidden_pass_without_fresh_verification",
+        "hidden_fail_with_fresh_verification",
+        "hidden_fail_without_fresh_verification",
+        "observed_infrastructure_failure",
+        "observed_infrastructure_failure_code",
+        "verification_attempt_count",
+        "verification_total_seconds",
+        "verification_max_seconds",
+        "verification_time_fraction",
+        "verification_invalidated",
+        "submission_after_fresh_verification",
+        "trajectory_elapsed_seconds",
+        "trajectory_timeout",
+        "trajectory_assistant_turns",
+        "trajectory_response_tokens",
+        "trajectory_max_turn",
+        "trajectory_response_length_limit",
+        "trajectory_terminal_tool_failure",
+        "oom_killed",
+        "oom_event_count",
+        "oom_memory_limit_bytes",
+        "oom_peak_memory_bytes",
+        "oom_exit_code",
+        "public_verification_test_pass_rate",
+        "public_verification_has_tests",
+        "public_verification_exit_success",
+        "public_verification_parse_reliable",
+        "public_patch_changed_files",
+        "public_patch_changed_bytes",
+        "public_patch_added_lines",
+        "public_patch_deleted_lines",
+        "public_patch_empty",
+        "public_patch_fingerprint_available",
+        "public_patch_fingerprint_truncated",
+        "hidden_verifier_staging_ok",
+        "hidden_verifier_setup_ok",
+        "hidden_patch_check_ok",
+        "hidden_patch_apply_ok",
+        "hidden_tests_started",
+        "hidden_tests_exit_code",
+        "hidden_patch_valid",
+        "hidden_failure_phase_code",
+        "hidden_reward_seconds",
+        "hidden_tests_seconds",
+        "hidden_patch_check_seconds",
+        "final_patch_changed_files",
+        "final_patch_changed_bytes",
+        "final_patch_added_lines",
+        "final_patch_deleted_lines",
+        "final_patch_empty",
+        "final_patch_fingerprint_available",
+        "diagnostic_outcome_code",
+    )
+    for field in protocol_fields:
+        if field not in batch.non_tensor_batch:
+            continue
+        values = _coerce_numeric_values(batch.non_tensor_batch[field])
+        if values.size:
+            metrics[f"protocol/{field}/mean"] = float(np.mean(values))
+
+    # Conditional reward metrics use sparse values: each trajectory contributes
+    # only to its matching infrastructure/non-infrastructure population.
+    for field in (
+        "infra_raw_score",
+        "infra_shaped_score",
+        "infra_trajectory_seconds",
+        "noninfra_raw_score",
+        "noninfra_shaped_score",
+        "noninfra_trajectory_seconds",
+    ):
+        if field not in batch.non_tensor_batch:
+            continue
+        values = _coerce_numeric_values(batch.non_tensor_batch[field])
+        if values.size:
+            metrics[f"protocol/{field}/mean"] = float(np.mean(values))
+
+    observed = _coerce_numeric_values(batch.non_tensor_batch.get("observed_infrastructure_failure", []))
+    if observed.size:
+        observed_mask = observed.astype(bool)
+        metrics["protocol/infra/observed_rate"] = float(np.mean(observed_mask))
+        metrics["protocol/infra/count"] = float(np.sum(observed_mask))
+        codes = _coerce_numeric_values(batch.non_tensor_batch.get("observed_infrastructure_failure_code", []))
+        if codes.size == observed.size:
+            for code, name in (
+                (1, "queue"),
+                (2, "transport"),
+                (3, "timeout"),
+                (4, "reward"),
+                (5, "other"),
+                (6, "oom"),
+            ):
+                metrics[f"protocol/infra/{name}_failure_rate"] = float(np.mean(observed_mask & (codes == code)))
+
+        attempts = _coerce_numeric_values(batch.non_tensor_batch.get("verification_attempt_count", []))
+        if attempts.size == observed.size:
+            timeouts = _coerce_numeric_values(batch.non_tensor_batch.get("trajectory_timeout", []))
+            for label, mask in (
+                ("0", attempts == 0),
+                ("1", attempts == 1),
+                ("2plus", attempts >= 2),
+            ):
+                if np.any(mask):
+                    metrics[f"protocol/infra_rate_verification_{label}"] = float(np.mean(observed_mask[mask]))
+                    if timeouts.size == observed.size:
+                        metrics[f"protocol/timeout_rate_verification_{label}"] = float(np.mean(timeouts[mask]))
+
+    outcome_codes = _coerce_numeric_values(batch.non_tensor_batch.get("diagnostic_outcome_code", []))
+    if outcome_codes.size:
+        for code, name in (
+            (0, "no_patch"),
+            (1, "invalid_patch"),
+            (2, "valid_no_verification"),
+            (3, "valid_stale_verification"),
+            (4, "fresh_verification_no_submission"),
+            (5, "fresh_verification_hidden_fail"),
+            (6, "fresh_verification_hidden_pass"),
+            (7, "fresh_verification_no_hidden_score"),
+            (8, "infrastructure_oom"),
+        ):
+            metrics[f"protocol/outcome/{name}"] = float(np.mean(outcome_codes == code))
+
+    phase_codes = _coerce_numeric_values(batch.non_tensor_batch.get("hidden_failure_phase_code", []))
+    if phase_codes.size:
+        for code, name in (
+            (5, "patch_check_failed"),
+            (6, "patch_apply_failed"),
+            (3, "verifier_staging_failed"),
+            (4, "verifier_setup_failed"),
+            (7, "test_execution_failed"),
+            (8, "test_timeout"),
+        ):
+            metrics[f"protocol/hidden/{name}_rate"] = float(np.mean(phase_codes == code))
+
     return metrics
+
+
+def _coerce_numeric_values(values: Any) -> np.ndarray:
+    """Convert mixed reward metadata to finite numeric values.
+
+    Conditional diagnostics intentionally use sparse ``None`` values. Keeping
+    the conversion here prevents those fields from becoming object-array
+    failures while preserving the existing metric names and semantics.
+    """
+    result: list[float] = []
+    for value in np.asarray(values, dtype=object).reshape(-1):
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if np.isfinite(numeric):
+            result.append(numeric)
+    return np.asarray(result, dtype=np.float32)
 
 
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
@@ -978,16 +1152,28 @@ def process_validation_metrics(
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # Reward metadata is sparse: the validation collector inserts
+                # None when a trajectory does not emit an optional field. Drop
+                # those entries before numeric reduction instead of passing an
+                # object array containing None to NumPy.
+                valid_indices = [index for index, value in enumerate(var_vals) if value is not None]
+                if not valid_indices:
                     continue
+                numeric_vals = [var_vals[index] for index in valid_indices]
+                if isinstance(numeric_vals[0], str):
+                    continue
+                numeric_pred_vals = None
+                if pred_vals is not None:
+                    candidate_preds = [pred_vals[index] for index in valid_indices]
+                    if all(pred is not None for pred in candidate_preds):
+                        numeric_pred_vals = candidate_preds
 
                 # compute mean and std
-                n_resps = len(var_vals)
-                metric = {f"mean@{n_resps}": float(np_mean(var_vals))}
+                n_resps = len(numeric_vals)
+                metric = {f"mean@{n_resps}": float(np_mean(numeric_vals))}
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = float(np_std(var_vals))
+                    metric[f"std@{n_resps}"] = float(np_std(numeric_vals))
 
                     # cache ns list
                     if n_resps not in ns_cache:
@@ -998,7 +1184,7 @@ def process_validation_metrics(
                     for n in ns:
                         # compute best/worst metrics
                         (bon_mean, bon_std), (won_mean, won_std) = bootstrap_metric(
-                            data=var_vals,
+                            data=numeric_vals,
                             subset_size=n,
                             reduce_fns=reduce_fns_best_worst,
                             n_bootstrap=n_bootstrap,
@@ -1010,10 +1196,11 @@ def process_validation_metrics(
                         metric[f"worst@{n}/std"] = won_std
 
                         # compute maj metrics
-                        if has_pred:
+                        if has_pred and numeric_pred_vals is not None:
                             # create vote_data
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, pred_vals, strict=True)
+                                {"val": val, "pred": pred}
+                                for val, pred in zip(numeric_vals, numeric_pred_vals, strict=True)
                             ]
                             # compute maj metrics
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(

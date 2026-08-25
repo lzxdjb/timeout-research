@@ -20,6 +20,8 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
+import os
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -272,6 +274,8 @@ def compute_grpo_outcome_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    diagnostics: Optional[dict[str, float]] = None,
+    expected_group_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -290,6 +294,8 @@ def compute_grpo_outcome_advantage(
             whether to scale the GRPO advantage
         config: `(Optional[AlgoConfig])`
             algorithm configuration object
+        diagnostics: optional dictionary populated with GRPO invariant metrics
+        expected_group_size: expected number of responses for every prompt group
 
     Note:
         If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
@@ -301,34 +307,119 @@ def compute_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
-    scores = token_level_rewards.sum(dim=-1)
+    if token_level_rewards.ndim != 2 or response_mask.shape != token_level_rewards.shape:
+        raise ValueError(
+            "GRPO expects token_level_rewards and response_mask with the same two-dimensional shape, "
+            f"got rewards={tuple(token_level_rewards.shape)} mask={tuple(response_mask.shape)}"
+        )
+    binary_mask = (response_mask == 0) | (response_mask == 1)
+    if not binary_mask.all():
+        invalid_count = int((~binary_mask).sum().item())
+        raise ValueError(
+            "GRPO response_mask must be binary before advantage computation: "
+            f"invalid_count={invalid_count}, min={response_mask.min().item()}, max={response_mask.max().item()}"
+        )
 
-    id2score = defaultdict(list)
-    id2mean = {}
-    id2std = {}
+    output_dtype = token_level_rewards.dtype if token_level_rewards.is_floating_point() else torch.float32
+    scores = token_level_rewards.sum(dim=-1, dtype=torch.float64)
+    if len(index) != scores.shape[0]:
+        raise ValueError(f"GRPO uid count {len(index)} does not match batch size {scores.shape[0]}")
+
+    invariant_check = os.getenv("VERL_GRPO_INVARIANT_CHECK", "1").strip().lower() not in {"0", "false", "no"}
+    invalid_policy = os.getenv("VERL_GRPO_INVALID_GROUP_POLICY", "zero").strip().lower()
+    diagnostic_log = os.getenv("VERL_GRPO_DIAGNOSTICS", "0").strip().lower() not in {"0", "false", "no"}
+    if invalid_policy not in {"zero", "raise"}:
+        raise ValueError(f"Unsupported VERL_GRPO_INVALID_GROUP_POLICY={invalid_policy!r}; expected 'zero' or 'raise'")
+
+    group_positions: dict[Any, list[int]] = defaultdict(list)
+    for position, uid in enumerate(index):
+        group_positions[uid].append(position)
+
+    stats = {
+        "grpo/constant_groups": 0.0,
+        "grpo/mixed_groups": 0.0,
+        "grpo/invalid_groups": 0.0,
+        "grpo/recomputed_groups": 0.0,
+        "grpo/zeroed_groups": 0.0,
+        "grpo/max_abs_advantage": 0.0,
+        "grpo/input_mutation_detected": 0.0,
+    }
+
+    def normalize_group(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        values64 = values.to(dtype=torch.float64)
+        mean = values64.mean()
+        centered = values64 - mean
+        if values64.numel() <= 1 or torch.count_nonzero(centered).item() == 0:
+            std = values64.new_zeros(())
+            return centered.new_zeros(centered.shape), mean, std
+        std = values64.std(correction=1)
+        normalized = centered / (std + epsilon) if norm_adv_by_std_in_grpo else centered
+        return normalized, mean, std
+
+    def invalid_reason(values: torch.Tensor, normalized: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> str:
+        if invariant_check and expected_group_size is not None and values.numel() != expected_group_size:
+            return f"group size {values.numel()} does not match expected size {expected_group_size}"
+        if not torch.isfinite(values).all():
+            return "non-finite reward"
+        if not torch.isfinite(mean) or not torch.isfinite(std):
+            return "non-finite group statistic"
+        if not torch.isfinite(normalized).all():
+            return "non-finite advantage"
+        if invariant_check and norm_adv_by_std_in_grpo and values.numel() > 1:
+            # For sample standard deviation, a centered group of size n has
+            # max |z_i| <= (n - 1) / sqrt(n). Adding epsilon only reduces it.
+            max_allowed = (values.numel() - 1) / math.sqrt(values.numel())
+            if normalized.abs().max().item() > max_allowed + 1e-5:
+                return f"standardized magnitude exceeds {max_allowed:.8g}"
+        return ""
 
     with torch.no_grad():
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                scores_tensor = torch.stack(id2score[idx])
-                id2mean[idx] = torch.mean(scores_tensor)
-                id2std[idx] = torch.std(scores_tensor)
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-            else:
-                scores[i] = scores[i] - id2mean[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
+        scalar_advantages = torch.zeros_like(scores)
+        score_version = token_level_rewards._version
+        for uid, positions in group_positions.items():
+            position_tensor = torch.as_tensor(positions, device=scores.device, dtype=torch.long)
+            values = scores.index_select(0, position_tensor)
+            normalized, mean, std = normalize_group(values)
+            is_constant = bool(torch.isfinite(values).all() and values.numel() > 0 and values.min() == values.max())
+            stats["grpo/constant_groups" if is_constant else "grpo/mixed_groups"] += 1.0
 
-    return scores, scores
+            reason = invalid_reason(values, normalized, mean, std)
+            if reason:
+                stats["grpo/invalid_groups"] += 1.0
+                stats["grpo/recomputed_groups"] += 1.0
+                cpu_values = values.detach().to(device="cpu", dtype=torch.float64)
+                cpu_normalized, cpu_mean, cpu_std = normalize_group(cpu_values)
+                reason = invalid_reason(cpu_values, cpu_normalized, cpu_mean, cpu_std)
+                normalized = cpu_normalized.to(device=scores.device)
+                mean, std = cpu_mean, cpu_std
+
+            if reason:
+                details = (
+                    f"uid={uid!r} size={len(positions)} reason={reason} "
+                    f"rewards={values.detach().cpu().tolist()} mean={mean.item():.8g} std={std.item():.8g} "
+                    f"adv_range=[{normalized.min().item():.8g}, {normalized.max().item():.8g}] "
+                    f"dtype={values.dtype} device={values.device} shape={tuple(values.shape)}"
+                )
+                if invalid_policy == "raise":
+                    raise FloatingPointError(f"Invalid GRPO group: {details}")
+                normalized = torch.zeros_like(normalized)
+                stats["grpo/zeroed_groups"] += 1.0
+                if diagnostic_log:
+                    print(f"[GRPO invariant] zeroed invalid group: {details}", flush=True)
+
+            scalar_advantages.index_copy_(0, position_tensor, normalized)
+
+        stats["grpo/max_abs_advantage"] = float(scalar_advantages.abs().max().item()) if scores.numel() else 0.0
+        stats["grpo/input_mutation_detected"] = float(token_level_rewards._version != score_version)
+        advantages = scalar_advantages.to(dtype=output_dtype).unsqueeze(-1) * response_mask
+        if not torch.isfinite(advantages).all():
+            raise FloatingPointError("GRPO produced non-finite token advantages")
+        if torch.count_nonzero(advantages.masked_select(response_mask == 0)).item():
+            raise RuntimeError("GRPO produced nonzero advantages outside the response mask")
+
+    if diagnostics is not None:
+        diagnostics.update(stats)
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)

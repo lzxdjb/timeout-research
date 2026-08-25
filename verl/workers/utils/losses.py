@@ -84,6 +84,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
+    if "train_sample_mask" in data:
+        fields.append("train_sample_mask")
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -91,6 +93,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
+    train_sample_mask = data.get("train_sample_mask")
+    if train_sample_mask is not None:
+        response_mask = response_mask & train_sample_mask.to(bool).unsqueeze(-1)
     # compute policy loss
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
@@ -178,10 +183,16 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
         metric_aggregation = AggregationType.MEAN
 
     # select fields and convert to padded tensor
-    data = data.select("values", "returns", "response_mask").to_padded_tensor()
+    fields = ["values", "returns", "response_mask"]
+    if "train_sample_mask" in data:
+        fields.append("train_sample_mask")
+    data = data.select(*fields).to_padded_tensor()
     values = data["values"]
     returns = data["returns"]
     response_mask = data["response_mask"].to(bool)
+    train_sample_mask = data.get("train_sample_mask")
+    if train_sample_mask is not None:
+        response_mask = response_mask & train_sample_mask.to(bool).unsqueeze(-1)
 
     vf_loss, vf_clipfrac = compute_value_loss(
         vpreds=vpreds,
