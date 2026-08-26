@@ -79,6 +79,14 @@ export ETP="${ETP:-1}"
 export GEN_TP="${GEN_TP:-2}"
 export ALL_OFFLOAD="${ALL_OFFLOAD:-True}"
 export NDEVICES_PER_NODE="${NDEVICES_PER_NODE:-8}"
+# Megatron-Core's auto backend requires all NVTE attention modes to be enabled.
+# The SWE Ray runtime enables FlashAttention only, so default to the compatible
+# backend while keeping this selectable for environments with different kernels.
+export ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
+# Qwen3.5 GDN is most portable in Megatron's padded BSHD path. Set these to
+# True only with a Megatron/mbridge combination known to support packed THD.
+export USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
+export USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
 
 export SWE_AGENT_EXECUTION_BACKEND="${SWE_AGENT_EXECUTION_BACKEND:-remote}"
 export SWE_AGENT_EXECUTION_BYPASS_PROXY="${SWE_AGENT_EXECUTION_BYPASS_PROXY:-1}"
@@ -167,20 +175,21 @@ overrides=(
   data.max_response_length=40000
   data.return_raw_chat=True
   actor_rollout_ref.model.enable_gradient_checkpointing=True
-  actor_rollout_ref.model.use_remove_padding=True
+  actor_rollout_ref.model.use_remove_padding="$USE_REMOVE_PADDING"
   actor_rollout_ref.actor.optim.lr=3e-6
   actor_rollout_ref.actor.use_kl_loss=False
   actor_rollout_ref.actor.ppo_mini_batch_size=512
-  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=48192
-  actor_rollout_ref.actor.use_dynamic_bsz=True
+  actor_rollout_ref.actor.use_dynamic_bsz="$USE_DYNAMIC_BSZ"
   actor_rollout_ref.actor.megatron.pad_bshd_to_minibatch_max=False
-  actor_rollout_ref.actor.megatron.use_remove_padding=True
+  actor_rollout_ref.actor.megatron.use_remove_padding="$USE_REMOVE_PADDING"
+  actor_rollout_ref.actor.megatron.override_transformer_config.attention_backend="$ATTENTION_BACKEND"
   actor_rollout_ref.ref.megatron.use_mbridge=True
   actor_rollout_ref.ref.megatron.vanilla_mbridge=True
-  actor_rollout_ref.ref.megatron.use_remove_padding=True
-  actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
-  actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
+  actor_rollout_ref.ref.megatron.use_remove_padding="$USE_REMOVE_PADDING"
+  actor_rollout_ref.ref.log_prob_use_dynamic_bsz="$USE_DYNAMIC_BSZ"
+  actor_rollout_ref.rollout.log_prob_use_dynamic_bsz="$USE_DYNAMIC_BSZ"
   actor_rollout_ref.rollout.n=1
   actor_rollout_ref.rollout.gpu_memory_utilization=0.80
   actor_rollout_ref.rollout.max_num_seqs=2048
@@ -211,20 +220,20 @@ overrides=(
   critic.enable=True
   critic.model.trust_remote_code=True
   critic.model.enable_gradient_checkpointing=True
-  critic.model.use_remove_padding=True
+  critic.model.use_remove_padding="$USE_REMOVE_PADDING"
   critic.optim.lr=1e-5
   +critic.optim.override_optimizer_config.optimizer_offload_fraction=1
   +critic.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True
   +critic.optim.override_optimizer_config.use_precision_aware_optimizer=True
   +critic.optim.override_optimizer_config.optimizer_cpu_offload=True
-  critic.ppo_mini_batch_size=64
+  critic.ppo_mini_batch_size=512
   critic.ppo_micro_batch_size_per_gpu=1
   critic.ppo_max_token_len_per_gpu=48192
   critic.forward_max_token_len_per_gpu=48192
-  critic.use_dynamic_bsz=True
+  critic.use_dynamic_bsz="$USE_DYNAMIC_BSZ"
   critic.megatron.use_mbridge=True
   critic.megatron.vanilla_mbridge=True
-  critic.megatron.use_remove_padding=True
+  critic.megatron.use_remove_padding="$USE_REMOVE_PADDING"
   critic.megatron.tensor_model_parallel_size="$TP"
   critic.megatron.pipeline_model_parallel_size="$PP"
   critic.megatron.context_parallel_size="$CP"
@@ -246,7 +255,7 @@ overrides=(
 echo "Target verl: $TARGET_VERL"
 echo "SWE source:  $SWE_SOURCE ($SWE_SOURCE_REVISION, recipe=$SWE_SOURCE_AGENT_STATE)"
 echo "Model:       $MODEL_PATH"
-echo "Parallelism: TP=$TP PP=$PP CP=$CP EP=$EP ETP=$ETP GEN_TP=$GEN_TP"
+echo "Parallelism: TP=$TP PP=$PP CP=$CP EP=$EP ETP=$ETP GEN_TP=$GEN_TP attention_backend=$ATTENTION_BACKEND"
 echo "Prefetch:    training=$SWE_AGENT_TRAINING_IMAGE_PREFETCH validation=$SWE_AGENT_VALIDATION_IMAGE_PREFETCH"
 echo "PPO: adv_estimator=gae rollout.n=1 critic_model=$MODEL_PATH infra_filter=$SWE_AGENT_TASK_FILTER_TRAINING_ENABLED"
 echo "Timeouts:    trajectory(train/val)=$SWE_AGENT_ROLLOUT_TRAINING_TRAJECTORY_TIMEOUT_SECONDS/$SWE_AGENT_ROLLOUT_VALIDATION_TRAJECTORY_TIMEOUT_SECONDS hard(train/val)=$SWE_AGENT_EXECUTION_TRAINING_HARD_TIMEOUT_SECONDS/$SWE_AGENT_EXECUTION_VALIDATION_HARD_TIMEOUT_SECONDS http(claim/execute/reward/release/prefetch)=$SWE_AGENT_EXECUTION_CLAIM_HTTP_TIMEOUT_SECONDS/$SWE_AGENT_EXECUTION_EXECUTE_HTTP_TIMEOUT_SECONDS/$SWE_AGENT_EXECUTION_REWARD_HTTP_TIMEOUT_SECONDS/$SWE_AGENT_EXECUTION_RELEASE_HTTP_TIMEOUT_SECONDS/$SWE_AGENT_EXECUTION_PREFETCH_HTTP_TIMEOUT_SECONDS"

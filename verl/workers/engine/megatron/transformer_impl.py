@@ -294,11 +294,13 @@ class MegatronEngine(BaseEngine):
 
         override_transformer_config = mapping_string_to_attn_backend({**self.engine_config.override_transformer_config})
         if self.is_value_model:
-            # A value head cannot share weights with the vocabulary embedding. This must
-            # be set before either bridge creates and finalizes its Megatron config.
+            # A value head cannot share weights with the vocabulary embedding. Force the HF
+            # flag off (both bridges derive the model's tie-embeddings behavior from it) and
+            # record it for the checkpoint manager. Do not push this compatibility flag
+            # through override_transformer_config: vanilla mbridge forwards those values
+            # into TransformerConfig(**kwargs), and some Megatron builds reject the kwarg.
             self.model_config.hf_config.tie_word_embeddings = False
             self.share_embeddings_and_output_weights = False
-            override_transformer_config["share_embeddings_and_output_weights"] = False
         if self.engine_config.dynamic_context_parallel:
             override_transformer_config.update(
                 {
@@ -329,6 +331,11 @@ class MegatronEngine(BaseEngine):
             tf_config = bridge.config
             tf_config.fp16 = self.param_dtype == torch.float16
             tf_config.bf16 = self.param_dtype == torch.bfloat16
+            # Older Qwen3.5 mbridge TransformerConfig classes do not expose this field.
+            # Set it only when supported, after construction, instead of passing it to
+            # set_extra_args above.
+            if self.is_value_model and hasattr(tf_config, "share_embeddings_and_output_weights"):
+                tf_config.share_embeddings_and_output_weights = False
         else:
             from verl.models.mcore.bridge import AutoBridge
 
@@ -362,6 +369,11 @@ class MegatronEngine(BaseEngine):
             }
             for key, value in override_transformer_config.items():
                 provider_overrides[key] = value
+            # Megatron-Bridge exposes this on its provider in supported versions; apply it
+            # there rather than sending the legacy compatibility kwarg through the generic
+            # override map.
+            if self.is_value_model and hasattr(provider, "share_embeddings_and_output_weights"):
+                provider_overrides["share_embeddings_and_output_weights"] = False
             if (
                 self.model_config.hf_config.model_type == "deepseek_v4"
                 and not self.model_config.mtp.enable
