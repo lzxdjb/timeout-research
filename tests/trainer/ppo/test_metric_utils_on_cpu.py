@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 
+from verl import DataProto
 from verl.trainer.ppo.metric_utils import (
     bootstrap_metric,
     calc_maj_val,
@@ -29,7 +30,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.ray_trainer import _get_validation_metric_sources
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _get_validation_metric_sources
 from verl.utils.metric import (
     reduce_metrics,
 )
@@ -73,6 +74,30 @@ class TestReduceMetrics(unittest.TestCase):
 
 
 class TestValidationMetricSources(unittest.TestCase):
+    def test_generation_batch_preserves_metric_source_for_agent_reward_loop(self):
+        batch = DataProto.from_single_dict(
+            {
+                "dummy_tensor": torch.zeros(2, 1),
+                "data_source": np.array(["swe_agent_verl"] * 2, dtype=object),
+                "metric_data_source": np.array(["swe_bench_pro", "swe_bench_verified"], dtype=object),
+                "reward_model": np.array([{}, {}], dtype=object),
+                "extra_info": np.array([{}, {}], dtype=object),
+                "uid": np.array(["pro-task", "verified-task"], dtype=object),
+                "agent_name": np.array(["swe_tool_agent"] * 2, dtype=object),
+            }
+        )
+
+        gen_batch = RayPPOTrainer.__new__(RayPPOTrainer)._get_gen_batch(batch)
+
+        np.testing.assert_array_equal(
+            batch.non_tensor_batch["metric_data_source"],
+            ["swe_bench_pro", "swe_bench_verified"],
+        )
+        np.testing.assert_array_equal(
+            gen_batch.non_tensor_batch["metric_data_source"],
+            ["swe_bench_pro", "swe_bench_verified"],
+        )
+
     def test_prefers_metric_data_source_and_falls_back_per_row(self):
         sources = _get_validation_metric_sources(
             {

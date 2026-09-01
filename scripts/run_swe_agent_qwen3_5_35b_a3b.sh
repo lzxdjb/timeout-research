@@ -93,7 +93,7 @@ export SWE_AGENT_EXECUTION_OPERATION_POLL_INTERVAL_SECONDS="${SWE_AGENT_EXECUTIO
 export SWE_AGENT_EXECUTION_TRAINING_HARD_TIMEOUT_SECONDS="${SWE_AGENT_EXECUTION_TRAINING_HARD_TIMEOUT_SECONDS:-600}"
 export SWE_AGENT_EXECUTION_VALIDATION_HARD_TIMEOUT_SECONDS="${SWE_AGENT_EXECUTION_VALIDATION_HARD_TIMEOUT_SECONDS:-900}"
 export SWE_AGENT_ROLLOUT_TRAINING_TRAJECTORY_TIMEOUT_SECONDS="${SWE_AGENT_ROLLOUT_TRAINING_TRAJECTORY_TIMEOUT_SECONDS:-2100}"
-export SWE_AGENT_ROLLOUT_VALIDATION_TRAJECTORY_TIMEOUT_SECONDS="${SWE_AGENT_ROLLOUT_VALIDATION_TRAJECTORY_TIMEOUT_SECONDS:-2100}"
+export SWE_AGENT_ROLLOUT_VALIDATION_TRAJECTORY_TIMEOUT_SECONDS="${SWE_AGENT_ROLLOUT_VALIDATION_TRAJECTORY_TIMEOUT_SECONDS:-400}"
 export SWE_AGENT_TRAINING_VERIFICATION_REWARD_SHAPING="${SWE_AGENT_TRAINING_VERIFICATION_REWARD_SHAPING:-1}"
 export SWE_AGENT_TRAINING_VERIFICATION_PENALTY="${SWE_AGENT_TRAINING_VERIFICATION_PENALTY:-0.1}"
 export SWE_AGENT_TRAINING_VERIFICATION_WINDOW_TURNS="${SWE_AGENT_TRAINING_VERIFICATION_WINDOW_TURNS:-2}"
@@ -156,6 +156,35 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3_5_35b_a3b_swe_cp2}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SWE_SOURCE/output/checkpoints/$EXPERIMENT_NAME}"
 SWE_AGENT_MAX_TURNS="${SWE_AGENT_MAX_TURNS:-70}"
 MAX_TOOL_RESPONSE_LENGTH="${MAX_TOOL_RESPONSE_LENGTH:-8000}"
+SWE_AGENT_HARNESS_PROFILE="${SWE_AGENT_HARNESS_PROFILE:-baseline}"
+export SWE_AGENT_HARNESS_PROFILE
+if [[ -z "${SWE_AGENT_TOOL_CONFIG_PATH:-}" ]]; then
+  if [[ "$SWE_AGENT_HARNESS_PROFILE" == "claude_like" ]]; then
+    SWE_AGENT_TOOL_CONFIG_PATH="$SWE_SOURCE/recipe/swe_agent/config/tool_config_claude_like.yaml"
+  else
+    SWE_AGENT_TOOL_CONFIG_PATH="$SWE_SOURCE/recipe/swe_agent/config/tool_config.yaml"
+  fi
+fi
+[[ -f "$SWE_AGENT_TOOL_CONFIG_PATH" ]] || {
+  echo "Tool config not found: $SWE_AGENT_TOOL_CONFIG_PATH" >&2
+  exit 2
+}
+python - "$SWE_AGENT_TOOL_CONFIG_PATH" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+path = Path(sys.argv[1])
+try:
+    with path.open(encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+except Exception as exc:
+    raise SystemExit(f"Invalid tool config YAML: {path}: {exc}")
+if not isinstance(config, dict) or not isinstance(config.get("tools"), list):
+    raise SystemExit(f"Invalid tool config shape: {path} (expected a top-level tools list)")
+print(f"Tool config valid: {path} ({len(config['tools'])} tools)")
+PY
 
 overrides=(
   data.train_files="$TRAIN_FILES"
@@ -189,7 +218,7 @@ overrides=(
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=48192
   actor_rollout_ref.rollout.multi_turn.enable=True
   actor_rollout_ref.rollout.multi_turn.format=qwen3_coder
-  actor_rollout_ref.rollout.multi_turn.tool_config_path="$SWE_SOURCE/recipe/swe_agent/config/tool_config.yaml"
+  actor_rollout_ref.rollout.multi_turn.tool_config_path="$SWE_AGENT_TOOL_CONFIG_PATH"
   actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1
   actor_rollout_ref.rollout.multi_turn.max_assistant_turns="$SWE_AGENT_MAX_TURNS"
   actor_rollout_ref.rollout.multi_turn.max_user_turns="$SWE_AGENT_MAX_TURNS"
@@ -211,6 +240,7 @@ overrides=(
 echo "Target verl: $TARGET_VERL"
 echo "SWE source:  $SWE_SOURCE ($SWE_SOURCE_REVISION, recipe=$SWE_SOURCE_AGENT_STATE)"
 echo "Model:       $MODEL_PATH"
+echo "Harness:     $SWE_AGENT_HARNESS_PROFILE"
 echo "Parallelism: TP=$TP PP=$PP CP=$CP EP=$EP ETP=$ETP GEN_TP=$GEN_TP"
 echo "Prefetch:    training=$SWE_AGENT_TRAINING_IMAGE_PREFETCH validation=$SWE_AGENT_VALIDATION_IMAGE_PREFETCH"
 echo "GRPO checks: invariant=$VERL_GRPO_INVARIANT_CHECK policy=$VERL_GRPO_INVALID_GROUP_POLICY diagnostics=$VERL_GRPO_DIAGNOSTICS"

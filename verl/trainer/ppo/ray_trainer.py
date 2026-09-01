@@ -1102,7 +1102,12 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        # Keep metric labels on the original batch so validation can restore
+        # them after agent-side reward-loop generation.
+        reward_keys = (
+            {"data_source", "metric_data_source", "reward_model", "extra_info", "uid"}
+            & batch.non_tensor_batch.keys()
+        )
 
         # pop those keys for generation
         batch_keys_to_pop = []
