@@ -14,6 +14,39 @@ rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
 # fsdp, fsdp2 or megatron. must be set.
 strategy: ???
 
+# Optional three-class reward prediction for trajectory timeouts
+timeout_prediction:
+
+  # Target dataclass for this configuration
+  _target_: verl.workers.config.TimeoutPredictionConfig
+
+  # Enable timeout prediction and retention
+  enabled: false
+
+  # Reward classes are {-0.1, 0, 1}
+  target_mode: three_class_reward
+
+  # Weight of the sidecar predictor loss
+  loss_coef: 0.1
+
+  # Learning rate for the sidecar predictor
+  learning_rate: 1.0e-4
+
+  # Calibration failure probability
+  confidence_delta: 0.05
+
+  # Reserved for a future lagged predictor mode
+  use_lagged_predictor: false
+
+  # Keep the existing terminal reward layout by default
+  reward_assignment: terminal
+
+  # Optional normalization when broadcast assignment is explicitly selected
+  normalize_broadcast: false
+
+  # Save sidecar optimizer state with actor checkpoints
+  save_optimizer: true
+
 # Split each sample into sub-batches of this size for PPO
 ppo_mini_batch_size: 256
 

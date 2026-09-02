@@ -51,6 +51,12 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.timeout_prediction import (
+    TimeoutRewardPredictor,
+    build_timeout_rewards,
+    conformal_radius,
+    reward_classes,
+)
 from verl.trainer.ppo.swe_image_prefetch import (
     _SWETrainingImagePrefetcher,
     _SWEValidationImagePrefetcher,
@@ -705,6 +711,20 @@ class RayPPOTrainer:
         self.processor = processor
         self.config = config
 
+        timeout_cfg = config.actor_rollout_ref.actor.get("timeout_prediction", {})
+        self.timeout_prediction_enabled = bool(timeout_cfg.get("enabled", False))
+        self.timeout_prediction_cfg = timeout_cfg
+        self.timeout_predictor = TimeoutRewardPredictor() if self.timeout_prediction_enabled else None
+        self.timeout_predictor_optimizer = (
+            torch.optim.AdamW(
+                self.timeout_predictor.parameters(),
+                lr=float(timeout_cfg.get("learning_rate", 1.0e-4)),
+            )
+            if self.timeout_predictor is not None
+            else None
+        )
+        self.timeout_prediction_step = 0
+
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
@@ -749,6 +769,118 @@ class RayPPOTrainer:
 
         self.checkpoint_manager = None
         self._init_dump_executor()
+
+    def _timeout_failure_mask(self, batch: DataProto) -> torch.Tensor:
+        """Identify genuine trajectory-deadline timeouts from reward metadata."""
+        reasons = batch.non_tensor_batch.get("observed_infrastructure_failure_reason")
+        if reasons is None:
+            reasons = batch.non_tensor_batch.get("infrastructure_failure_reason")
+        if reasons is None:
+            return torch.zeros(len(batch), dtype=torch.bool)
+        if len(reasons) != len(batch):
+            raise ValueError("Timeout metadata length does not match training batch size")
+        return torch.tensor(
+            [str(reason) == "trajectory_deadline_exceeded" for reason in reasons], dtype=torch.bool
+        )
+
+    def _infrastructure_failure_mask(self, batch: DataProto) -> torch.Tensor:
+        values = batch.non_tensor_batch.get("observed_infrastructure_failure")
+        if values is None:
+            values = batch.non_tensor_batch.get("infrastructure_failure")
+        if values is None:
+            return torch.zeros(len(batch), dtype=torch.bool)
+        if len(values) != len(batch):
+            raise ValueError("Infrastructure metadata length does not match training batch size")
+
+        def is_failure(value: Any) -> bool:
+            try:
+                if value is None or (isinstance(value, float) and not np.isfinite(value)):
+                    return False
+                return int(value) == 1
+            except (TypeError, ValueError, OverflowError):
+                return False
+
+        return torch.tensor([is_failure(value) for value in values], dtype=torch.bool)
+
+    @staticmethod
+    def _trajectory_scores(reward_tensor: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+        """Read scalar scores from the existing terminal reward representation."""
+        positions = response_mask.to(torch.long).sum(dim=-1).clamp_min(1) - 1
+        return reward_tensor.gather(1, positions.unsqueeze(-1)).squeeze(-1)
+
+    def _apply_timeout_prediction(self, batch: DataProto, reward_tensor: torch.Tensor) -> torch.Tensor:
+        """Calibrate predictions and mask unverified timeout trajectories."""
+        if not self.timeout_prediction_enabled or self.timeout_predictor is None:
+            return reward_tensor
+
+        response_mask = batch.batch["response_mask"]
+        old_log_probs = batch.batch["old_log_probs"].detach().to(torch.float32).cpu()
+        response_mask_cpu = response_mask.detach().to(torch.bool).cpu()
+        features = self.timeout_predictor.features(old_log_probs, response_mask_cpu)
+        with torch.no_grad():
+            probabilities, _ = self.timeout_predictor.predict(features)
+
+        timeout_mask = self._timeout_failure_mask(batch)
+        infrastructure_mask = self._infrastructure_failure_mask(batch)
+        complete_mask = ~infrastructure_mask
+        scores_cpu = self._trajectory_scores(
+            reward_tensor.detach().to(torch.float32).cpu(), response_mask_cpu
+        )
+        calibration_radius = conformal_radius(
+            probabilities[complete_mask],
+            scores_cpu[complete_mask],
+            float(self.timeout_prediction_cfg.get("confidence_delta", 0.05)),
+        )
+        predicted_classes = probabilities.argmax(dim=-1)
+        unique_max = probabilities.eq(probabilities.max(dim=-1, keepdim=True).values).sum(dim=-1).eq(1)
+        confidence_set_size = (probabilities > calibration_radius).sum(dim=-1)
+        keep_mask = (confidence_set_size == 1) & unique_max
+        assignment = str(self.timeout_prediction_cfg.get("reward_assignment", "terminal"))
+        normalize = bool(self.timeout_prediction_cfg.get("normalize_broadcast", False))
+        scores, train_mask = build_timeout_rewards(
+            reward_tensor,
+            response_mask,
+            timeout_mask.to(reward_tensor.device),
+            probabilities.to(reward_tensor.device),
+            keep_mask.to(reward_tensor.device),
+            assignment,
+            normalize,
+            infrastructure_mask.to(reward_tensor.device),
+        )
+        batch.batch["timeout_prediction_probs"] = probabilities.to(reward_tensor.device)
+        batch.batch["timeout_prediction_class"] = predicted_classes.to(reward_tensor.device)
+        batch.batch["timeout_prediction_keep"] = keep_mask.to(reward_tensor.device)
+        batch.batch["timeout_prediction_target_scores"] = scores_cpu.to(reward_tensor.device)
+        batch.batch["timeout_prediction_radius"] = torch.full(
+            (len(batch),), calibration_radius, dtype=reward_tensor.dtype, device=reward_tensor.device
+        )
+        batch.batch["timeout_train_mask"] = train_mask
+        return scores
+
+    def _update_timeout_predictor(self, batch: DataProto) -> dict[str, float]:
+        if not self.timeout_prediction_enabled or self.timeout_predictor is None:
+            return {}
+        infrastructure_mask = self._infrastructure_failure_mask(batch)
+        complete_mask = ~infrastructure_mask
+        if not complete_mask.any():
+            return {"timeout_prediction/complete_count": 0.0}
+        response_mask = batch.batch["response_mask"].detach().to(torch.bool).cpu()
+        old_log_probs = batch.batch["old_log_probs"].detach().to(torch.float32).cpu()
+        features = self.timeout_predictor.features(old_log_probs, response_mask)
+        scores = batch.batch["timeout_prediction_target_scores"].detach().to(torch.float32).cpu()
+        labels = reward_classes(scores)
+        logits = self.timeout_predictor(features[complete_mask])
+        loss = torch.nn.functional.cross_entropy(logits, labels[complete_mask])
+        loss = loss * float(self.timeout_prediction_cfg.get("loss_coef", 0.1))
+        assert self.timeout_predictor_optimizer is not None
+        self.timeout_predictor_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.timeout_predictor_optimizer.step()
+        self.timeout_prediction_step += 1
+        return {
+            "timeout_prediction/loss": float(loss.detach().item()),
+            "timeout_prediction/complete_count": float(complete_mask.sum().item()),
+        }
 
     @staticmethod
     def _iter_batches_with_lookahead(dataloader, *, enabled: bool, capture_state: bool = False):
@@ -1577,6 +1709,7 @@ class RayPPOTrainer:
         self.actor_rollout_wg.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
         )
+        self._save_timeout_predictor(actor_local_path)
 
         if self.use_critic:
             critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
@@ -1655,6 +1788,7 @@ class RayPPOTrainer:
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
+        self._load_timeout_predictor(actor_path)
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(
@@ -1679,6 +1813,35 @@ class RayPPOTrainer:
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+    def _save_timeout_predictor(self, actor_path: str) -> None:
+        if not self.timeout_prediction_enabled or self.timeout_predictor is None:
+            return
+        sidecar_path = os.path.join(actor_path, "timeout_predictor")
+        os.makedirs(sidecar_path, exist_ok=True)
+        payload = {
+            "model": self.timeout_predictor.state_dict(),
+            "step": self.timeout_prediction_step,
+            "class_values": TimeoutRewardPredictor.class_values,
+        }
+        if (
+            bool(self.timeout_prediction_cfg.get("save_optimizer", True))
+            and self.timeout_predictor_optimizer is not None
+        ):
+            payload["optimizer"] = self.timeout_predictor_optimizer.state_dict()
+        torch.save(payload, os.path.join(sidecar_path, "state.pt"))
+
+    def _load_timeout_predictor(self, actor_path: str) -> None:
+        if not self.timeout_prediction_enabled or self.timeout_predictor is None:
+            return
+        state_path = os.path.join(actor_path, "timeout_predictor", "state.pt")
+        if not os.path.exists(state_path):
+            return
+        payload = torch.load(state_path, map_location="cpu", weights_only=False)
+        self.timeout_predictor.load_state_dict(payload["model"])
+        self.timeout_prediction_step = int(payload.get("step", 0))
+        if self.timeout_predictor_optimizer is not None and "optimizer" in payload:
+            self.timeout_predictor_optimizer.load_state_dict(payload["optimizer"])
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -2200,6 +2363,14 @@ class RayPPOTrainer:
                                 metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    if self.timeout_prediction_enabled:
+                        reward_tensor = self._apply_timeout_prediction(batch, reward_tensor)
+                        if grpo_boundary_baseline is not None:
+                            # Reward imputation is an intentional transformation; subsequent
+                            # boundary checks should validate the transformed inputs.
+                            grpo_boundary_baseline = _capture_grpo_boundary(
+                                batch, reward_tensor=reward_tensor
+                            )
                     if grpo_boundary_baseline is not None:
                         _check_grpo_boundary(
                             "after_old_log_prob",
@@ -2265,6 +2436,11 @@ class RayPPOTrainer:
                                 and int(self.config.actor_rollout_ref.rollout.n) == 1
                             ),
                         )
+                        if self.timeout_prediction_enabled:
+                            timeout_row_mask = batch.batch["timeout_train_mask"].any(dim=-1)
+                            batch.batch["train_sample_mask"] = (
+                                batch.batch["train_sample_mask"] & timeout_row_mask
+                            )
                         metrics.update(task_filter_metrics)
                         for key in ("task_filter_excluded", "task_filter_ratio", "task_filter_failure_count"):
                             if key in batch.non_tensor_batch:
@@ -2318,6 +2494,7 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+                        metrics.update(self._update_timeout_predictor(batch))
                         if grpo_boundary_baseline is not None:
                             _check_grpo_boundary(
                                 "after_actor_update",

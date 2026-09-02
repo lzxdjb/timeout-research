@@ -36,6 +36,7 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "PolicyLossConfig",
     "RouterReplayConfig",
+    "TimeoutPredictionConfig",
     "ActorConfig",
     "FSDPActorConfig",
     "McoreActorConfig",
@@ -101,6 +102,21 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     dro_beta: Optional[float] = None
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+
+
+@dataclass
+class TimeoutPredictionConfig(BaseConfig):
+    """Optional sidecar configuration for imputing trajectory-timeout rewards."""
+
+    enabled: bool = False
+    target_mode: str = "three_class_reward"
+    loss_coef: float = 0.1
+    learning_rate: float = 1.0e-4
+    confidence_delta: float = 0.05
+    use_lagged_predictor: bool = False
+    reward_assignment: str = "terminal"
+    normalize_broadcast: bool = False
+    save_optimizer: bool = True
 
 
 @dataclass
@@ -188,6 +204,7 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+    timeout_prediction: TimeoutPredictionConfig = field(default_factory=TimeoutPredictionConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
