@@ -156,6 +156,22 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3_5_35b_a3b_swe_cp2}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SWE_SOURCE/output/checkpoints/$EXPERIMENT_NAME}"
 SWE_AGENT_MAX_TURNS="${SWE_AGENT_MAX_TURNS:-70}"
 MAX_TOOL_RESPONSE_LENGTH="${MAX_TOOL_RESPONSE_LENGTH:-8000}"
+
+# Keep the prompt/response lengths as the only sequence-size knobs. Lowercase
+# variables are supported for consistency with the other launch scripts;
+# uppercase aliases are accepted for environment-based configuration.
+max_prompt_length="${max_prompt_length:-${MAX_PROMPT_LENGTH:-8192}}"
+max_response_length="${max_response_length:-${MAX_RESPONSE_LENGTH:-40000}}"
+if ! [[ "$max_prompt_length" =~ ^[0-9]+$ ]] || (( 10#$max_prompt_length <= 0 )); then
+  echo "max_prompt_length must be a positive integer: $max_prompt_length" >&2
+  exit 2
+fi
+if ! [[ "$max_response_length" =~ ^[0-9]+$ ]] || (( 10#$max_response_length <= 0 )); then
+  echo "max_response_length must be a positive integer: $max_response_length" >&2
+  exit 2
+fi
+max_sequence_length=$((10#$max_prompt_length + 10#$max_response_length))
+
 SWE_AGENT_HARNESS_PROFILE="${SWE_AGENT_HARNESS_PROFILE:-baseline}"
 export SWE_AGENT_HARNESS_PROFILE
 if [[ -z "${SWE_AGENT_TOOL_CONFIG_PATH:-}" ]]; then
@@ -190,15 +206,15 @@ overrides=(
   data.train_files="$TRAIN_FILES"
   data.val_files="$VAL_FILES"
   data.train_batch_size=64
-  data.max_prompt_length=8192
-  data.max_response_length=40000
+  data.max_prompt_length="$max_prompt_length"
+  data.max_response_length="$max_response_length"
   data.return_raw_chat=True
   actor_rollout_ref.model.enable_gradient_checkpointing=True
   actor_rollout_ref.model.use_remove_padding=True
   actor_rollout_ref.actor.optim.lr=3e-6
   actor_rollout_ref.actor.ppo_mini_batch_size=64
-  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
-  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=48192
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$max_sequence_length"
   actor_rollout_ref.actor.use_dynamic_bsz=True
   actor_rollout_ref.actor.megatron.pad_bshd_to_minibatch_max=False
   actor_rollout_ref.actor.megatron.use_remove_padding=True
@@ -210,12 +226,13 @@ overrides=(
   actor_rollout_ref.rollout.n=8
   actor_rollout_ref.rollout.gpu_memory_utilization=0.80
   actor_rollout_ref.rollout.max_num_seqs=2048
-  actor_rollout_ref.rollout.max_model_len=48192
+  actor_rollout_ref.rollout.max_num_batched_tokens="$max_sequence_length"
+  actor_rollout_ref.rollout.max_model_len="$max_sequence_length"
   actor_rollout_ref.rollout.enforce_eager=True
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4
-  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=48192
+  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$max_sequence_length"
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4
-  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=48192
+  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$max_sequence_length"
   actor_rollout_ref.rollout.multi_turn.enable=True
   actor_rollout_ref.rollout.multi_turn.format=qwen3_coder
   actor_rollout_ref.rollout.multi_turn.tool_config_path="$SWE_AGENT_TOOL_CONFIG_PATH"
@@ -241,6 +258,7 @@ echo "Target verl: $TARGET_VERL"
 echo "SWE source:  $SWE_SOURCE ($SWE_SOURCE_REVISION, recipe=$SWE_SOURCE_AGENT_STATE)"
 echo "Model:       $MODEL_PATH"
 echo "Harness:     $SWE_AGENT_HARNESS_PROFILE"
+echo "Sequence lengths: prompt=$max_prompt_length response=$max_response_length total=$max_sequence_length"
 echo "Parallelism: TP=$TP PP=$PP CP=$CP EP=$EP ETP=$ETP GEN_TP=$GEN_TP"
 echo "Prefetch:    training=$SWE_AGENT_TRAINING_IMAGE_PREFETCH validation=$SWE_AGENT_VALIDATION_IMAGE_PREFETCH"
 echo "GRPO checks: invariant=$VERL_GRPO_INVARIANT_CHECK policy=$VERL_GRPO_INVALID_GROUP_POLICY diagnostics=$VERL_GRPO_DIAGNOSTICS"
