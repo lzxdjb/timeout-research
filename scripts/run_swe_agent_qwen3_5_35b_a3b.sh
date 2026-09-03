@@ -157,17 +157,34 @@ OUTPUT_DIR="${OUTPUT_DIR:-$SWE_SOURCE/output/checkpoints/$EXPERIMENT_NAME}"
 SWE_AGENT_MAX_TURNS="${SWE_AGENT_MAX_TURNS:-70}"
 MAX_TOOL_RESPONSE_LENGTH="${MAX_TOOL_RESPONSE_LENGTH:-8000}"
 
-# Keep the prompt/response lengths as the only sequence-size knobs. Lowercase
-# variables are supported for consistency with the other launch scripts;
-# uppercase aliases are accepted for environment-based configuration.
+# Prompt/response lengths define the maximum sequence accepted by the model.
+# PPO/log-prob token budgets are independent knobs because lowering them makes
+# the same batch run as more, smaller dynamic micro-batches. Lowercase variables
+# are supported for consistency with the other launch scripts; uppercase aliases
+# are accepted for environment-based configuration.
 max_prompt_length="${max_prompt_length:-${MAX_PROMPT_LENGTH:-8192}}"
 max_response_length="${max_response_length:-${MAX_RESPONSE_LENGTH:-40000}}"
+ppo_max_token_len_per_gpu="${ppo_max_token_len_per_gpu:-${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}}"
+rollout_log_prob_max_token_len_per_gpu="${rollout_log_prob_max_token_len_per_gpu:-${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-$ppo_max_token_len_per_gpu}}"
+ref_log_prob_max_token_len_per_gpu="${ref_log_prob_max_token_len_per_gpu:-${REF_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-$ppo_max_token_len_per_gpu}}"
 if ! [[ "$max_prompt_length" =~ ^[0-9]+$ ]] || (( 10#$max_prompt_length <= 0 )); then
   echo "max_prompt_length must be a positive integer: $max_prompt_length" >&2
   exit 2
 fi
 if ! [[ "$max_response_length" =~ ^[0-9]+$ ]] || (( 10#$max_response_length <= 0 )); then
   echo "max_response_length must be a positive integer: $max_response_length" >&2
+  exit 2
+fi
+if ! [[ "$ppo_max_token_len_per_gpu" =~ ^[0-9]+$ ]] || (( 10#$ppo_max_token_len_per_gpu <= 0 )); then
+  echo "ppo_max_token_len_per_gpu must be a positive integer: $ppo_max_token_len_per_gpu" >&2
+  exit 2
+fi
+if ! [[ "$rollout_log_prob_max_token_len_per_gpu" =~ ^[0-9]+$ ]] || (( 10#$rollout_log_prob_max_token_len_per_gpu <= 0 )); then
+  echo "rollout_log_prob_max_token_len_per_gpu must be a positive integer: $rollout_log_prob_max_token_len_per_gpu" >&2
+  exit 2
+fi
+if ! [[ "$ref_log_prob_max_token_len_per_gpu" =~ ^[0-9]+$ ]] || (( 10#$ref_log_prob_max_token_len_per_gpu <= 0 )); then
+  echo "ref_log_prob_max_token_len_per_gpu must be a positive integer: $ref_log_prob_max_token_len_per_gpu" >&2
   exit 2
 fi
 max_sequence_length=$((10#$max_prompt_length + 10#$max_response_length))
@@ -214,7 +231,7 @@ overrides=(
   actor_rollout_ref.actor.optim.lr=3e-6
   actor_rollout_ref.actor.ppo_mini_batch_size=64
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
-  actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$max_sequence_length"
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$ppo_max_token_len_per_gpu"
   actor_rollout_ref.actor.use_dynamic_bsz=True
   actor_rollout_ref.actor.megatron.pad_bshd_to_minibatch_max=False
   actor_rollout_ref.actor.megatron.use_remove_padding=True
@@ -230,9 +247,9 @@ overrides=(
   actor_rollout_ref.rollout.max_model_len="$max_sequence_length"
   actor_rollout_ref.rollout.enforce_eager=True
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4
-  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$max_sequence_length"
+  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$rollout_log_prob_max_token_len_per_gpu"
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4
-  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$max_sequence_length"
+  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$ref_log_prob_max_token_len_per_gpu"
   actor_rollout_ref.rollout.multi_turn.enable=True
   actor_rollout_ref.rollout.multi_turn.format=qwen3_coder
   actor_rollout_ref.rollout.multi_turn.tool_config_path="$SWE_AGENT_TOOL_CONFIG_PATH"
@@ -259,6 +276,7 @@ echo "SWE source:  $SWE_SOURCE ($SWE_SOURCE_REVISION, recipe=$SWE_SOURCE_AGENT_S
 echo "Model:       $MODEL_PATH"
 echo "Harness:     $SWE_AGENT_HARNESS_PROFILE"
 echo "Sequence lengths: prompt=$max_prompt_length response=$max_response_length total=$max_sequence_length"
+echo "Token budgets per GPU: ppo=$ppo_max_token_len_per_gpu rollout_log_prob=$rollout_log_prob_max_token_len_per_gpu ref_log_prob=$ref_log_prob_max_token_len_per_gpu"
 echo "Parallelism: TP=$TP PP=$PP CP=$CP EP=$EP ETP=$ETP GEN_TP=$GEN_TP"
 echo "Prefetch:    training=$SWE_AGENT_TRAINING_IMAGE_PREFETCH validation=$SWE_AGENT_VALIDATION_IMAGE_PREFETCH"
 echo "GRPO checks: invariant=$VERL_GRPO_INVARIANT_CHECK policy=$VERL_GRPO_INVALID_GROUP_POLICY diagnostics=$VERL_GRPO_DIAGNOSTICS"

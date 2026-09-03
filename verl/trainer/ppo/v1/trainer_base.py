@@ -98,6 +98,31 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
     params["temperature"] = 0
 
 
+def _get_off_policy_step_arrays(
+    tags: list[dict], non_padding_mask: np.ndarray, trainer_mode: str
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Extract trajectory model-version ranges, tolerating missing rollout metadata."""
+    min_values = []
+    max_values = []
+    for tag, is_non_padding in zip(tags, non_padding_mask):
+        if not is_non_padding:
+            continue
+        min_step = tag.get("min_global_steps")
+        max_step = tag.get("max_global_steps")
+        if trainer_mode == "sync":
+            sample_step = tag.get("global_steps")
+            # Synchronous generation runs before the actor update for this step,
+            # so its weights are the version immediately preceding the sample step.
+            rollout_step = sample_step - 1 if sample_step is not None else None
+            min_step = rollout_step if min_step is None else min_step
+            max_step = rollout_step if max_step is None else max_step
+        if min_step is None or max_step is None:
+            return None, None
+        min_values.append(min_step)
+        max_values.append(max_step)
+    return np.asarray(min_values, dtype=int), np.asarray(max_values, dtype=int)
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
@@ -1739,8 +1764,9 @@ class PPOTrainer(ABC):
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
-        min_global_steps = np.array([tag["min_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
-        max_global_steps = np.array([tag["max_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
+        min_global_steps, max_global_steps = _get_off_policy_step_arrays(
+            batch.tags, non_padding_mask, self.trainer_mode
+        )
 
         # Only fetch speculative decoding stats when rollout writes them.
         spec_drafts = spec_accepts = spec_verifies = None
@@ -1814,22 +1840,29 @@ class PPOTrainer(ABC):
         #     so the lag is a range: the freshest weights used give the lower bound
         #     (global_steps - max_global_steps) and the oldest weights the worst case
         #     (global_steps - min_global_steps). We log the lower bound as the primary metric.
-        trajectory_spans = max_global_steps - min_global_steps + 1
-        trajectory_staleness = (global_steps - 1) - max_global_steps
-        trajectory_staleness_worst = (global_steps - 1) - min_global_steps
-        metrics.update(
-            {
-                "training/off_policy/trajectory_spans/mean": trajectory_spans.mean(),
-                "training/off_policy/trajectory_spans/max": trajectory_spans.max(),
-                "training/off_policy/trajectory_spans/min": trajectory_spans.min(),
-                "training/off_policy/trajectory_staleness/mean": trajectory_staleness.mean(),
-                "training/off_policy/trajectory_staleness/max": trajectory_staleness.max(),
-                "training/off_policy/trajectory_staleness/min": trajectory_staleness.min(),
-                "training/off_policy/trajectory_staleness_worst/mean": trajectory_staleness_worst.mean(),
-                "training/off_policy/trajectory_staleness_worst/max": trajectory_staleness_worst.max(),
-                "training/off_policy/trajectory_staleness_worst/min": trajectory_staleness_worst.min(),
-            }
-        )
+        if min_global_steps is not None and max_global_steps is not None and min_global_steps.size:
+            trajectory_spans = max_global_steps - min_global_steps + 1
+            trajectory_staleness = (global_steps - 1) - max_global_steps
+            trajectory_staleness_worst = (global_steps - 1) - min_global_steps
+            metrics.update(
+                {
+                    "training/off_policy/trajectory_spans/mean": trajectory_spans.mean(),
+                    "training/off_policy/trajectory_spans/max": trajectory_spans.max(),
+                    "training/off_policy/trajectory_spans/min": trajectory_spans.min(),
+                    "training/off_policy/trajectory_staleness/mean": trajectory_staleness.mean(),
+                    "training/off_policy/trajectory_staleness/max": trajectory_staleness.max(),
+                    "training/off_policy/trajectory_staleness/min": trajectory_staleness.min(),
+                    "training/off_policy/trajectory_staleness_worst/mean": trajectory_staleness_worst.mean(),
+                    "training/off_policy/trajectory_staleness_worst/max": trajectory_staleness_worst.max(),
+                    "training/off_policy/trajectory_staleness_worst/min": trajectory_staleness_worst.min(),
+                }
+            )
+        elif non_padding_mask.any():
+            if not getattr(self, "_off_policy_metadata_warning_logged", False):
+                logger.warning(
+                    "Skipping off-policy staleness metrics because rollout version metadata is unavailable."
+                )
+                self._off_policy_metadata_warning_logged = True
 
 
 TRAINER_REGISTRY: dict[str, type[PPOTrainer]] = {}

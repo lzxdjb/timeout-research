@@ -17,7 +17,7 @@ from unittest.mock import patch
 from omegaconf import OmegaConf
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
-from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+from verl.trainer.ppo.v1.trainer_base import PPOTrainer, _get_off_policy_step_arrays
 
 
 class _StubTrainer(PPOTrainer):
@@ -31,6 +31,35 @@ class _StubTrainer(PPOTrainer):
 class _CustomSampler:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+
+
+def test_off_policy_steps_sync_fall_back_to_sample_step():
+    tags = [
+        {"global_steps": 3, "min_global_steps": None, "max_global_steps": None},
+        {"is_padding": True},
+    ]
+    min_steps, max_steps = _get_off_policy_step_arrays(tags, [True, False], "sync")
+
+    assert min_steps.tolist() == [2]
+    assert max_steps.tolist() == [2]
+
+
+def test_off_policy_steps_async_require_rollout_versions():
+    tags = [{"global_steps": 3, "min_global_steps": None, "max_global_steps": None}]
+
+    min_steps, max_steps = _get_off_policy_step_arrays(tags, [True], "separate_async")
+
+    assert min_steps is None
+    assert max_steps is None
+
+
+def test_off_policy_steps_preserve_async_rollout_versions():
+    tags = [{"global_steps": 3, "min_global_steps": 1, "max_global_steps": 2}]
+
+    min_steps, max_steps = _get_off_policy_step_arrays(tags, [True], "separate_async")
+
+    assert min_steps.tolist() == [1]
+    assert max_steps.tolist() == [2]
 
 
 def _trainer_with_filter_groups(filter_groups: dict, trainer_mode: str = "sync") -> _StubTrainer:
