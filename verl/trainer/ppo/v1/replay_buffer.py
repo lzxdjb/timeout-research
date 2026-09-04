@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import math
 import os
 import time
 from collections import Counter, defaultdict
@@ -29,6 +30,26 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS = int(os.getenv("VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS", "60"))
 
 DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
+
+COMPLETION_RATIO_ENV = {
+    "train": "SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD",
+    "val": "SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD",
+}
+
+
+def completion_ratio_threshold(partition_id: str) -> float | None:
+    """Return the opt-in completion ratio for a TransferQueue partition."""
+    name = COMPLETION_RATIO_ENV[partition_id]
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return None
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(value) or not 0.0 < value <= 1.0:
+        raise ValueError(f"{name} must be greater than 0 and at most 1")
+    return value
 
 
 def _accumulate_eviction_metrics(acc: dict, new: dict, stale_count: int) -> None:
@@ -126,6 +147,7 @@ class ReplayBuffer:
         gen_batch_size (int, optional): Dataloader fetch granularity for refill dispatches.
         max_inflight_gen_batches (int): Maximum Sync DAPO prompt batches concurrently pending or running.
         sync_refill_failed_groups (bool): Whether sync sampling replaces failed groups with no trajectories.
+        cancel_fn (callable, optional): UID-scoped rollout cancellation used by completion-ratio cutoff.
     """
 
     def __init__(
@@ -142,6 +164,7 @@ class ReplayBuffer:
         gen_batch_size: int | None = None,
         max_inflight_gen_batches: int = 1,
         sync_refill_failed_groups: bool = False,
+        cancel_fn=None,
     ):
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
@@ -155,6 +178,10 @@ class ReplayBuffer:
         self.gen_batch_size = gen_batch_size
         self.max_inflight_gen_batches = max_inflight_gen_batches
         self.sync_refill_failed_groups = sync_refill_failed_groups
+        self.cancel_fn = cancel_fn
+        self.completion_ratio_thresholds = {
+            partition_id: completion_ratio_threshold(partition_id) for partition_id in COMPLETION_RATIO_ENV
+        }
 
         assert isinstance(self.max_off_policy_threshold, int) and self.max_off_policy_threshold > 0, (
             f"Invalid max off policy threshold: {self.max_off_policy_threshold}, must be an integer greater than 0"
@@ -166,6 +193,11 @@ class ReplayBuffer:
             raise ValueError("Group filtering (filter_groups_metric) requires refill_fn to replace evicted groups")
         if self.sync_refill_failed_groups and self.refill_fn is None:
             raise ValueError("sync_refill_failed_groups requires refill_fn to replace failed groups")
+        if any(value is not None for value in self.completion_ratio_thresholds.values()):
+            if self.trainer_mode != "sync":
+                raise ValueError("Completion-ratio rollout cutoff is supported only in V1 synchronous trainer mode")
+            if self.filter_groups_metric is not None:
+                raise ValueError("Completion-ratio rollout cutoff cannot be combined with synchronous group filtering")
         self._validate_mode_config()
         # partition_id => {key: tag}
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
@@ -173,6 +205,7 @@ class ReplayBuffer:
         self.running_keys: dict[str, set] = defaultdict(set)
         self.finished_keys: dict[str, set] = defaultdict(set)
         self.failure_keys: dict[str, set] = defaultdict(set)
+        self.completion_ratio_cutoff_keys: dict[str, set] = defaultdict(set)
         # partition_id => {prompt_key: global_steps}, used to prioritize older samples.
         self.prompt_global_steps: dict[str, dict[str, int]] = defaultdict(dict)
         # Finished groups are immutable, so their DAPO classification can be reused across polling iterations.
@@ -192,6 +225,7 @@ class ReplayBuffer:
         self.running_keys.clear()
         self.finished_keys.clear()
         self.failure_keys.clear()
+        self.completion_ratio_cutoff_keys.clear()
         self.prompt_global_steps.clear()
 
         data = tq.kv_list()
@@ -213,6 +247,8 @@ class ReplayBuffer:
                             self.finished_keys[partition_id].add(key)
                         case "failure":
                             self.failure_keys[partition_id].add(key)
+                            if tag.get("completion_ratio_cutoff", False):
+                                self.completion_ratio_cutoff_keys[partition_id].add(key)
                         case _:
                             raise ValueError(f"Unknown status: {tag['status']}")
                 else:
@@ -241,6 +277,7 @@ class ReplayBuffer:
             del self.partitions[partition_id][key]
         for status_keys in (self.pending_keys, self.running_keys, self.finished_keys, self.failure_keys):
             status_keys[partition_id].difference_update(uids)
+        self.completion_ratio_cutoff_keys[partition_id].difference_update(uids)
         for uid in uids:
             self.prompt_global_steps[partition_id].pop(uid, None)
             self._dapo_classification_cache[partition_id].pop(uid, None)
@@ -306,14 +343,25 @@ class ReplayBuffer:
         twice. ``dapo_counts`` is the {shared_metric_value: group_count} diagnostic for ``dapo_uids``; it
         rides along in the return value so no hidden state is needed between production and consumption.
         """
+        cutoff_uids = set(self.completion_ratio_cutoff_keys[partition_id])
+        usable_cutoff_uids = set()
+        for uid in cutoff_uids:
+            session_ids = {
+                key.rsplit("_", 2)[1]
+                for key in self.partitions[partition_id]
+                if key.split("_")[0] == uid
+            }
+            if session_ids:
+                usable_cutoff_uids.add(uid)
+        cutoff_uids -= usable_cutoff_uids
         if partition_id == "val":
-            return set(), set(), set(), Counter()
+            return set(), set(), cutoff_uids, Counter()
 
         dapo_uids, dapo_counts = self._dapo_filtered_keys(partition_id)
-        failed_uids = set()
+        failed_uids = cutoff_uids
         if self.sync_refill_failed_groups:
             materializable_uids = {key.split("_")[0] for key in self.partitions[partition_id]}
-            failed_uids = self.failure_keys[partition_id] - materializable_uids
+            failed_uids |= self.failure_keys[partition_id] - materializable_uids
         return set(), dapo_uids, failed_uids, dapo_counts
 
     def _sampleable_terminal_keys(
@@ -401,6 +449,44 @@ class ReplayBuffer:
             return now
         return last_debug_time
 
+    def _maybe_apply_completion_ratio_cutoff(
+        self,
+        partition_id: str,
+        batch_size: int,
+        cutoff_requested: bool,
+    ) -> tuple[bool, dict[str, float]]:
+        threshold = self.completion_ratio_thresholds.get(partition_id)
+        if threshold is None or cutoff_requested:
+            return cutoff_requested, {}
+
+        terminal_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        inflight_uids = self.pending_keys[partition_id] | self.running_keys[partition_id]
+        total_groups = len(terminal_uids) + len(inflight_uids)
+        required_groups = math.ceil(total_groups * threshold)
+        if total_groups < batch_size or len(terminal_uids) < required_groups or not inflight_uids:
+            return False, {}
+        if self.cancel_fn is None:
+            raise RuntimeError("Completion-ratio rollout cutoff requires an agent-loop cancellation callback")
+
+        cancelled = int(self.cancel_fn(sorted(inflight_uids), validate=partition_id == "val"))
+        prefix = self._metrics_prefix(partition_id)
+        logger.info(
+            "Applied %s completion-ratio cutoff: terminal=%s total=%s threshold=%s requested=%s cancelled=%s",
+            partition_id,
+            len(terminal_uids),
+            total_groups,
+            threshold,
+            len(inflight_uids),
+            cancelled,
+        )
+        return True, {
+            f"{prefix}/completion_ratio/threshold": threshold,
+            f"{prefix}/completion_ratio/terminal_groups": float(len(terminal_uids)),
+            f"{prefix}/completion_ratio/total_groups": float(total_groups),
+            f"{prefix}/completion_ratio/cutoff_groups": float(len(inflight_uids)),
+            f"{prefix}/completion_ratio/cancelled_groups": float(cancelled),
+        }
+
     @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
     def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:
         """Sample a batch using synchronous rollout semantics.
@@ -426,12 +512,20 @@ class ReplayBuffer:
         refill_credit = 0
         draining = False
         max_inflight_prompts = 0
+        cutoff_requested = False
         if dapo_enabled:
             max_inflight_prompts = self.max_inflight_gen_batches * self.train_batch_size
 
         while True:
             # Eviction, gating, and selection below must all use this snapshot.
             self._sync_metadata_from_transfer_queue()
+
+            cutoff_requested, completion_ratio_metrics = self._maybe_apply_completion_ratio_cutoff(
+                partition_id, batch_size, cutoff_requested
+            )
+            eviction_metrics.update(completion_ratio_metrics)
+            if completion_ratio_metrics:
+                continue
 
             eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
             failed_count = len(eviction_reasons[2])
@@ -445,7 +539,7 @@ class ReplayBuffer:
             has_enough_samples = len(sampleable_keys) >= batch_size
             inflight_count = len(self.pending_keys[partition_id]) + len(self.running_keys[partition_id])
 
-            if not dapo_enabled and failed_count > 0 and not has_enough_samples:
+            if not dapo_enabled and not cutoff_requested and failed_count > 0 and not has_enough_samples:
                 self.refill_fn(failed_count)
                 continue
 
@@ -468,7 +562,10 @@ class ReplayBuffer:
                         refill_credit -= dispatch_count
                         continue
 
-            can_select = has_enough_samples and (not dapo_enabled or inflight_count == 0)
+            can_select = (
+                (has_enough_samples or (cutoff_requested and bool(sampleable_keys)))
+                and (not dapo_enabled or inflight_count == 0)
+            )
             if can_select:
                 selected_prompt_uids, partition_snapshot, _prompt_global_steps_snapshot = self._select_prompt_uids(
                     partition_id, sampleable_keys, batch_size

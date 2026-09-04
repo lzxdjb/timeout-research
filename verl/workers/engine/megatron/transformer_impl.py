@@ -30,6 +30,7 @@ import verl.utils.torch_functional as verl_F
 from verl.models.mcore import get_mcore_weight_converter
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
+from verl.utils import timeout_debug
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
@@ -1323,19 +1324,46 @@ class MegatronEngineWithLMHead(MegatronEngine):
             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
 
             fused_forward_fn = get_mcore_forward_fused_model_engine_fn(self.model_config.hf_config)
-            output = fused_forward_fn(
-                model=model,
-                input_ids=input_ids,
-                labels=label,
-                multi_modal_inputs=multi_modal_inputs,
-                temperature=temperature_value,
-                calculate_entropy=calculate_entropy,
-                pad_token_id=self.model_config.tokenizer.pad_token_id,
-                cp_layout=cp_layout,
-                local_cp_size=local_cp_size,
-                router_padding_mask=router_padding_mask,
-                pad_to_length_bucket=pad_to_length_bucket,
-            )
+            try:
+                output = fused_forward_fn(
+                    model=model,
+                    input_ids=input_ids,
+                    labels=label,
+                    multi_modal_inputs=multi_modal_inputs,
+                    temperature=temperature_value,
+                    calculate_entropy=calculate_entropy,
+                    pad_token_id=self.model_config.tokenizer.pad_token_id,
+                    cp_layout=cp_layout,
+                    local_cp_size=local_cp_size,
+                    router_padding_mask=router_padding_mask,
+                    pad_to_length_bucket=pad_to_length_bucket,
+                )
+            except RuntimeError as error:
+                # Preserve the original exception, but capture the exact micro-batch
+                # and CP/routing metadata that reached mbridge.
+                try:
+                    timeout_debug.record(
+                        "engine_forward_runtime_error",
+                        batch,
+                        extra={
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                            "use_fused_kernels": bool(use_fused_kernels),
+                            "cp_layout": cp_layout,
+                            "local_cp_size": local_cp_size,
+                            "cp_rank": mpu.get_context_parallel_rank(),
+                            "cp_size": mpu.get_context_parallel_world_size(),
+                            "tp_size": mpu.get_tensor_model_parallel_world_size(),
+                            "attention_lengths": (
+                                attention_mask.to(torch.bool).sum(dim=-1).detach().cpu().tolist()
+                                if isinstance(attention_mask, torch.Tensor) and not attention_mask.is_nested
+                                else None
+                            ),
+                        },
+                    )
+                except Exception:
+                    logger.exception("Unable to collect timeout debug context for model forward failure")
+                raise
         else:
             if not isinstance(temperature, torch.Tensor):
                 temperature = torch.tensor([temperature] * input_ids.shape[0], device=input_ids.device)

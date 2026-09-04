@@ -41,8 +41,10 @@ def _create_fake_checkouts(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     agent_loop = source / "recipe" / "swe_agent" / "agent_loop.py"
     agent_loop.parent.mkdir(parents=True)
     agent_loop.write_text("# test fixture\n", encoding="utf-8")
+    (agent_loop.parent / "config").mkdir()
+    (agent_loop.parent / "config" / "tool_config.yaml").write_text("tools: []\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(source)], check=True)
-    subprocess.run(["git", "-C", str(source), "add", "recipe/swe_agent/agent_loop.py"], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "recipe/swe_agent"], check=True)
     subprocess.run(
         [
             "git",
@@ -69,6 +71,8 @@ def _launcher_env(target: Path, source: Path, model: Path) -> dict[str, str]:
     env = os.environ.copy()
     for name in TIMEOUT_DEFAULTS:
         env.pop(name, None)
+    env.pop("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", None)
+    env.pop("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD", None)
     env.update(
         {
             "TARGET_VERL": str(target),
@@ -115,6 +119,31 @@ def test_launcher_preserves_explicit_timeout_overrides(tmp_path: Path) -> None:
 
     assert exported["SWE_AGENT_EXECUTION_HTTP_TIMEOUT"] == "999"
     assert exported["SWE_AGENT_EXECUTION_PREFETCH_HTTP_TIMEOUT_SECONDS"] == "17"
+
+
+def test_launcher_preserves_separate_completion_ratio_thresholds(tmp_path: Path) -> None:
+    target, source, model, _revision = _create_fake_checkouts(tmp_path)
+    env = _launcher_env(target, source, model)
+    env["SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD"] = "0.9"
+    env["SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD"] = "0.95"
+
+    result = subprocess.run([str(LAUNCHER)], env=env, check=True, text=True, capture_output=True)
+    exported = _exported_environment(result.stdout)
+
+    assert exported["SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD"] == "0.9"
+    assert exported["SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD"] == "0.95"
+    assert "Completion ratios: training=0.9 validation=0.95" in result.stdout
+
+
+def test_launcher_rejects_invalid_completion_ratio(tmp_path: Path) -> None:
+    target, source, model, _revision = _create_fake_checkouts(tmp_path)
+    env = _launcher_env(target, source, model)
+    env["SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD"] = "1.5"
+
+    result = subprocess.run([str(LAUNCHER)], env=env, text=True, capture_output=True)
+
+    assert result.returncode != 0
+    assert "must be greater than 0 and at most 1" in result.stderr
 
 
 def test_launcher_rejects_source_revision_mismatch(tmp_path: Path) -> None:

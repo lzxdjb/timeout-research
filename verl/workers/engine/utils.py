@@ -20,6 +20,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
+from verl.utils import timeout_debug
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import is_npu_available
 from verl.utils.device import manual_seed as device_manual_seed
@@ -127,6 +128,31 @@ def prepare_micro_batches(
         )
         micro_batches = tu.chunk_tensordict(data, total_data_size // (micro_batch_size_per_gpu * force_group_size))
         batch_idx_list = None
+    if timeout_debug.enabled():
+        for micro_batch_index, micro_batch in enumerate(micro_batches):
+            try:
+                timeout_debug.record(
+                    "engine_micro_batch",
+                    micro_batch,
+                    extra={
+                        "micro_batch_index": micro_batch_index,
+                        "micro_batch_count": len(micro_batches),
+                        "dynamic_bsz": bool(use_dynamic_bsz),
+                        "batch_indices": (
+                            batch_idx_list[micro_batch_index].detach().cpu().tolist()
+                            if batch_idx_list is not None
+                            and isinstance(batch_idx_list[micro_batch_index], torch.Tensor)
+                            else (
+                                list(batch_idx_list[micro_batch_index]) if batch_idx_list is not None else None
+                            )
+                        ),
+                    },
+                )
+            except Exception:
+                # Diagnostics must never change micro-batch construction.
+                import logging
+
+                logging.getLogger(__name__).exception("Unable to collect timeout debug micro-batch")
     return micro_batches, batch_idx_list
 
 

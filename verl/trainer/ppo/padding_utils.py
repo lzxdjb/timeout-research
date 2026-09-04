@@ -71,13 +71,18 @@ def construct_minimal_padding_template(
     source_td: dict,
     source_tag: dict,
     eos_token_id: int,
+    min_seq_len: int = 2,
 ) -> tuple[dict, dict]:
-    """Construct a minimal text-only padding template of one prompt token and one response token.
+    """Construct a minimal text-only padding template.
 
     Args:
         source_td: A single sample dict retrieved from TransferQueue.
         source_tag: The corresponding tag dict for that sample.
         eos_token_id: The EOS token id from the tokenizer.
+        min_seq_len: Minimum attended sequence length. Context-parallel mbridge
+            requires at least ``tensor_parallel_size * context_parallel_size``
+            tokens when context parallelism is enabled. The default preserves
+            the historical two-token template.
 
     Returns:
         A tuple of (template_sample, template_tag) ready for padding.
@@ -92,17 +97,20 @@ def construct_minimal_padding_template(
     template_tag = copy.deepcopy(source_tag)
 
     # Build minimal sequence
-    prompts = torch.full((1,), eos_token_id, dtype=torch.int64)
-    input_ids = prompts.repeat(2)
+    min_seq_len = max(2, int(min_seq_len))
+    prompt_len = min_seq_len - 1
+    prompts = torch.full((prompt_len,), eos_token_id, dtype=torch.int64)
+    responses = torch.full((1,), eos_token_id, dtype=torch.int64)
+    input_ids = torch.cat((prompts, responses), dim=0)
     attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
-    response_mask = torch.zeros_like(prompts)
+    response_mask = torch.zeros_like(responses)
     position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
     routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
 
     # Update the fields and remove redundant parts
     template_sample.update(
         prompts=prompts,
-        responses=prompts.clone(),
+        responses=responses,
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -120,7 +128,7 @@ def construct_minimal_padding_template(
         template_sample.pop("routed_experts", None)
 
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
-    template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)
+    template_tag.update(is_padding=True, prompt_len=prompt_len, response_len=1, seq_len=min_seq_len)
     return template_sample, template_tag
 
 
@@ -128,11 +136,12 @@ def upsample_batch_to_divisible_size(
     batch: KVBatchMeta,
     batch_multiple: int,
     eos_token_id: int,
+    min_seq_len: int = 2,
 ) -> KVBatchMeta:
     """Append synthetic no-op samples so the batch size becomes divisible by *batch_multiple*.
 
     The synthetic samples reuse the first real sample as a metadata template,
-    but manually construct a minimal ``prompt_len=1 / response_len=1`` sequence
+    but manually construct a minimal sequence of ``min_seq_len`` tokens
     and zero out reward-related fields so they do not contribute to PPO,
     entropy, or KL losses.  An ``is_padding`` flag is added in the tag for
     downstream metrics filtering.
@@ -141,6 +150,7 @@ def upsample_batch_to_divisible_size(
         batch: The current KVBatchMeta from TransferQueue.
         batch_multiple: The required divisor (e.g. lcm of dp_size and mini-batch sizes).
         eos_token_id: The EOS token id from the tokenizer.
+        min_seq_len: Minimum attended sequence length for synthetic samples.
 
     Returns:
         The (possibly enlarged) KVBatchMeta.
@@ -154,8 +164,13 @@ def upsample_batch_to_divisible_size(
     source_key = batch.keys[source_idx]
     source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
 
-    # Construct the minimal padding template of one prompt token and one response token
-    template_sample, template_tag = construct_minimal_padding_template(source_td, batch.tags[source_idx], eos_token_id)
+    # Construct a CP-safe padding template when requested by the caller.
+    template_sample, template_tag = construct_minimal_padding_template(
+        source_td,
+        batch.tags[source_idx],
+        eos_token_id,
+        min_seq_len=min_seq_len,
+    )
 
     # All padding data use the same uid (also the same trajectory_id 0 but with ascending session_ids)
     # This uid is not identical to any of the actual data, so it won't affect the grpo advantage value.

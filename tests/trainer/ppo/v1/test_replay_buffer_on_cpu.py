@@ -60,6 +60,7 @@ def _make_rb(
     gen_batch_size: int = 1,
     max_inflight_gen_batches: int = 1,
     sync_refill_failed_groups: bool = False,
+    cancel_fn=None,
 ) -> ReplayBuffer:
     """Construct a ReplayBuffer with defaults that keep generic samples on-policy."""
     replay_buffer_cls = ReplayBuffer if trainer_mode == "sync" else ReplayBufferAsync
@@ -76,6 +77,7 @@ def _make_rb(
         gen_batch_size=gen_batch_size,
         max_inflight_gen_batches=max_inflight_gen_batches,
         sync_refill_failed_groups=sync_refill_failed_groups,
+        cancel_fn=cancel_fn,
     )
 
 
@@ -254,6 +256,75 @@ def test_init_rejects_unknown_strategy():
     """max_off_policy_strategy must be one of {drop, wait}."""
     with pytest.raises(AssertionError, match="max off policy strategy"):
         _make_rb(max_off_policy_strategy="bogus")
+
+
+@pytest.mark.parametrize("value", ["0", "1.1", "nan", "not-a-number"])
+def test_completion_ratio_rejects_invalid_values(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD", value)
+
+    with pytest.raises(ValueError, match="SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD"):
+        _make_rb()
+
+
+def test_sync_completion_ratio_cancels_tail_and_returns_complete_groups(
+    tq_init, partition_id: str, monkeypatch
+) -> None:
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", "0.9")
+    finished = [PromptSpec(uid=_uid(), status="finished", sessions=2) for _ in range(9)]
+    running_uid = _uid()
+    _produce(partition_id, finished).join_and_check()
+    tq.kv_put(
+        key=running_uid,
+        partition_id=partition_id,
+        tag={"is_prompt": True, "status": "running", "global_steps": 0},
+    )
+    cancelled: list[tuple[list[str], bool]] = []
+
+    def cancel_fn(uids: list[str], validate: bool = False) -> int:
+        cancelled.append((uids, validate))
+        for uid in uids:
+            tq.kv_put(
+                key=uid,
+                partition_id=partition_id,
+                tag={
+                    "is_prompt": True,
+                    "status": "failure",
+                    "global_steps": 0,
+                    "completion_ratio_cutoff": True,
+                },
+            )
+        return len(uids)
+
+    rb = _make_rb(train_batch_size=10, cancel_fn=cancel_fn)
+    rb.completion_ratio_thresholds[partition_id] = 0.9
+    try:
+        batch, metrics = rb.sample(global_steps=0, partition_id=partition_id, batch_size=10)
+
+        assert cancelled == [([running_uid], False)]
+        assert len(batch.keys) == 18
+        assert _uids_of(batch.keys) == {spec.uid for spec in finished}
+        assert metrics["validation/completion_ratio/terminal_groups"] == 9.0
+        assert metrics["validation/completion_ratio/cutoff_groups"] == 1.0
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_completion_ratio_keeps_cutoff_groups_with_materialized_sessions() -> None:
+    rb = _make_rb()
+    complete_uid = _uid()
+    no_output_uid = _uid()
+    rb.failure_keys["train"].update({complete_uid, no_output_uid})
+    rb.completion_ratio_cutoff_keys["train"].update({complete_uid, no_output_uid})
+    rb.partitions["train"] = {
+        _trajectory_key(complete_uid, 0): {"completion_ratio_cutoff": True},
+        _trajectory_key(complete_uid, 1): {"completion_ratio_cutoff": True},
+    }
+
+    eviction_reasons = rb._terminal_eviction_reasons(global_steps=0, partition_id="train")
+
+    assert complete_uid not in eviction_reasons[2]
+    assert no_output_uid in eviction_reasons[2]
+    assert complete_uid in rb._sampleable_terminal_keys("train", eviction_reasons)
 
 
 def test_init_rejects_non_positive_sync_dapo_inflight_limit():

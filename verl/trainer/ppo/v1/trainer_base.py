@@ -63,6 +63,12 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_spec_decode_metrics
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+from verl.trainer.ppo.timeout_prediction import (
+    TimeoutRewardPredictor,
+    build_timeout_rewards,
+    conformal_radius,
+    reward_classes,
+)
 from verl.trainer.ppo.utils import (
     Role,
     create_rl_dataset,
@@ -74,6 +80,7 @@ from verl.trainer.ppo.utils import (
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
 from verl.utils import tensordict_utils as tu
+from verl.utils import timeout_debug
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import collate_fn
@@ -156,6 +163,19 @@ class PPOTrainer(ABC):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.trainer_mode = self.config.trainer.v1.trainer_mode
+        timeout_cfg = self.config.actor_rollout_ref.actor.get("timeout_prediction", {})
+        self.timeout_prediction_enabled = bool(timeout_cfg.get("enabled", False))
+        self.timeout_prediction_cfg = timeout_cfg
+        self.timeout_predictor = TimeoutRewardPredictor() if self.timeout_prediction_enabled else None
+        self.timeout_predictor_optimizer = (
+            torch.optim.AdamW(
+                self.timeout_predictor.parameters(),
+                lr=float(timeout_cfg.get("learning_rate", 1.0e-4)),
+            )
+            if self.timeout_predictor is not None
+            else None
+        )
+        self.timeout_prediction_step = 0
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
         self.replay_buffer = self._build_replay_buffer()
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
@@ -416,6 +436,7 @@ class PPOTrainer(ABC):
             agent_loop_manager: The agent loop manager to generate sequences.
         """
         self.agent_loop_manager = agent_loop_manager
+        self.replay_buffer.cancel_fn = agent_loop_manager.cancel_sequences
 
         # initialize SkipManager for V1 rollout skip support
         SkipManager.init(self.config)
@@ -845,6 +866,7 @@ class PPOTrainer(ABC):
             local_path=os.path.join(global_step_folder, "actor"),
             del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
         )
+        self._load_timeout_predictor(os.path.join(global_step_folder, "actor"))
 
         # 3. load critic checkpoint
         if self.use_critic:
@@ -940,6 +962,7 @@ class PPOTrainer(ABC):
         self.actor_rollout_wg.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
         )
+        self._save_timeout_predictor(actor_local_path)
 
         # save critic
         if self.use_critic:
@@ -1022,6 +1045,35 @@ class PPOTrainer(ABC):
                 self.checkpoint_manager.sleep_replicas()
                 batch = self._compute_reward_colocate(batch)
                 self.checkpoint_manager.update_weights()
+
+            if self.timeout_prediction_enabled:
+                # Validation normally skips policy inference.  Compute the same
+                # features as training only when the opt-in predictor is enabled.
+                batch = self._compute_old_log_prob(batch, metrics={})
+                prediction_data = tq.kv_batch_get(
+                    keys=batch.keys,
+                    partition_id=batch.partition_id,
+                    select_fields=["response_mask", "rm_scores", "old_log_probs", "extra_fields"],
+                )
+                prediction_extra_fields = prediction_data.pop("extra_fields").tolist()
+                prediction_data = DataProto(batch=prediction_data.to_padded_tensor())
+                predicted_scores, _train_mask, _calibration_mask = self._apply_v1_timeout_prediction(
+                    prediction_data,
+                    batch.tags,
+                    prediction_extra_fields,
+                )
+                tq.kv_batch_put(
+                    keys=batch.keys,
+                    partition_id=batch.partition_id,
+                    fields=TensorDict(
+                        {
+                            "rm_scores": response_to_nested(
+                                predicted_scores, prediction_data.batch["response_mask"]
+                            )
+                        },
+                        batch_size=len(batch),
+                    ),
+                )
 
             # 4. collect necessary data for logging
             # For multi-output agent loops, only use the final output per session for metrics.
@@ -1488,7 +1540,52 @@ class PPOTrainer(ABC):
 
         # Upsampling the batch with padding sequences
         batch_multiple = self._get_required_batch_multiple(dp_size)
-        batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
+        if timeout_debug.enabled():
+            try:
+                debug_data = tq.kv_batch_get(
+                    keys=batch.keys,
+                    partition_id=batch.partition_id,
+                    select_fields=["input_ids", "attention_mask", "response_mask", "loss_mask", "rm_scores"],
+                )
+                timeout_debug.record(
+                    "trainer_before_balance",
+                    debug_data,
+                    tags=batch.tags,
+                    row_keys=batch.keys,
+                    extra={"required_multiple": batch_multiple, "dp_size": dp_size},
+                )
+            except Exception:
+                logger.exception("Unable to collect timeout debug batch before balancing")
+        megatron_config = self.config.actor_rollout_ref.actor.get("megatron", {})
+        tensor_parallel_size = int(megatron_config.get("tensor_model_parallel_size", 1) or 1)
+        context_parallel_size = int(megatron_config.get("context_parallel_size", 1) or 1)
+        # mbridge's zigzag CP packing slices each sequence across TP*CP
+        # tokens. Keep the historical two-token padding unless CP is enabled.
+        min_padding_seq_len = (
+            tensor_parallel_size * context_parallel_size if context_parallel_size > 1 else 2
+        )
+        batch = upsample_batch_to_divisible_size(
+            batch,
+            batch_multiple,
+            self.tokenizer.eos_token_id,
+            min_seq_len=min_padding_seq_len,
+        )
+        if timeout_debug.enabled():
+            try:
+                debug_data = tq.kv_batch_get(
+                    keys=batch.keys,
+                    partition_id=batch.partition_id,
+                    select_fields=["input_ids", "attention_mask", "response_mask", "loss_mask", "rm_scores"],
+                )
+                timeout_debug.record(
+                    "trainer_after_balance",
+                    debug_data,
+                    tags=batch.tags,
+                    row_keys=batch.keys,
+                    extra={"required_multiple": batch_multiple, "dp_size": dp_size},
+                )
+            except Exception:
+                logger.exception("Unable to collect timeout debug batch after balancing")
         global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
         workload_lst = calculate_workload(global_seqlen_lst)
 
@@ -1516,6 +1613,19 @@ class PPOTrainer(ABC):
             data["old_log_probs"] = data.pop("rollout_log_probs")
             tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
             return batch
+
+        if timeout_debug.enabled():
+            try:
+                debug_data = tq.kv_batch_get(
+                    keys=batch.keys,
+                    partition_id=batch.partition_id,
+                    select_fields=["input_ids", "attention_mask", "response_mask", "loss_mask", "rm_scores"],
+                )
+                timeout_debug.record(
+                    "trainer_before_old_log_prob", debug_data, tags=batch.tags, row_keys=batch.keys
+                )
+            except Exception:
+                logger.exception("Unable to collect timeout debug batch before old log-prob computation")
 
         # 1. compute log probs
         batch.extra_info.update(
@@ -1612,13 +1722,34 @@ class PPOTrainer(ABC):
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
-        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        fields = [
+            "uid",
+            "response_mask",
+            "rm_scores",
+            "rollout_log_probs",
+            "old_log_probs",
+            "ref_log_prob",
+            "values",
+            "extra_fields",
+        ]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
+        extra_fields = data.pop("extra_fields").tolist()
         response_mask = data["response_mask"]
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+
+        if self.timeout_prediction_enabled:
+            reward_tensor, train_sample_mask, prediction_targets = self._apply_v1_timeout_prediction(
+                data,
+                batch.tags,
+                extra_fields,
+            )
+            data.batch["token_level_scores"] = reward_tensor
+            data.batch["train_sample_mask"] = train_sample_mask
+            data.batch["rm_scores"] = reward_tensor
+            self._update_v1_timeout_predictor(data, prediction_targets)
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1665,11 +1796,162 @@ class PPOTrainer(ABC):
         output = {}
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
+        if self.timeout_prediction_enabled:
+            output["rm_scores"] = response_to_nested(data.batch["rm_scores"], response_mask)
+            output["train_sample_mask"] = data.batch["train_sample_mask"]
         output = TensorDict(output, batch_size=len(batch))
 
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
 
         return batch
+
+    @staticmethod
+    def _trajectory_scores(reward_tensor: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+        positions = response_mask.to(torch.long).sum(dim=-1).clamp_min(1) - 1
+        return reward_tensor.gather(1, positions.unsqueeze(-1)).squeeze(-1)
+
+    def _apply_v1_timeout_prediction(
+        self,
+        data: DataProto,
+        tags: list[dict],
+        extra_fields: list,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Impute rewards for deadline and completion-ratio cutoff rows in V1."""
+        response_mask = data.batch["response_mask"]
+        timeout_debug.record(
+            "trainer_before_timeout_prediction",
+            data.batch,
+            tags=tags,
+            extra={"extra_field_count": len(extra_fields)},
+        )
+        old_log_probs = data.batch["old_log_probs"].detach().to(torch.float32).cpu()
+        response_mask_cpu = response_mask.detach().to(torch.bool).cpu()
+        features = self.timeout_predictor.features(old_log_probs, response_mask_cpu)
+        with torch.no_grad():
+            probabilities, _ = self.timeout_predictor.predict(features)
+
+        infrastructure = []
+        timeout = []
+        cutoff = []
+        for tag, extra in zip(tags, extra_fields, strict=True):
+            extra = getattr(extra, "data", extra)
+            extra = extra if isinstance(extra, dict) else {}
+            reward_info = extra.get("reward_extra_info", {})
+            reward_info = reward_info if isinstance(reward_info, dict) else {}
+            infra_value = reward_info.get(
+                "observed_infrastructure_failure",
+                extra.get("observed_infrastructure_failure", 0),
+            )
+            try:
+                is_infrastructure = int(infra_value) == 1
+            except (TypeError, ValueError, OverflowError):
+                is_infrastructure = False
+            reason = str(
+                reward_info.get("observed_infrastructure_failure_reason")
+                or extra.get("observed_infrastructure_failure_reason")
+                or ""
+            )
+            termination_reason = str(extra.get("termination_reason") or "")
+            is_timeout = reason == "trajectory_deadline_exceeded" or termination_reason == "swe_trajectory_timeout"
+            is_cutoff = bool(tag.get("completion_ratio_cutoff", False))
+            infrastructure.append(is_infrastructure)
+            timeout.append(is_timeout or is_cutoff)
+            cutoff.append(is_cutoff)
+
+        infrastructure_mask = torch.tensor(infrastructure, dtype=torch.bool)
+        timeout_mask = torch.tensor(timeout, dtype=torch.bool)
+        cutoff_mask = torch.tensor(cutoff, dtype=torch.bool)
+        # Keep legacy deadline-timeout handling intact, but never impute a
+        # completion-cutoff row that is itself an infrastructure failure.
+        prediction_mask = timeout_mask & (~cutoff_mask | ~infrastructure_mask)
+        scores_cpu = self._trajectory_scores(
+            data.batch["rm_scores"].detach().to(torch.float32).cpu(), response_mask_cpu
+        )
+        calibration_mask = ~(infrastructure_mask | timeout_mask)
+        calibration_radius = conformal_radius(
+            probabilities[calibration_mask],
+            scores_cpu[calibration_mask],
+            float(self.timeout_prediction_cfg.get("confidence_delta", 0.05)),
+        )
+        predicted_classes = probabilities.argmax(dim=-1)
+        unique_max = probabilities.eq(probabilities.max(dim=-1, keepdim=True).values).sum(dim=-1).eq(1)
+        confidence_set_size = (probabilities > calibration_radius).sum(dim=-1)
+        keep_mask = (confidence_set_size == 1) & unique_max
+        scores, train_mask = build_timeout_rewards(
+            data.batch["rm_scores"],
+            response_mask,
+            prediction_mask.to(response_mask.device),
+            probabilities.to(response_mask.device),
+            keep_mask.to(response_mask.device),
+            str(self.timeout_prediction_cfg.get("reward_assignment", "terminal")),
+            bool(self.timeout_prediction_cfg.get("normalize_broadcast", False)),
+            infrastructure_mask.to(response_mask.device),
+        )
+        data.batch["timeout_prediction_probs"] = probabilities.to(scores.device)
+        data.batch["timeout_prediction_class"] = predicted_classes.to(scores.device)
+        data.batch["timeout_prediction_keep"] = keep_mask.to(scores.device)
+        data.batch["timeout_prediction_target_scores"] = scores_cpu.to(scores.device)
+        data.batch["timeout_prediction_radius"] = torch.full(
+            (len(data),), calibration_radius, dtype=scores.dtype, device=scores.device
+        )
+        timeout_debug.record(
+            "trainer_after_timeout_prediction",
+            data.batch,
+            tags=tags,
+            extra={
+                "prediction_rows": int(prediction_mask.sum().item()),
+                "infrastructure_rows": int(infrastructure_mask.sum().item()),
+                "calibration_rows": int(calibration_mask.sum().item()),
+            },
+        )
+        return scores, train_mask.any(dim=-1), calibration_mask
+
+    def _update_v1_timeout_predictor(self, data: DataProto, calibration_mask: torch.Tensor) -> None:
+        """Fit the sidecar only on observed, non-infrastructure rewards."""
+        if not calibration_mask.any():
+            return
+        response_mask = data.batch["response_mask"].detach().to(torch.bool).cpu()
+        old_log_probs = data.batch["old_log_probs"].detach().to(torch.float32).cpu()
+        features = self.timeout_predictor.features(old_log_probs, response_mask)
+        scores = data.batch["timeout_prediction_target_scores"].detach().to(torch.float32).cpu()
+        logits = self.timeout_predictor(features[calibration_mask])
+        labels = reward_classes(scores[calibration_mask])
+        loss = torch.nn.functional.cross_entropy(logits, labels)
+        loss = loss * float(self.timeout_prediction_cfg.get("loss_coef", 0.1))
+        assert self.timeout_predictor_optimizer is not None
+        self.timeout_predictor_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.timeout_predictor_optimizer.step()
+        self.timeout_prediction_step += 1
+
+    def _save_timeout_predictor(self, actor_path: str) -> None:
+        if not self.timeout_prediction_enabled or self.timeout_predictor is None:
+            return
+        sidecar_path = os.path.join(actor_path, "timeout_predictor")
+        os.makedirs(sidecar_path, exist_ok=True)
+        payload = {
+            "model": self.timeout_predictor.state_dict(),
+            "step": self.timeout_prediction_step,
+            "class_values": TimeoutRewardPredictor.class_values,
+        }
+        if (
+            bool(self.timeout_prediction_cfg.get("save_optimizer", True))
+            and self.timeout_predictor_optimizer is not None
+        ):
+            payload["optimizer"] = self.timeout_predictor_optimizer.state_dict()
+        torch.save(payload, os.path.join(sidecar_path, "state.pt"))
+
+    def _load_timeout_predictor(self, actor_path: str) -> None:
+        if not self.timeout_prediction_enabled or self.timeout_predictor is None:
+            return
+        state_path = os.path.join(actor_path, "timeout_predictor", "state.pt")
+        if not os.path.exists(state_path):
+            return
+        payload = torch.load(state_path, map_location="cpu", weights_only=False)
+        self.timeout_predictor.load_state_dict(payload["model"])
+        self.timeout_prediction_step = int(payload.get("step", 0))
+        if self.timeout_predictor_optimizer is not None and "optimizer" in payload:
+            self.timeout_predictor_optimizer.load_state_dict(payload["optimizer"])
 
     def _update_critic(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the critic network."""

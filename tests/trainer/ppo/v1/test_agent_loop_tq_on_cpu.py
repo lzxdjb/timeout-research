@@ -37,3 +37,26 @@ def test_settle_session_tasks_waits_for_siblings_after_failure():
         assert isinstance(errors[0], RuntimeError)
 
     asyncio.run(run())
+
+
+def test_settle_session_tasks_waits_for_cancelled_sessions():
+    async def run():
+        cleanup_complete = asyncio.Event()
+
+        async def session():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                cleanup_complete.set()
+
+        task = asyncio.create_task(session())
+        await asyncio.sleep(0)
+        task.cancel()
+        errors = await _settle_session_tasks([task])
+
+        assert cleanup_complete.is_set()
+        assert len(errors) == 1
+        assert isinstance(errors[0], asyncio.CancelledError)
+
+    asyncio.run(run())

@@ -55,6 +55,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         super().__init__(*args, **kwargs)
         tq.init()
         self.background_tasks = set()
+        self.prompt_tasks: dict[str, dict[str, asyncio.Task[Any]]] = {"train": {}, "val": {}}
+
+    def _discard_prompt_task(self, partition_id: str, uid: str, task: asyncio.Task[Any]) -> None:
+        if self.prompt_tasks[partition_id].get(uid) is task:
+            del self.prompt_tasks[partition_id][uid]
 
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
@@ -103,6 +108,54 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             )
             self.background_tasks.add(task)
             task.add_done_callback(self.background_tasks.discard)
+            uid = str(prompt["uid"])
+            partition_id = "val" if validate else "train"
+            self.prompt_tasks[partition_id][uid] = task
+            task.add_done_callback(
+                lambda completed, partition_id=partition_id, uid=uid: self._discard_prompt_task(
+                    partition_id, uid, completed
+                )
+            )
+
+    async def cancel_sequences(self, uids: list[str], validate: bool = False) -> int:
+        """Cancel prompt groups and wait until their sessions release resources."""
+        partition_id = "val" if validate else "train"
+        tasks_by_uid = {
+            uid: self.prompt_tasks[partition_id][uid]
+            for uid in uids
+            if uid in self.prompt_tasks[partition_id] and not self.prompt_tasks[partition_id][uid].done()
+        }
+        for task in tasks_by_uid.values():
+            task.cancel()
+        if tasks_by_uid:
+            await asyncio.gather(*tasks_by_uid.values(), return_exceptions=True)
+
+        # Preserve trajectories that were published before cancellation. They are valid
+        # partial rollouts for completion-ratio reward prediction; groups with no
+        # materialized sessions are evicted by ReplayBuffer.
+        items = (tq.kv_list(partition_id) or {}).get(partition_id, {})
+        for uid in tasks_by_uid:
+            tag = items.get(uid, {})
+            if tag.get("status") not in {"pending", "running"}:
+                continue
+            trajectory_keys = [key for key in items if key.startswith(f"{uid}_")]
+            if trajectory_keys:
+                trajectory_tags = []
+                for key in trajectory_keys:
+                    trajectory_tag = dict(items.get(key, {}))
+                    trajectory_tag["completion_ratio_cutoff"] = True
+                    trajectory_tags.append(trajectory_tag)
+                tq.kv_batch_put(
+                    keys=trajectory_keys,
+                    partition_id=partition_id,
+                    tags=trajectory_tags,
+                )
+            await tq.async_kv_put(
+                key=uid,
+                partition_id=partition_id,
+                tag={"status": "failure", "completion_ratio_cutoff": True},
+            )
+        return len(tasks_by_uid)
 
     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
@@ -141,6 +194,31 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             else:
                 status = "finished"
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await _settle_session_tasks(tasks)
+
+            items = (tq.kv_list(partition_id) or {}).get(partition_id, {})
+            trajectory_keys = [key for key in items if key.startswith(f"{uid}_")]
+            if trajectory_keys:
+                trajectory_tags = []
+                for key in trajectory_keys:
+                    trajectory_tag = dict(items.get(key, {}))
+                    trajectory_tag["completion_ratio_cutoff"] = True
+                    trajectory_tags.append(trajectory_tag)
+                tq.kv_batch_put(
+                    keys=trajectory_keys,
+                    partition_id=partition_id,
+                    tags=trajectory_tags,
+                )
+            await tq.async_kv_put(
+                key=uid,
+                partition_id=partition_id,
+                tag={"status": "failure", "completion_ratio_cutoff": True},
+            )
+            raise
         except Exception as e:
             logger.exception(f"Error in _run_prompt: {e}")
             if tasks:
@@ -254,4 +332,17 @@ class AgentLoopManagerTQ(AgentLoopManager):
                 worker.generate_sequences.remote(chunk)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
             ]
+        )
+
+    def cancel_sequences(self, uids: list[str], validate: bool = False) -> int:
+        """Cancel the requested prompt groups on whichever workers own them."""
+        if not uids:
+            return 0
+        return sum(
+            ray.get(
+                [
+                    worker.cancel_sequences.remote(uids, validate=validate)
+                    for worker in self.agent_loop_workers
+                ]
+            )
         )
