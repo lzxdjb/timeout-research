@@ -14,7 +14,7 @@
 
 import asyncio
 
-from verl.trainer.ppo.v1.agent_loop_tq import _settle_session_tasks
+from verl.trainer.ppo.v1.agent_loop_tq import _infrastructure_failure_from_extra_fields, _settle_session_tasks
 
 
 def test_settle_session_tasks_waits_for_siblings_after_failure():
@@ -60,3 +60,11 @@ def test_settle_session_tasks_waits_for_cancelled_sessions():
         assert isinstance(errors[0], asyncio.CancelledError)
 
     asyncio.run(run())
+
+
+def test_infrastructure_failure_marker_supports_nested_and_direct_metadata():
+    assert _infrastructure_failure_from_extra_fields(
+        {"reward_extra_info": {"observed_infrastructure_failure": 1}}
+    )
+    assert _infrastructure_failure_from_extra_fields({"infrastructure_failure": 1})
+    assert not _infrastructure_failure_from_extra_fields({"observed_infrastructure_failure": 0})

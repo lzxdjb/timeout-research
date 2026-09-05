@@ -47,6 +47,10 @@ class MetricsAggregator:
                 "validation/filter_groups/discarded_surplus_samples",
                 "training/rollout_failure/evicted_samples",
                 "validation/rollout_failure/evicted_samples",
+                "training/infrastructure_group_filter/discarded_groups",
+                "validation/infrastructure_group_filter/discarded_groups",
+                "training/infrastructure_group_filter/refilled_groups",
+                "validation/infrastructure_group_filter/refilled_groups",
             ],
             "last": [
                 "training/global_step",
@@ -79,6 +83,13 @@ class MetricsAggregator:
                 return int(evicted_samples.item()) if evicted_samples.numel() == 1 else sample_count
             if isinstance(evicted_samples, int | float | np.number):
                 return int(evicted_samples)
+        if metric_name.endswith("/infrastructure_group_filter/failure_ratio_mean"):
+            prefix = metric_name.rsplit("/failure_ratio_mean", 1)[0]
+            discarded_groups = metrics.get(f"{prefix}/discarded_groups", sample_count)
+            if isinstance(discarded_groups, torch.Tensor):
+                return int(discarded_groups.item()) if discarded_groups.numel() == 1 else sample_count
+            if isinstance(discarded_groups, int | float | np.number):
+                return int(discarded_groups)
         return sample_count
 
     def _get_aggregation_type(self, metric_name: str) -> str:

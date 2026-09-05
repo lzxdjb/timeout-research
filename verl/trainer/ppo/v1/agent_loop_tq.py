@@ -49,6 +49,24 @@ async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseExce
     return [result for result in results if isinstance(result, BaseException)]
 
 
+def _infrastructure_failure_from_extra_fields(extra_fields) -> bool:
+    """Read the SWE infrastructure marker from either supported metadata layout."""
+    extra_fields = extra_fields if isinstance(extra_fields, dict) else {}
+    reward_extra_info = extra_fields.get("reward_extra_info", {})
+    reward_extra_info = reward_extra_info if isinstance(reward_extra_info, dict) else {}
+    value = reward_extra_info.get(
+        "observed_infrastructure_failure",
+        extra_fields.get(
+            "observed_infrastructure_failure",
+            reward_extra_info.get("infrastructure_failure", extra_fields.get("infrastructure_failure", 0)),
+        ),
+    )
+    try:
+        return int(value) == 1
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 @ray.remote
 class AgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
@@ -258,6 +276,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         # - session_id: session id for rollout.n sampling
         # - index: index of agent loop output
         keys, fields, tags = [], [], []
+        infrastructure_metadata_count = 0
+        infrastructure_failure_count = 0
         for i, output in enumerate(outputs):
             prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
             responses = torch.tensor(output.response_ids, dtype=torch.int64)
@@ -280,6 +300,23 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["multi_modal_inputs"] = multi_modal_inputs
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
+            extra_fields = field["extra_fields"]
+            if isinstance(extra_fields, dict):
+                reward_extra_info = extra_fields.get("reward_extra_info", {})
+                if (
+                    "observed_infrastructure_failure" in extra_fields
+                    or "infrastructure_failure" in extra_fields
+                    or (
+                        isinstance(reward_extra_info, dict)
+                        and (
+                            "observed_infrastructure_failure" in reward_extra_info
+                            or "infrastructure_failure" in reward_extra_info
+                        )
+                    )
+                ):
+                    infrastructure_metadata_count += 1
+            infrastructure_failure = _infrastructure_failure_from_extra_fields(extra_fields)
+            infrastructure_failure_count += int(infrastructure_failure)
             tags.append(
                 {
                     "status": "success",
@@ -294,7 +331,22 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "min_global_steps": field["extra_fields"].get("min_global_steps"),
                     # max_global_steps: end generation model weights version of this trajectory
                     "max_global_steps": field["extra_fields"].get("max_global_steps"),
+                    # ReplayBuffer needs this before sampling so invalid groups
+                    # do not contribute to completion-ratio accounting.
+                    "infrastructure_failure": infrastructure_failure,
                 }
+            )
+
+        if infrastructure_metadata_count or infrastructure_failure_count:
+            logger.info(
+                "V1 infrastructure marker propagation: uid=%s session=%s validation=%s outputs=%d "
+                "metadata_outputs=%d failure_outputs=%d",
+                uid,
+                session_id,
+                validate,
+                len(outputs),
+                infrastructure_metadata_count,
+                infrastructure_failure_count,
             )
 
         await tq.async_kv_batch_put(

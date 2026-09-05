@@ -30,7 +30,7 @@ import torch
 import transfer_queue as tq
 from omegaconf import DictConfig, OmegaConf, open_dict
 from packaging.version import InvalidVersion, Version
-from tensordict import TensorDict
+from tensordict import NonTensorStack, TensorDict
 from tensordict.tensorclass import NonTensorData
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -49,7 +49,7 @@ from verl.single_controller.ray import (
 )
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import agg_loss
+from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     RolloutMoELoadBalanceMetricsAccumulator,
     compute_data_metrics,
@@ -61,7 +61,12 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
-from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_spec_decode_metrics
+from verl.trainer.ppo.ray_trainer import (
+    _task_filter_enabled,
+    apply_kl_penalty,
+    apply_training_task_filter,
+    compute_spec_decode_metrics,
+)
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 from verl.trainer.ppo.timeout_prediction import (
     TimeoutRewardPredictor,
@@ -77,7 +82,12 @@ from verl.trainer.ppo.utils import (
     need_reference_policy,
     need_teacher_policy,
 )
-from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
+from verl.trainer.ppo.v1.replay_buffer import (
+    DAPO_FILTERED_REWARD_COUNTS_KEY,
+    ReplayBuffer,
+    ReplayBufferAsync,
+    infrastructure_failure_ratio_threshold,
+)
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
 from verl.utils import tensordict_utils as tu
 from verl.utils import timeout_debug
@@ -176,6 +186,7 @@ class PPOTrainer(ABC):
             else None
         )
         self.timeout_prediction_step = 0
+        self._validation_prompt_templates: dict[str, TensorDict] = {}
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
         self.replay_buffer = self._build_replay_buffer()
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
@@ -213,9 +224,15 @@ class PPOTrainer(ABC):
         if not has_custom_sampler:
             filter_groups_metric = self._resolve_filter_groups_metric()
             sync_refill_failed_groups = bool(sampler_config.get("sync_refill_failed_groups", False))
+            rollout_config = self.config.get("actor_rollout_ref", {}).get("rollout", {})
+            rollout_n = int(rollout_config.get("n", 1))
+            validation_rollout_n = int(rollout_config.get("val_kwargs", {}).get("n", 1))
             replay_buffer_kwargs.update(
                 filter_groups_metric=filter_groups_metric,
                 sync_refill_failed_groups=sync_refill_failed_groups,
+                expected_rollout_n=rollout_n,
+                expected_validation_rollout_n=validation_rollout_n,
+                validation_refill_fn=self._refill_validation_groups,
             )
             if sampler_cls is ReplayBuffer:
                 filter_groups = self.config.algorithm.get("filter_groups", None)
@@ -223,10 +240,30 @@ class PPOTrainer(ABC):
                 if filter_groups_metric is not None:
                     max_inflight_gen_batches = filter_groups.get("max_inflight_gen_batches", 1)
                 train_batch_size = self.config.data.train_batch_size
+                infrastructure_group_filter_enabled = (
+                    infrastructure_failure_ratio_threshold("train") is not None
+                )
+                logger.info(
+                    "V1 rollout threshold config: completion(train/val)=%s/%s "
+                    "infra_failure(train/val)=%s/%s rollout_n(train/val)=%d/%d "
+                    "trainer_mode=%s timeout_prediction=%s",
+                    os.getenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD"),
+                    os.getenv("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD"),
+                    os.getenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD"),
+                    os.getenv("SWE_AGENT_ROLLOUT_VALIDATION_INFRA_FAILURE_GROUP_RATIO_THRESHOLD"),
+                    rollout_n,
+                    validation_rollout_n,
+                    self.trainer_mode,
+                    getattr(self, "timeout_prediction_enabled", False),
+                )
                 replay_buffer_kwargs.update(
                     train_batch_size=train_batch_size,
                     gen_batch_size=1
-                    if filter_groups_metric is not None or sync_refill_failed_groups
+                    if (
+                        filter_groups_metric is not None
+                        or sync_refill_failed_groups
+                        or infrastructure_group_filter_enabled
+                    )
                     else (self.config.data.get("gen_batch_size", None) or train_batch_size),
                     max_inflight_gen_batches=max_inflight_gen_batches,
                 )
@@ -619,17 +656,37 @@ class PPOTrainer(ABC):
         with marked_timer("adv", timing_raw, color="brown"):
             batch = self._compute_advantage(batch, metrics=metrics)
 
-        # 8. [OPTIONAL] update critic
-        if self.use_critic:
+        # 8. [OPTIONAL] update critic.  Filtering can leave a batch with no
+        # trainable rows; avoid invoking a worker with an empty loss mask.
+        has_active_training_samples = self._has_active_training_samples(batch)
+        if self.use_critic and has_active_training_samples:
             with marked_timer("update_critic", timing_raw, color="pink"):
                 batch = self._update_critic(batch, metrics=metrics)
+        elif self.use_critic and not has_active_training_samples:
+            metrics["task_filter/critic_update_skipped"] = 1.0
 
         # 9. update actor
-        if self.config.trainer.critic_warmup <= self.global_steps:
+        if not has_active_training_samples:
+            metrics["task_filter/actor_update_skipped"] = 1.0
+        elif self.config.trainer.critic_warmup <= self.global_steps:
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
 
         return batch
+
+    def _has_active_training_samples(self, batch: KVBatchMeta) -> bool:
+        """Check the persisted sequence mask without changing the default path."""
+        if not _task_filter_enabled():
+            return True
+        data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["train_sample_mask"],
+        )
+        mask = data.get("train_sample_mask")
+        if mask is None:
+            return True
+        return bool(mask.to(torch.bool).any().item())
 
     # ------------------------------ abstract methods ------------------------------
 
@@ -719,7 +776,13 @@ class PPOTrainer(ABC):
         filter_groups = self.config.algorithm.get("filter_groups", None)
         dapo_enabled = bool(filter_groups is not None and filter_groups.get("enable", False))
         sync_refill_failed_groups = bool(self.config.trainer.v1.sampler.get("sync_refill_failed_groups", False))
-        requires_exact_refill = self.trainer_mode != "sync" or dapo_enabled or sync_refill_failed_groups
+        infrastructure_group_filter_enabled = infrastructure_failure_ratio_threshold("train") is not None
+        requires_exact_refill = (
+            self.trainer_mode != "sync"
+            or dapo_enabled
+            or sync_refill_failed_groups
+            or infrastructure_group_filter_enabled
+        )
         if requires_exact_refill:
             user_gen_batch_size = self.config.data.get("gen_batch_size", None)
             if user_gen_batch_size not in (None, 1):
@@ -1020,6 +1083,7 @@ class PPOTrainer(ABC):
         session_to_sample_idx: dict[str, int] = {}
 
         for batch_dict in self.val_dataloader:
+            self._validation_prompt_templates.clear()
             # 1. put batch to agent loop manager
             batch_dict["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
@@ -1027,13 +1091,7 @@ class PPOTrainer(ABC):
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
-            # Register each prompt (GRPO group) in TransferQueue as a tag-only status marker.
-            # global_steps is required by ReplayBuffer's metadata sync / staleness ordering.
-            tags = [
-                {"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))
-            ]
-            tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
-            self.agent_loop_manager.generate_sequences(batch)
+            self._submit_validation_batch(batch)
 
             # 2. sample batch from replay buffer: one prompt (GRPO group) per submitted row.
             batch, _ = self.replay_buffer.sample(
@@ -1437,6 +1495,30 @@ class PPOTrainer(ABC):
         self.agent_loop_manager.generate_sequences(batch)
         return len(batch)
 
+    def _submit_validation_batch(self, batch: TensorDict) -> int:
+        """Register validation prompts and retain templates for exact retries."""
+        uid_values = [str(uid) for uid in batch["uid"]]
+        for index, uid in enumerate(uid_values):
+            self._validation_prompt_templates[uid] = batch[index : index + 1].clone()
+        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in uid_values]
+        tq.kv_batch_put(keys=uid_values, partition_id="val", tags=tags)
+        self.agent_loop_manager.generate_sequences(batch)
+        return len(batch)
+
+    def _refill_validation_groups(self, discarded_uids: list[str]) -> int:
+        """Retry the same validation prompts under fresh group identifiers."""
+        replacements = []
+        for uid in discarded_uids:
+            template = self._validation_prompt_templates.pop(uid, None)
+            if template is None:
+                raise RuntimeError(f"Missing validation prompt template for discarded group {uid}")
+            replacement = template.clone()
+            new_uid = str(uuid.uuid4())
+            replacement["uid"] = NonTensorStack.from_list([NonTensorData(new_uid)])
+            replacements.append(replacement)
+        batch = replacements[0] if len(replacements) == 1 else tu.concat_tensordict(replacements)
+        return self._submit_validation_batch(batch)
+
     def _add_prompts_to_generate(self, num_prompts: int) -> int:
         """Add an exact number of prompts to the AgentLoopManager."""
         batch = self._next_train_batch(num_prompts)
@@ -1720,6 +1802,85 @@ class PPOTrainer(ABC):
 
         return batch
 
+    @staticmethod
+    def _extract_v1_infrastructure_metadata(
+        extra_fields: list, direct_fields: dict[str, list] | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Flatten SWE infrastructure metadata carried in V1 trajectory fields."""
+        direct_fields = direct_fields or {}
+        direct_failure = direct_fields.get(
+            "observed_infrastructure_failure", direct_fields.get("infrastructure_failure", [])
+        )
+        direct_code = direct_fields.get(
+            "observed_infrastructure_failure_code", direct_fields.get("infrastructure_failure_code", [])
+        )
+
+        def direct_value(values: list, index: int) -> Any:
+            if index >= len(values):
+                return None
+            value = values[index]
+            if value is None:
+                return None
+            try:
+                if isinstance(value, float) and not np.isfinite(value):
+                    return None
+            except TypeError:
+                pass
+            return value
+
+        failure_values: list[Any] = []
+        code_values: list[Any] = []
+        for index, extra in enumerate(extra_fields):
+            extra = getattr(extra, "data", extra)
+            extra = extra if isinstance(extra, dict) else {}
+            reward_info = extra.get("reward_extra_info", {})
+            reward_info = reward_info if isinstance(reward_info, dict) else {}
+            failure = direct_value(direct_failure, index)
+            if failure is None:
+                failure = reward_info.get(
+                    "observed_infrastructure_failure",
+                    extra.get(
+                        "observed_infrastructure_failure",
+                        reward_info.get(
+                            "infrastructure_failure", extra.get("infrastructure_failure", np.nan)
+                        ),
+                    ),
+                )
+            code = direct_value(direct_code, index)
+            if code is None:
+                code = reward_info.get(
+                    "observed_infrastructure_failure_code",
+                    extra.get(
+                        "observed_infrastructure_failure_code",
+                        reward_info.get(
+                            "infrastructure_failure_code", extra.get("infrastructure_failure_code", np.nan)
+                        ),
+                    ),
+                )
+            failure_values.append(failure)
+            code_values.append(code)
+        return np.asarray(failure_values, dtype=object), np.asarray(code_values, dtype=object)
+
+    def _apply_v1_task_filter(
+        self, data: DataProto, extra_fields: list, metrics: dict, direct_fields: dict[str, list] | None = None
+    ) -> None:
+        """Apply the V0 SWE infrastructure filter to a V1 training batch."""
+        if not _task_filter_enabled():
+            return
+
+        failure_values, code_values = self._extract_v1_infrastructure_metadata(extra_fields, direct_fields)
+        data.non_tensor_batch["infrastructure_failure"] = failure_values
+        data.non_tensor_batch["infrastructure_failure_code"] = code_values
+        per_sample = self.config.algorithm.adv_estimator == AdvantageEstimator.GAE and int(
+            self.config.actor_rollout_ref.rollout.n
+        ) == 1
+        timeout_mask = data.batch.get("train_sample_mask")
+        task_filter_metrics = apply_training_task_filter(data, per_sample_infrastructure_filter=per_sample)
+        if timeout_mask is not None:
+            data.batch["train_sample_mask"] = data.batch["train_sample_mask"] & timeout_mask
+        data.meta_info["task_filter_all_excluded"] = not data.batch["train_sample_mask"].any().item()
+        metrics.update(task_filter_metrics)
+
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = [
@@ -1735,6 +1896,24 @@ class PPOTrainer(ABC):
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         extra_fields = data.pop("extra_fields").tolist()
+        direct_fields = {}
+        if _task_filter_enabled() or self.timeout_prediction_enabled:
+            for field in (
+                "observed_infrastructure_failure",
+                "observed_infrastructure_failure_code",
+                "infrastructure_failure",
+                "infrastructure_failure_code",
+            ):
+                try:
+                    direct_data = tq.kv_batch_get(
+                        keys=batch.keys,
+                        partition_id=batch.partition_id,
+                        select_fields=[field],
+                    )
+                except Exception:
+                    continue
+                if field in direct_data:
+                    direct_fields[field] = direct_data[field].tolist()
         response_mask = data["response_mask"]
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
@@ -1745,11 +1924,14 @@ class PPOTrainer(ABC):
                 data,
                 batch.tags,
                 extra_fields,
+                direct_fields,
             )
             data.batch["token_level_scores"] = reward_tensor
             data.batch["train_sample_mask"] = train_sample_mask
             data.batch["rm_scores"] = reward_tensor
             self._update_v1_timeout_predictor(data, prediction_targets)
+
+        self._apply_v1_task_filter(data, extra_fields, metrics, direct_fields)
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1796,7 +1978,7 @@ class PPOTrainer(ABC):
         output = {}
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
-        if self.timeout_prediction_enabled:
+        if self.timeout_prediction_enabled or _task_filter_enabled():
             output["rm_scores"] = response_to_nested(data.batch["rm_scores"], response_mask)
             output["train_sample_mask"] = data.batch["train_sample_mask"]
         output = TensorDict(output, batch_size=len(batch))
@@ -1815,6 +1997,7 @@ class PPOTrainer(ABC):
         data: DataProto,
         tags: list[dict],
         extra_fields: list,
+        direct_fields: dict[str, list] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Impute rewards for deadline and completion-ratio cutoff rows in V1."""
         response_mask = data.batch["response_mask"]
@@ -1830,18 +2013,16 @@ class PPOTrainer(ABC):
         with torch.no_grad():
             probabilities, _ = self.timeout_predictor.predict(features)
 
+        infrastructure_values, _ = self._extract_v1_infrastructure_metadata(extra_fields, direct_fields)
         infrastructure = []
         timeout = []
         cutoff = []
-        for tag, extra in zip(tags, extra_fields, strict=True):
+        for index, (tag, extra) in enumerate(zip(tags, extra_fields, strict=True)):
             extra = getattr(extra, "data", extra)
             extra = extra if isinstance(extra, dict) else {}
             reward_info = extra.get("reward_extra_info", {})
             reward_info = reward_info if isinstance(reward_info, dict) else {}
-            infra_value = reward_info.get(
-                "observed_infrastructure_failure",
-                extra.get("observed_infrastructure_failure", 0),
-            )
+            infra_value = infrastructure_values[index]
             try:
                 is_infrastructure = int(infra_value) == 1
             except (TypeError, ValueError, OverflowError):

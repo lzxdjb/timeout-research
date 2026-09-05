@@ -36,6 +36,11 @@ COMPLETION_RATIO_ENV = {
     "val": "SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD",
 }
 
+INFRA_FAILURE_RATIO_ENV = {
+    "train": "SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD",
+    "val": "SWE_AGENT_ROLLOUT_VALIDATION_INFRA_FAILURE_GROUP_RATIO_THRESHOLD",
+}
+
 
 def completion_ratio_threshold(partition_id: str) -> float | None:
     """Return the opt-in completion ratio for a TransferQueue partition."""
@@ -52,6 +57,21 @@ def completion_ratio_threshold(partition_id: str) -> float | None:
     return value
 
 
+def infrastructure_failure_ratio_threshold(partition_id: str) -> float | None:
+    """Return the opt-in infrastructure-failure ratio for a partition."""
+    name = INFRA_FAILURE_RATIO_ENV[partition_id]
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return None
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return value
+
+
 def _accumulate_eviction_metrics(acc: dict, new: dict, stale_count: int) -> None:
     """Merge one poll iteration's eviction metrics into ``acc`` in place.
 
@@ -59,6 +79,11 @@ def _accumulate_eviction_metrics(acc: dict, new: dict, stale_count: int) -> None
     """
     stale_count_key = next((k for k in new if k.endswith("/off_policy/evicted_samples")), None)
     prev_stale_total = acc.get(stale_count_key, 0) if stale_count_key else 0
+    infrastructure_count_key = next(
+        (k for k in new if k.endswith("/infrastructure_group_filter/discarded_groups")), None
+    )
+    previous_infrastructure_total = acc.get(infrastructure_count_key, 0) if infrastructure_count_key else 0
+    new_infrastructure_total = new.get(infrastructure_count_key, 0) if infrastructure_count_key else 0
 
     for key, value in new.items():
         if key.endswith("/evicted_samples_staleness/mean"):
@@ -68,6 +93,13 @@ def _accumulate_eviction_metrics(acc: dict, new: dict, stale_count: int) -> None
             acc[key] = max(acc.get(key, value), value)
         elif key.endswith("/evicted_samples_staleness/min"):
             acc[key] = min(acc.get(key, value), value)
+        elif key.endswith("/infrastructure_group_filter/failure_ratio_mean"):
+            denominator = previous_infrastructure_total + new_infrastructure_total
+            acc[key] = (
+                acc.get(key, 0.0) * previous_infrastructure_total + value * new_infrastructure_total
+            ) / denominator
+        elif key.endswith("/infrastructure_group_filter/failure_ratio_max"):
+            acc[key] = max(acc.get(key, value), value)
         elif key == DAPO_FILTERED_REWARD_COUNTS_KEY:
             # Dict-valued diagnostic: merge {metric_value: count} across poll iterations.
             merged = Counter(acc.get(key, {}))
@@ -165,6 +197,9 @@ class ReplayBuffer:
         max_inflight_gen_batches: int = 1,
         sync_refill_failed_groups: bool = False,
         cancel_fn=None,
+        expected_rollout_n: int | None = None,
+        expected_validation_rollout_n: int | None = None,
+        validation_refill_fn=None,
     ):
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
@@ -182,6 +217,30 @@ class ReplayBuffer:
         self.completion_ratio_thresholds = {
             partition_id: completion_ratio_threshold(partition_id) for partition_id in COMPLETION_RATIO_ENV
         }
+        self.infrastructure_failure_ratio_thresholds = {
+            partition_id: infrastructure_failure_ratio_threshold(partition_id)
+            for partition_id in INFRA_FAILURE_RATIO_ENV
+        }
+        self.expected_rollout_counts = {
+            "train": expected_rollout_n,
+            "val": expected_validation_rollout_n,
+        }
+        self.validation_refill_fn = validation_refill_fn
+
+        logger.info(
+            "V1 replay threshold config: mode=%s completion(train/val)=%s/%s "
+            "infra_failure(train/val)=%s/%s rollout_n(train/val)=%s/%s "
+            "refill(train/val)=%s/%s",
+            self.trainer_mode,
+            self.completion_ratio_thresholds["train"],
+            self.completion_ratio_thresholds["val"],
+            self.infrastructure_failure_ratio_thresholds["train"],
+            self.infrastructure_failure_ratio_thresholds["val"],
+            expected_rollout_n,
+            expected_validation_rollout_n,
+            self.refill_fn is not None,
+            self.validation_refill_fn is not None,
+        )
 
         assert isinstance(self.max_off_policy_threshold, int) and self.max_off_policy_threshold > 0, (
             f"Invalid max off policy threshold: {self.max_off_policy_threshold}, must be an integer greater than 0"
@@ -198,6 +257,23 @@ class ReplayBuffer:
                 raise ValueError("Completion-ratio rollout cutoff is supported only in V1 synchronous trainer mode")
             if self.filter_groups_metric is not None:
                 raise ValueError("Completion-ratio rollout cutoff cannot be combined with synchronous group filtering")
+        if any(value is not None for value in self.infrastructure_failure_ratio_thresholds.values()):
+            if self.trainer_mode != "sync":
+                raise ValueError("Infrastructure group filtering is supported only in V1 synchronous trainer mode")
+            for partition_id, count in self.expected_rollout_counts.items():
+                if self.infrastructure_failure_ratio_thresholds[partition_id] is None:
+                    continue
+                if self.completion_ratio_thresholds[partition_id] is None:
+                    name = COMPLETION_RATIO_ENV[partition_id]
+                    raise ValueError(f"Infrastructure group filtering requires {name}")
+                if not isinstance(count, int) or count <= 0:
+                    raise ValueError(
+                        f"Infrastructure group filtering requires a positive rollout count for {partition_id}"
+                    )
+                if partition_id == "train" and self.refill_fn is None:
+                    raise ValueError("Training infrastructure group filtering requires refill_fn")
+                if partition_id == "val" and self.validation_refill_fn is None:
+                    raise ValueError("Validation infrastructure group filtering requires validation_refill_fn")
         self._validate_mode_config()
         # partition_id => {key: tag}
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
@@ -210,6 +286,7 @@ class ReplayBuffer:
         self.prompt_global_steps: dict[str, dict[str, int]] = defaultdict(dict)
         # Finished groups are immutable, so their DAPO classification can be reused across polling iterations.
         self._dapo_classification_cache: dict[str, dict[str, float | None]] = defaultdict(dict)
+        self._infrastructure_classification_cache: dict[str, dict[str, float]] = defaultdict(dict)
 
     def _validate_mode_config(self) -> None:
         if self.filter_groups_metric is not None:
@@ -257,6 +334,11 @@ class ReplayBuffer:
                         partition[key] = {}
                     partition[key].update(tag)
 
+        for partition_id, cache in self._infrastructure_classification_cache.items():
+            live_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+            for uid in cache.keys() - live_uids:
+                del cache[uid]
+
     @staticmethod
     def _metrics_prefix(partition_id: str) -> str:
         return "training" if partition_id == "train" else "validation"
@@ -281,6 +363,89 @@ class ReplayBuffer:
         for uid in uids:
             self.prompt_global_steps[partition_id].pop(uid, None)
             self._dapo_classification_cache[partition_id].pop(uid, None)
+
+    @staticmethod
+    def _infrastructure_flag(tag: dict) -> bool:
+        """Read the pre-sampling infrastructure marker published by the agent loop."""
+        value = tag.get("infrastructure_failure", False)
+        try:
+            return int(value) == 1
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def _infrastructure_filtered_uids(self, partition_id: str) -> tuple[set[str], dict[str, float]]:
+        """Classify terminal groups before they participate in completion accounting."""
+        threshold = self.infrastructure_failure_ratio_thresholds.get(partition_id)
+        if threshold is None:
+            return set(), {}
+
+        terminal_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        cache = self._infrastructure_classification_cache[partition_id]
+        for uid in cache.keys() - terminal_uids:
+            del cache[uid]
+
+        new_uids = terminal_uids - cache.keys()
+        final_key_by_session: dict[tuple[str, str], tuple[int, str]] = {}
+        for key in self.partitions[partition_id]:
+            parts = key.rsplit("_", 2)
+            if len(parts) != 3 or parts[0] not in new_uids:
+                continue
+            try:
+                output_index = int(parts[2])
+            except ValueError:
+                output_index = 0
+            session = (parts[0], parts[1])
+            if session not in final_key_by_session or output_index > final_key_by_session[session][0]:
+                final_key_by_session[session] = (output_index, key)
+
+        failures_by_uid: dict[str, int] = defaultdict(int)
+        for (_uid, _session), (_index, key) in final_key_by_session.items():
+            if self._infrastructure_flag(self.partitions[partition_id][key]):
+                failures_by_uid[_uid] += 1
+
+        expected_count = self.expected_rollout_counts[partition_id]
+        assert expected_count is not None
+        for uid in new_uids:
+            cache[uid] = failures_by_uid[uid] / expected_count
+
+        ratios = {uid: cache[uid] for uid in terminal_uids}
+        discarded_uids = {uid for uid, ratio in ratios.items() if ratio > threshold}
+        if new_uids:
+            logger.info(
+                "V1 infrastructure group scan: partition=%s terminal_groups=%d newly_classified=%d "
+                "materialized_sessions=%d marked_failures=%d expected_sessions=%d threshold=%.4f "
+                "discarded_groups=%d",
+                partition_id,
+                len(terminal_uids),
+                len(new_uids),
+                len(final_key_by_session),
+                sum(failures_by_uid.values()),
+                expected_count,
+                threshold,
+                len(discarded_uids),
+            )
+        return discarded_uids, ratios
+
+    def _discard_infrastructure_groups(self, partition_id: str) -> tuple[set[str], dict[str, float]]:
+        discarded_uids, ratios = self._infrastructure_filtered_uids(partition_id)
+        if not discarded_uids:
+            return set(), {}
+        prefix = self._metrics_prefix(partition_id)
+        discarded_ratios = [ratios[uid] for uid in discarded_uids]
+        metrics = {
+            f"{prefix}/infrastructure_group_filter/discarded_groups": float(len(discarded_uids)),
+            f"{prefix}/infrastructure_group_filter/failure_ratio_mean": float(np.mean(discarded_ratios)),
+            f"{prefix}/infrastructure_group_filter/failure_ratio_max": float(np.max(discarded_ratios)),
+        }
+        logger.info(
+            "V1 infrastructure group filter discarded partition=%s groups=%d ratio_mean=%.4f ratio_max=%.4f",
+            partition_id,
+            len(discarded_uids),
+            float(np.mean(discarded_ratios)),
+            float(np.max(discarded_ratios)),
+        )
+        self._clear_groups(partition_id, discarded_uids)
+        return discarded_uids, metrics
 
     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
         """Finished groups whose configured DAPO metric is identical across all trajectories.
@@ -519,6 +684,24 @@ class ReplayBuffer:
         while True:
             # Eviction, gating, and selection below must all use this snapshot.
             self._sync_metadata_from_transfer_queue()
+
+            discarded_uids, infrastructure_metrics = self._discard_infrastructure_groups(partition_id)
+            if discarded_uids:
+                _accumulate_eviction_metrics(eviction_metrics, infrastructure_metrics, stale_count=0)
+                if not cutoff_requested:
+                    if partition_id == "val":
+                        self.validation_refill_fn(sorted(discarded_uids))
+                    else:
+                        self.refill_fn(len(discarded_uids))
+                    prefix = self._metrics_prefix(partition_id)
+                    refill_key = f"{prefix}/infrastructure_group_filter/refilled_groups"
+                    eviction_metrics[refill_key] = eviction_metrics.get(refill_key, 0) + len(discarded_uids)
+                    logger.info(
+                        "V1 infrastructure group filter refilled partition=%s groups=%d",
+                        partition_id,
+                        len(discarded_uids),
+                    )
+                continue
 
             cutoff_requested, completion_ratio_metrics = self._maybe_apply_completion_ratio_cutoff(
                 partition_id, batch_size, cutoff_requested

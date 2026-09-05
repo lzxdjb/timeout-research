@@ -61,6 +61,9 @@ def _make_rb(
     max_inflight_gen_batches: int = 1,
     sync_refill_failed_groups: bool = False,
     cancel_fn=None,
+    expected_rollout_n: int | None = None,
+    expected_validation_rollout_n: int | None = None,
+    validation_refill_fn=None,
 ) -> ReplayBuffer:
     """Construct a ReplayBuffer with defaults that keep generic samples on-policy."""
     replay_buffer_cls = ReplayBuffer if trainer_mode == "sync" else ReplayBufferAsync
@@ -78,6 +81,9 @@ def _make_rb(
         max_inflight_gen_batches=max_inflight_gen_batches,
         sync_refill_failed_groups=sync_refill_failed_groups,
         cancel_fn=cancel_fn,
+        expected_rollout_n=expected_rollout_n,
+        expected_validation_rollout_n=expected_validation_rollout_n,
+        validation_refill_fn=validation_refill_fn,
     )
 
 
@@ -148,6 +154,7 @@ class PromptSpec:
     sessions: int = 1
     global_steps: int = 0
     rewards: list[float] | None = None
+    infrastructure_failures: list[int] | None = None
     trajectory_keys: list[str] = field(default_factory=list)
 
 
@@ -169,6 +176,16 @@ class RolloutProducer(threading.Thread):
                     tag = {"is_prompt": False, "seq_len": 3, "global_steps": spec.global_steps}
                     if spec.rewards is not None:
                         fields["extra_fields"] = {"reward_extra_info": {"acc": float(spec.rewards[session_id])}}
+                    if spec.infrastructure_failures is not None:
+                        fields.setdefault("extra_fields", {}).setdefault("reward_extra_info", {}).update(
+                            {
+                                "observed_infrastructure_failure": int(
+                                    spec.infrastructure_failures[session_id]
+                                ),
+                                "observed_infrastructure_failure_code": 3,
+                            }
+                        )
+                        tag["infrastructure_failure"] = bool(spec.infrastructure_failures[session_id])
                     tq.kv_put(
                         key=key,
                         partition_id=self.partition_id,
@@ -325,6 +342,155 @@ def test_completion_ratio_keeps_cutoff_groups_with_materialized_sessions() -> No
     assert complete_uid not in eviction_reasons[2]
     assert no_output_uid in eviction_reasons[2]
     assert complete_uid in rb._sampleable_terminal_keys("train", eviction_reasons)
+
+
+@pytest.mark.parametrize("value", ["-0.1", "1.1", "nan", "not-a-number"])
+def test_infrastructure_group_filter_rejects_invalid_values(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", "0.9")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", value)
+
+    with pytest.raises(ValueError, match="SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD"):
+        _make_rb(refill_fn=lambda _n: None, expected_rollout_n=8)
+
+
+def test_infrastructure_group_filter_requires_completion_ratio(monkeypatch) -> None:
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+
+    with pytest.raises(ValueError, match="SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD"):
+        _make_rb(refill_fn=lambda _n: None, expected_rollout_n=8)
+
+
+def test_validation_infrastructure_filter_does_not_require_training_refill(monkeypatch) -> None:
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD", "0.9")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+
+    rb = _make_rb(
+        refill_fn=None,
+        expected_validation_rollout_n=8,
+        validation_refill_fn=lambda _uids: None,
+    )
+    assert rb.infrastructure_failure_ratio_thresholds["val"] == 0.25
+
+
+def test_infrastructure_group_filter_uses_expected_sessions_and_strict_threshold(
+    tq_init, partition_id: str, monkeypatch
+) -> None:
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", "0.9")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+    discarded = PromptSpec(
+        uid=_uid(), status="finished", sessions=3, infrastructure_failures=[1, 1, 1]
+    )
+    boundary = PromptSpec(
+        uid=_uid(), status="finished", sessions=2, infrastructure_failures=[1, 1]
+    )
+    _produce(partition_id, [discarded, boundary]).join_and_check()
+    rb = _make_rb(
+        refill_fn=lambda _n: None,
+        expected_rollout_n=8,
+        expected_validation_rollout_n=8,
+    )
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        discarded_uids, ratios = rb._infrastructure_filtered_uids(partition_id)
+
+        assert ratios[discarded.uid] == 3 / 8
+        assert ratios[boundary.uid] == 2 / 8
+        assert discarded_uids == {discarded.uid}
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_infrastructure_group_filter_counts_only_final_output_per_session(
+    tq_init, partition_id: str, monkeypatch
+) -> None:
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", "0.9")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+    uid = _uid()
+    for index, failure in enumerate([1, 0]):
+        tq.kv_put(
+            key=_trajectory_key(uid, session_id=0, index=index),
+            partition_id=partition_id,
+            fields={
+                "input_ids": torch.tensor([1, 2, 3]),
+                "extra_fields": {
+                    "reward_extra_info": {"observed_infrastructure_failure": failure}
+                },
+            },
+            tag={
+                "is_prompt": False,
+                "seq_len": 3,
+                "global_steps": 0,
+                "infrastructure_failure": bool(failure),
+            },
+        )
+    _set_prompt_status(partition_id, uid, "finished", global_steps=0)
+    rb = _make_rb(refill_fn=lambda _n: None, expected_rollout_n=1, expected_validation_rollout_n=1)
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        discarded_uids, ratios = rb._infrastructure_filtered_uids(partition_id)
+
+        assert ratios[uid] == 0.0
+        assert not discarded_uids
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_infrastructure_groups_are_replaced_before_completion_cutoff(
+    tq_init, partition_id: str, monkeypatch
+) -> None:
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", "0.75")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+    invalid = PromptSpec(
+        uid=_uid(), status="finished", sessions=4, infrastructure_failures=[1, 1, 0, 0]
+    )
+    valid = [
+        PromptSpec(uid=_uid(), status="finished", sessions=4, infrastructure_failures=[0, 0, 0, 0])
+        for _ in range(2)
+    ]
+    running_uid = _uid()
+    _produce(partition_id, [invalid, *valid]).join_and_check()
+    tq.kv_put(
+        key=running_uid,
+        partition_id=partition_id,
+        tag={"is_prompt": True, "status": "running", "global_steps": 0},
+    )
+    refiller = FakeRefiller(partition_id, global_steps=0, sessions=4)
+    cancelled: list[list[str]] = []
+
+    def cancel_fn(uids: list[str], validate: bool = False) -> int:
+        cancelled.append(uids)
+        for uid in uids:
+            tq.kv_put(
+                key=uid,
+                partition_id=partition_id,
+                tag={
+                    "is_prompt": True,
+                    "status": "failure",
+                    "global_steps": 0,
+                    "completion_ratio_cutoff": True,
+                },
+            )
+        return len(uids)
+
+    rb = _make_rb(
+        refill_fn=refiller,
+        cancel_fn=cancel_fn,
+        train_batch_size=4,
+        expected_rollout_n=4,
+        expected_validation_rollout_n=4,
+    )
+    try:
+        batch, metrics = rb.sample(global_steps=0, partition_id=partition_id, batch_size=4)
+
+        assert invalid.uid not in _uids_of(batch.keys)
+        assert refiller.calls == [1]
+        assert cancelled == [[running_uid]]
+        assert metrics["validation/infrastructure_group_filter/discarded_groups"] == 1.0
+        assert metrics["validation/infrastructure_group_filter/refilled_groups"] == 1
+        assert metrics["validation/completion_ratio/terminal_groups"] == 3.0
+        assert metrics["validation/completion_ratio/total_groups"] == 4.0
+    finally:
+        _clear_partition(partition_id)
 
 
 def test_init_rejects_non_positive_sync_dapo_inflight_limit():
