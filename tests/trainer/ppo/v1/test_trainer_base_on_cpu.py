@@ -14,10 +14,17 @@
 
 from unittest.mock import patch
 
+import pytest
+import torch
 from omegaconf import OmegaConf
+from transfer_queue import KVBatchMeta
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
-from verl.trainer.ppo.v1.trainer_base import PPOTrainer, _get_off_policy_step_arrays
+from verl.trainer.ppo.v1.trainer_base import (
+    PPOTrainer,
+    _get_off_policy_step_arrays,
+    _resolve_v1_sequence_lengths,
+)
 
 
 class _StubTrainer(PPOTrainer):
@@ -31,6 +38,72 @@ class _StubTrainer(PPOTrainer):
 class _CustomSampler:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+
+
+def _batch_with_tags(tags: list[dict]) -> KVBatchMeta:
+    return KVBatchMeta(
+        partition_id="train",
+        keys=[f"row_{index}" for index in range(len(tags))],
+        tags=tags,
+    )
+
+
+def test_v1_sequence_lengths_use_complete_tags_without_queue_read():
+    batch = _batch_with_tags([{"seq_len": 3}, {"seq_len": 7}])
+
+    with patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get") as kv_batch_get:
+        lengths = _resolve_v1_sequence_lengths(batch)
+
+    assert lengths.tolist() == [3, 7]
+    kv_batch_get.assert_not_called()
+
+
+def test_v1_sequence_lengths_recover_only_missing_rows_from_jagged_input_ids():
+    batch = _batch_with_tags([{"seq_len": 3}, {"status": "success"}, {"seq_len": 7}])
+    input_ids = torch.nested.nested_tensor([torch.arange(5)], layout=torch.jagged)
+
+    with (
+        patch(
+            "verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get",
+            return_value={"input_ids": input_ids},
+        ) as kv_batch_get,
+        patch("verl.trainer.ppo.v1.trainer_base.logger.warning") as warning,
+    ):
+        lengths = _resolve_v1_sequence_lengths(batch)
+
+    assert lengths.tolist() == [3, 5, 7]
+    assert batch.tags[1]["seq_len"] == 5
+    kv_batch_get.assert_called_once_with(
+        keys=["row_1"], partition_id="train", select_fields=["input_ids"]
+    )
+    warning.assert_called_once()
+
+
+def test_v1_sequence_lengths_recover_invalid_rows_in_key_order():
+    batch = _batch_with_tags([{"seq_len": 0}, {"seq_len": "invalid"}])
+    input_ids = torch.nested.nested_tensor([torch.arange(4), torch.arange(6)], layout=torch.jagged)
+
+    with patch(
+        "verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get",
+        return_value={"input_ids": input_ids},
+    ):
+        lengths = _resolve_v1_sequence_lengths(batch)
+
+    assert lengths.tolist() == [4, 6]
+    assert [tag["seq_len"] for tag in batch.tags] == [4, 6]
+
+
+def test_v1_sequence_lengths_raise_contextual_error_when_recovery_fails():
+    batch = _batch_with_tags([{}, {"seq_len": 3}])
+
+    with (
+        patch(
+            "verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get",
+            side_effect=KeyError("input_ids"),
+        ),
+        pytest.raises(RuntimeError, match=r"could not recover.*row_0"),
+    ):
+        _resolve_v1_sequence_lengths(batch)
 
 
 def test_off_policy_steps_sync_fall_back_to_sample_step():

@@ -31,6 +31,10 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _get_validation_metric_sources
+from verl.trainer.ppo.v1.trainer_base import (
+    _resolve_validation_metric_sources,
+    _to_validation_metric_source_list,
+)
 from verl.utils.metric import (
     reduce_metrics,
 )
@@ -74,6 +78,31 @@ class TestReduceMetrics(unittest.TestCase):
 
 
 class TestValidationMetricSources(unittest.TestCase):
+    def test_v1_prefers_metric_source_and_falls_back_per_row(self):
+        sources = _resolve_validation_metric_sources(
+            ["swe_agent_verl", "swe_agent_verl", "terminal_bench_2_0"],
+            ["swe_bench_pro", "swe_bench_verified", ""],
+        )
+
+        np.testing.assert_array_equal(sources, ["swe_bench_pro", "swe_bench_verified", "terminal_bench_2_0"])
+
+    def test_v1_falls_back_when_metric_source_is_unavailable(self):
+        sources = ["swe_agent_verl", "terminal_bench_2_0"]
+        np.testing.assert_array_equal(_resolve_validation_metric_sources(sources, None), sources)
+        np.testing.assert_array_equal(_resolve_validation_metric_sources(sources, ["only-one"]), sources)
+
+    def test_v1_accepts_list_like_metric_sources_without_tolist(self):
+        class _LinkedList(list):
+            pass
+
+        metric_sources = _to_validation_metric_source_list(_LinkedList(["swe_bench_pro", "swe_bench_verified"]))
+        sources = _resolve_validation_metric_sources(
+            ["swe_agent_verl", "swe_agent_verl"],
+            metric_sources,
+        )
+
+        np.testing.assert_array_equal(sources, ["swe_bench_pro", "swe_bench_verified"])
+
     def test_generation_batch_preserves_metric_source_for_agent_reward_loop(self):
         batch = DataProto.from_single_dict(
             {

@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
-from verl.trainer.ppo.v1.utils import MetricsAggregator
+from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_v1_success_ratio_metrics
 
 
 def test_empty_aggregator_returns_empty():
@@ -218,3 +218,44 @@ def test_rollout_failure_evicted_samples_are_summed_across_iterations():
     agg.add_step_metrics({"training/rollout_failure/evicted_samples": 1})
     agg.add_step_metrics({"training/rollout_failure/evicted_samples": 2})
     assert agg.get_aggregated_metrics()["training/rollout_failure/evicted_samples"] == pytest.approx(3.0)
+
+
+def test_v1_success_ratios_exclude_whole_cutoff_and_infrastructure_groups():
+    keys = ["g1_0_0", "g1_1_0", "g2_0_0", "g2_1_0", "g3_0_0", "g3_1_0"]
+    tags = [
+        {"infrastructure_failure": 0},
+        {"infrastructure_failure": 0},
+        {"completion_ratio_cutoff": True, "infrastructure_failure": 0},
+        {"completion_ratio_cutoff": True, "infrastructure_failure": 0},
+        {"infrastructure_failure": 1},
+        {"infrastructure_failure": 1},
+    ]
+    metrics = compute_v1_success_ratio_metrics(
+        batch_keys=keys,
+        batch_tags=tags,
+        success_values=[1, 0, 1, 1, 0, 1],
+        prefix="training",
+        infrastructure_failure_ratio_threshold=0.25,
+        expected_rollout_count=2,
+    )
+
+    assert metrics["training/success_ratio/excluding_completion_cutoff"] == 0.5
+    assert metrics["training/success_ratio/excluding_completion_cutoff_and_infrastructure"] == 0.5
+    assert metrics["training/success_ratio/excluding_completion_cutoff_eligible_count"] == 4.0
+    assert metrics["training/success_ratio/excluding_completion_cutoff_and_infrastructure_eligible_count"] == 2.0
+    assert metrics["training/success_ratio/excluded_completion_cutoff_group_count"] == 1.0
+    assert metrics["training/success_ratio/excluded_infrastructure_group_count"] == 1.0
+
+
+def test_v1_success_ratios_use_final_output():
+    metrics = compute_v1_success_ratio_metrics(
+        batch_keys=["g_0_0", "g_0_1"],
+        batch_tags=[{}, {}],
+        success_values=[0, 1],
+        prefix="validation",
+        infrastructure_failure_ratio_threshold=None,
+        expected_rollout_count=1,
+    )
+
+    assert metrics["validation/success_ratio/excluding_completion_cutoff"] == 1.0
+    assert metrics["validation/success_ratio/excluding_completion_cutoff_eligible_count"] == 1.0

@@ -23,6 +23,148 @@ from verl.trainer.ppo.ray_trainer import compute_advantage
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
 
 
+_SUCCESS_RATIO_VARIANTS = (
+    "excluding_completion_cutoff",
+    "excluding_completion_cutoff_and_infrastructure",
+)
+
+
+def _optional_finite_float(value: Any) -> float | None:
+    """Return a finite scalar, or ``None`` for missing/non-numeric metadata."""
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        value = value.item()
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return numeric if np.isfinite(numeric) else None
+
+
+def v1_success_values(extra_fields: list[Any], fallback_scores: list[Any]) -> list[float | None]:
+    """Use V1's validation-core success convention for trajectory metrics.
+
+    ``acc`` is preferred when the reward manager emitted it for at least one
+    trajectory. Otherwise, the trajectory reward is used, matching validation's
+    existing ``acc``-then-``reward`` core-variable selection.
+    """
+    if len(extra_fields) != len(fallback_scores):
+        raise ValueError(
+            f"extra_fields and fallback_scores must have equal length, got {len(extra_fields)} and "
+            f"{len(fallback_scores)}"
+        )
+
+    accuracy_values: list[float | None] = []
+    has_accuracy = False
+    for extra in extra_fields:
+        extra = getattr(extra, "data", extra)
+        extra = extra if isinstance(extra, dict) else {}
+        reward_info = extra.get("reward_extra_info", {})
+        reward_info = reward_info if isinstance(reward_info, dict) else {}
+        has_accuracy = has_accuracy or "acc" in reward_info
+        accuracy_values.append(_optional_finite_float(reward_info.get("acc")))
+
+    if has_accuracy:
+        return accuracy_values
+    return [_optional_finite_float(score) for score in fallback_scores]
+
+
+def compute_v1_success_ratio_metrics(
+    *,
+    batch_keys: list[str],
+    batch_tags: list[dict[str, Any]],
+    success_values: list[Any],
+    prefix: str,
+    infrastructure_failure_ratio_threshold: float | None,
+    expected_rollout_count: int,
+) -> dict[str, float]:
+    """Compute trajectory success ratios after excluding whole V1 prompt groups.
+
+    Only the final output of each agent-loop session participates. Completion
+    cutoff is a group property when any row carries the cutoff tag. The
+    infrastructure classification intentionally mirrors ``ReplayBuffer``: the
+    final-session failure count is divided by the configured rollout count and
+    compared to the threshold with a strict ``>``.
+    """
+    if not (len(batch_keys) == len(batch_tags) == len(success_values)):
+        raise ValueError(
+            "batch_keys, batch_tags, and success_values must have equal length, got "
+            f"{len(batch_keys)}, {len(batch_tags)}, and {len(success_values)}"
+        )
+    if expected_rollout_count <= 0:
+        raise ValueError(f"expected_rollout_count must be positive, got {expected_rollout_count}")
+
+    final_by_session: dict[tuple[str, str], tuple[int, int]] = {}
+    group_cutoff: dict[str, bool] = defaultdict(bool)
+    for row_index, (key, tag) in enumerate(zip(batch_keys, batch_tags, strict=True)):
+        if tag.get("is_padding", False):
+            continue
+        parts = key.rsplit("_", 2)
+        if len(parts) == 3:
+            uid, session_id = parts[0], parts[1]
+            try:
+                output_index = int(parts[2])
+            except ValueError:
+                output_index = 0
+        else:
+            uid, session_id, output_index = key, "0", 0
+        group_cutoff[uid] = group_cutoff[uid] or bool(tag.get("completion_ratio_cutoff", False))
+        session = (uid, session_id)
+        if session not in final_by_session or output_index > final_by_session[session][0]:
+            final_by_session[session] = (output_index, row_index)
+
+    final_rows: list[tuple[str, float | None, bool]] = []
+    failures_by_group: Counter[str] = Counter()
+    for (uid, _session_id), (_output_index, row_index) in final_by_session.items():
+        success = _optional_finite_float(success_values[row_index])
+        tag = batch_tags[row_index]
+        try:
+            infrastructure_failure = int(tag.get("infrastructure_failure", False)) == 1
+        except (TypeError, ValueError, OverflowError):
+            infrastructure_failure = False
+        failures_by_group[uid] += int(infrastructure_failure)
+        final_rows.append((uid, success, group_cutoff[uid]))
+
+    infrastructure_groups: set[str] = set()
+    if infrastructure_failure_ratio_threshold is not None:
+        infrastructure_groups = {
+            uid
+            for uid, failure_count in failures_by_group.items()
+            if failure_count / expected_rollout_count > infrastructure_failure_ratio_threshold
+        }
+
+    cutoff_rows = [(uid, success) for uid, success, cutoff in final_rows if not cutoff and success is not None]
+    valid_rows = [
+        (uid, success) for uid, success in cutoff_rows if uid not in infrastructure_groups and success is not None
+    ]
+
+    def ratio(rows: list[tuple[str, float]]) -> tuple[float, float, float]:
+        eligible_count = len(rows)
+        successful_count = float(sum(success for _uid, success in rows))
+        value = successful_count / eligible_count if eligible_count else 0.0
+        return value, successful_count, float(eligible_count)
+
+    cutoff_ratio, cutoff_successes, cutoff_eligible = ratio(cutoff_rows)
+    valid_ratio, valid_successes, valid_eligible = ratio(valid_rows)
+    metric_root = f"{prefix}/success_ratio"
+    cutoff_name, valid_name = _SUCCESS_RATIO_VARIANTS
+    return {
+        f"{metric_root}/{cutoff_name}": cutoff_ratio,
+        f"{metric_root}/{cutoff_name}_successful_count": cutoff_successes,
+        f"{metric_root}/{cutoff_name}_eligible_count": cutoff_eligible,
+        f"{metric_root}/{valid_name}": valid_ratio,
+        f"{metric_root}/{valid_name}_successful_count": valid_successes,
+        f"{metric_root}/{valid_name}_eligible_count": valid_eligible,
+        f"{metric_root}/excluded_completion_cutoff_group_count": float(
+            sum(uid in group_cutoff and group_cutoff[uid] for uid in {row[0] for row in final_rows})
+        ),
+        f"{metric_root}/excluded_infrastructure_group_count": float(len(infrastructure_groups)),
+    }
+
+
 class MetricsAggregator:
     """
     Combine per-iteration training metrics collected within a single ``parameter_sync_step`` cycle.
@@ -76,6 +218,12 @@ class MetricsAggregator:
 
     def _get_metric_weight(self, metric_name: str, metrics: dict[str, Any], sample_count: int) -> int:
         """Return the sample weight used when reducing per-iteration average metrics."""
+        if "/success_ratio/" in metric_name and metric_name.rsplit("/", 1)[-1] in _SUCCESS_RATIO_VARIANTS:
+            eligible_count = metrics.get(f"{metric_name}_eligible_count", sample_count)
+            if isinstance(eligible_count, torch.Tensor):
+                return int(eligible_count.item()) if eligible_count.numel() == 1 else sample_count
+            if isinstance(eligible_count, int | float | np.number):
+                return int(eligible_count)
         if metric_name.endswith("/off_policy/evicted_samples_staleness/mean"):
             prefix = metric_name.rsplit("_staleness/mean", 1)[0]
             evicted_samples = metrics.get(prefix, sample_count)
@@ -98,6 +246,8 @@ class MetricsAggregator:
                 return agg_type
 
         metric_lower = metric_name.lower()
+        if "/success_ratio/" in metric_lower and metric_lower.endswith("_count"):
+            return "sum"
         if metric_lower.endswith("/lr") or metric_lower.endswith("_lr") or metric_lower == "lr":
             return "last"
         if "timing_s/" in metric_lower or "timing_per_token_ms/" in metric_lower:

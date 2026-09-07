@@ -88,7 +88,12 @@ from verl.trainer.ppo.v1.replay_buffer import (
     ReplayBufferAsync,
     infrastructure_failure_ratio_threshold,
 )
-from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
+from verl.trainer.ppo.v1.utils import (
+    MetricsAggregator,
+    compute_advantage_for_multi_trajectories,
+    compute_v1_success_ratio_metrics,
+    v1_success_values,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils import timeout_debug
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -113,6 +118,29 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
     params["top_p"] = 1.0
     params["top_k"] = -1
     params["temperature"] = 0
+
+
+def _resolve_validation_metric_sources(
+    data_sources: list[Any], metric_data_sources: list[Any] | None
+) -> list[Any]:
+    """Prefer dataset-specific labels for validation metrics, with a safe fallback."""
+    if metric_data_sources is None or len(metric_data_sources) != len(data_sources):
+        return data_sources
+    return [
+        metric_source if metric_source not in (None, "") else data_source
+        for metric_source, data_source in zip(metric_data_sources, data_sources, strict=True)
+    ]
+
+
+def _to_validation_metric_source_list(values: Any) -> list[Any]:
+    """Convert TransferQueue's batched metadata containers to a Python list."""
+    if hasattr(values, "tolist"):
+        converted = values.tolist()
+        return converted if isinstance(converted, list) else [converted]
+    try:
+        return list(values)
+    except TypeError:
+        return [values]
 
 
 def _get_off_policy_step_arrays(
@@ -142,6 +170,84 @@ def _get_off_policy_step_arrays(
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _valid_sequence_length(value: Any) -> int | None:
+    """Normalize a positive integral sequence length from queue metadata."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        value = value.item()
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or numeric <= 0 or not numeric.is_integer():
+        return None
+    return int(numeric)
+
+
+def _input_id_sequence_lengths(input_ids: Any, expected_rows: int) -> list[int]:
+    """Extract per-row lengths from persisted V1 ``input_ids`` data."""
+    if isinstance(input_ids, torch.Tensor):
+        if input_ids.is_nested:
+            lengths = input_ids.offsets().diff().detach().cpu().tolist()
+        elif input_ids.ndim >= 2 and input_ids.shape[0] == expected_rows:
+            lengths = [input_ids.shape[-1]] * expected_rows
+        elif expected_rows == 1 and input_ids.ndim == 1:
+            lengths = [input_ids.numel()]
+        else:
+            lengths = []
+    else:
+        try:
+            lengths = [len(row) for row in input_ids]
+        except (TypeError, AttributeError):
+            lengths = []
+
+    normalized = [_valid_sequence_length(length) for length in lengths]
+    if len(normalized) != expected_rows or any(length is None for length in normalized):
+        raise ValueError(f"expected {expected_rows} positive input_ids lengths, got {lengths!r}")
+    return [length for length in normalized if length is not None]
+
+
+def _resolve_v1_sequence_lengths(batch: KVBatchMeta) -> torch.Tensor:
+    """Resolve V1 balancing lengths, recovering incomplete mutable queue tags."""
+    lengths: list[int | None] = []
+    recovery_indices: list[int] = []
+    for index, tag in enumerate(batch.tags):
+        length = _valid_sequence_length(tag.get("seq_len") if isinstance(tag, dict) else None)
+        lengths.append(length)
+        if length is None:
+            recovery_indices.append(index)
+
+    if recovery_indices:
+        recovery_keys = [batch.keys[index] for index in recovery_indices]
+        try:
+            data = tq.kv_batch_get(
+                keys=recovery_keys,
+                partition_id=batch.partition_id,
+                select_fields=["input_ids"],
+            )
+            recovered_lengths = _input_id_sequence_lengths(data["input_ids"], len(recovery_keys))
+        except Exception as exc:
+            raise RuntimeError(
+                "V1 batch balancing could not recover missing or invalid seq_len metadata "
+                f"for {len(recovery_keys)} row(s); sample keys: {recovery_keys[:5]}"
+            ) from exc
+
+        for index, length in zip(recovery_indices, recovered_lengths, strict=True):
+            lengths[index] = length
+            if isinstance(batch.tags[index], dict):
+                batch.tags[index]["seq_len"] = length
+        logger.warning(
+            "Recovered missing or invalid V1 seq_len metadata from input_ids for %d row(s); sample keys: %s",
+            len(recovery_keys),
+            recovery_keys[:5],
+        )
+
+    return torch.tensor(lengths, dtype=torch.int64)
 
 
 def _tq_supports_checkpoint() -> bool:
@@ -1081,6 +1187,8 @@ class PPOTrainer(ABC):
         dump_all_outputs: list[str] = []
         dump_all_keys: list[str] = []
         session_to_sample_idx: dict[str, int] = {}
+        success_metric_keys: list[str] = []
+        success_metric_tags: list[dict] = []
 
         for batch_dict in self.val_dataloader:
             self._validation_prompt_templates.clear()
@@ -1149,6 +1257,8 @@ class PPOTrainer(ABC):
             sorted_sessions = sorted(session_max.items(), key=lambda x: x[1][1])
             final_indices = [pos for _, (_, pos) in sorted_sessions]
             final_keys = [batch.keys[i] for i in final_indices]
+            success_metric_keys.extend(final_keys)
+            success_metric_tags.extend(batch.tags[i] for i in final_indices)
             base_offset = len(sample_scores)
             session_to_sample_idx.update(
                 {session_key: base_offset + j for j, (session_key, _) in enumerate(sorted_sessions)}
@@ -1196,10 +1306,26 @@ class PPOTrainer(ABC):
                 sample_gts.extend([None] * len(final_indices))
 
             data_source = data.pop("data_source", None)
-            if data_source is not None:
-                data_sources.extend(data_source.tolist())
-            else:
-                data_sources.extend(["unknown"] * len(final_indices))
+            fallback_sources = (
+                _to_validation_metric_source_list(data_source)
+                if data_source is not None
+                else ["unknown"] * len(final_indices)
+            )
+            # ``metric_data_source`` is optional for backwards compatibility. It is
+            # intentionally read separately so older/custom rollouts that do not
+            # persist this field continue to use their existing ``data_source``.
+            metric_sources = None
+            try:
+                metric_data = tq.kv_batch_get(
+                    keys=final_keys,
+                    partition_id=batch.partition_id,
+                    select_fields=["metric_data_source"],
+                )
+                metric_source_values = metric_data["metric_data_source"]
+                metric_sources = _to_validation_metric_source_list(metric_source_values)
+            except (KeyError, TypeError, ValueError):
+                pass
+            data_sources.extend(_resolve_validation_metric_sources(fallback_sources, metric_sources))
 
             dump_all_inputs.extend(all_inputs)
             dump_all_outputs.extend(all_outputs)
@@ -1244,7 +1370,21 @@ class PPOTrainer(ABC):
                 dump_path=val_data_dir,
             )
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        validation_metrics = self._val_metrics_update(
+            data_sources, sample_uids, reward_extra_infos_dict, sample_turns
+        )
+        success_values = reward_extra_infos_dict.get("acc", reward_extra_infos_dict["reward"])
+        validation_metrics.update(
+            compute_v1_success_ratio_metrics(
+                batch_keys=success_metric_keys,
+                batch_tags=success_metric_tags,
+                success_values=success_values,
+                prefix="validation",
+                infrastructure_failure_ratio_threshold=infrastructure_failure_ratio_threshold("val"),
+                expected_rollout_count=int(self.config.actor_rollout_ref.rollout.val_kwargs.n),
+            )
+        )
+        return validation_metrics
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1668,7 +1808,7 @@ class PPOTrainer(ABC):
                 )
             except Exception:
                 logger.exception("Unable to collect timeout debug batch after balancing")
-        global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
+        global_seqlen_lst = _resolve_v1_sequence_lengths(batch)
         workload_lst = calculate_workload(global_seqlen_lst)
 
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
@@ -2224,6 +2364,14 @@ class PPOTrainer(ABC):
         )
 
         num_turns = np.array(data.pop("num_turns").tolist())
+        try:
+            extra_fields = tq.kv_batch_get(
+                keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"]
+            ).pop("extra_fields").tolist()
+        except (KeyError, ValueError):
+            # ``extra_fields`` is optional for generic V1 rollouts. Falling back
+            # to reward scores preserves the pre-existing metric path there.
+            extra_fields = [{} for _ in batch.keys]
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
@@ -2235,12 +2383,6 @@ class PPOTrainer(ABC):
         spec_drafts = spec_accepts = spec_verifies = None
         mtp_config = getattr(self.config.actor_rollout_ref.model, "mtp", None)
         if mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout:
-            spec_data = tq.kv_batch_get(
-                keys=batch.keys,
-                partition_id=batch.partition_id,
-                select_fields=["extra_fields"],
-            )
-            extra_fields = spec_data.pop("extra_fields").tolist()
             # The rollout omits the spec_* stats when the backend does not report
             # per-request spec-decode stats; leave all three as None in that case.
             if extra_fields and all(
@@ -2251,6 +2393,8 @@ class PPOTrainer(ABC):
                 spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
 
         data = data.to_padded_tensor()
+        trajectory_scores = data["rm_scores"].sum(dim=1).tolist()
+        success_values = v1_success_values(extra_fields, trajectory_scores)
         data["token_level_scores"] = data["rm_scores"]
         if "token_level_rewards" not in data:
             data["token_level_rewards"] = data["rm_scores"]
@@ -2270,6 +2414,16 @@ class PPOTrainer(ABC):
             )
         )
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+        metrics.update(
+            compute_v1_success_ratio_metrics(
+                batch_keys=batch.keys,
+                batch_tags=batch.tags,
+                success_values=success_values,
+                prefix="training",
+                infrastructure_failure_ratio_threshold=infrastructure_failure_ratio_threshold("train"),
+                expected_rollout_count=int(self.config.actor_rollout_ref.rollout.n),
+            )
+        )
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self._get_n_gpus_for_throughput()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
