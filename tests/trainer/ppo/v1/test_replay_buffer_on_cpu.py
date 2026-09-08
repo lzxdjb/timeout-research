@@ -29,7 +29,28 @@ import torch
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
 
-from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
+from verl.trainer.ppo.v1.replay_buffer import (
+    ReplayBuffer,
+    ReplayBufferAsync,
+    golden_group_is_eligible,
+)
+
+
+def test_golden_group_admission_excludes_zero_variance_and_rollout_discards():
+    common = {
+        "infrastructure_failure_count": 0,
+        "expected_rollout_count": 8,
+        "infrastructure_failure_threshold": 0.25,
+    }
+    assert golden_group_is_eligible([0.0, 1.0, 0.0, 1.0], completion_ratio_cutoff=False, **common)
+    assert not golden_group_is_eligible([1.0, 1.0, 1.0, 1.0], completion_ratio_cutoff=False, **common)
+    assert not golden_group_is_eligible([0.0, 1.0, 0.0, 1.0], completion_ratio_cutoff=True, **common)
+    assert not golden_group_is_eligible(
+        [0.0, 1.0, 0.0, 1.0],
+        completion_ratio_cutoff=False,
+        infrastructure_failure_count=3,
+        **{key: value for key, value in common.items() if key != "infrastructure_failure_count"},
+    )
 
 # Small poll interval so the blocking consumer reacts to producer writes quickly.
 POLL_INTERVAL = 0.05

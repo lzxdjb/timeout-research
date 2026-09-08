@@ -30,6 +30,70 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS = int(os.getenv("VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS", "60"))
 
 DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
+GOLDEN_REPLAY_PARTITION = "golden_replay"
+
+
+def golden_replay_enabled() -> bool:
+    """Return whether persistent golden-group retention is explicitly enabled."""
+    return os.getenv("VERL_GRPO_GOLDEN_REPLAY_ENABLED", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _positive_env_int(name: str, default: int | None = None) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def golden_replay_limits() -> tuple[int, int]:
+    """Read mandatory bounded-storage limits when golden replay is enabled."""
+    max_groups = _positive_env_int("VERL_GRPO_GOLDEN_REPLAY_MAX_GROUPS")
+    max_tokens = _positive_env_int("VERL_GRPO_GOLDEN_REPLAY_MAX_TOKENS")
+    if max_groups is None or max_tokens is None:
+        raise ValueError(
+            "VERL_GRPO_GOLDEN_REPLAY_MAX_GROUPS and "
+            "VERL_GRPO_GOLDEN_REPLAY_MAX_TOKENS are required when "
+            "VERL_GRPO_GOLDEN_REPLAY_ENABLED=1"
+        )
+    return max_groups, max_tokens
+
+
+def golden_group_is_eligible(
+    rewards: list[float],
+    *,
+    completion_ratio_cutoff: bool,
+    infrastructure_failure_count: int,
+    expected_rollout_count: int,
+    infrastructure_failure_threshold: float | None,
+    variance_tolerance: float = 1e-12,
+) -> bool:
+    """Pure admission predicate for persistent golden replay.
+
+    A group must have finite rewards with non-zero variance, must not have been
+    cancelled by the completion-ratio cutoff, and must not exceed the existing
+    strict infrastructure-failure threshold.
+    """
+    if completion_ratio_cutoff or not rewards or expected_rollout_count <= 0:
+        return False
+    if not all(math.isfinite(float(reward)) for reward in rewards):
+        return False
+    mean = sum(rewards) / len(rewards)
+    variance = sum((reward - mean) ** 2 for reward in rewards) / len(rewards)
+    if not math.isfinite(variance) or variance <= variance_tolerance:
+        return False
+    if infrastructure_failure_threshold is not None:
+        ratio = infrastructure_failure_count / expected_rollout_count
+        if ratio > infrastructure_failure_threshold:
+            return False
+    return True
 
 COMPLETION_RATIO_ENV = {
     "train": "SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD",
@@ -226,6 +290,28 @@ class ReplayBuffer:
             "val": expected_validation_rollout_n,
         }
         self.validation_refill_fn = validation_refill_fn
+        self.golden_replay_enabled = golden_replay_enabled()
+        self.golden_replay_max_groups = 0
+        self.golden_replay_max_tokens = 0
+        self.golden_replay_kl_radius = 0.05
+        if self.golden_replay_enabled:
+            if self.trainer_mode != "sync":
+                raise ValueError("Golden replay is currently supported only in V1 synchronous trainer mode")
+            self.golden_replay_max_groups, self.golden_replay_max_tokens = golden_replay_limits()
+            try:
+                self.golden_replay_kl_radius = float(
+                    os.getenv("VERL_GRPO_GOLDEN_REPLAY_KL_RADIUS", "0.05")
+                )
+            except ValueError as exc:
+                raise ValueError("VERL_GRPO_GOLDEN_REPLAY_KL_RADIUS must be numeric") from exc
+            if not math.isfinite(self.golden_replay_kl_radius) or self.golden_replay_kl_radius <= 0:
+                raise ValueError("VERL_GRPO_GOLDEN_REPLAY_KL_RADIUS must be positive")
+            logger.info(
+                "Golden replay enabled: max_groups=%d max_tokens=%d kl_radius=%s",
+                self.golden_replay_max_groups,
+                self.golden_replay_max_tokens,
+                self.golden_replay_kl_radius,
+            )
 
         logger.info(
             "V1 replay threshold config: mode=%s completion(train/val)=%s/%s "
@@ -287,6 +373,246 @@ class ReplayBuffer:
         # Finished groups are immutable, so their DAPO classification can be reused across polling iterations.
         self._dapo_classification_cache: dict[str, dict[str, float | None]] = defaultdict(dict)
         self._infrastructure_classification_cache: dict[str, dict[str, float]] = defaultdict(dict)
+
+    @staticmethod
+    def _golden_partition_id(partition_id: str) -> str:
+        return f"{GOLDEN_REPLAY_PARTITION}_{partition_id}"
+
+    @staticmethod
+    def _uid_from_key(key: str) -> str:
+        parts = key.rsplit("_", 2)
+        return parts[0] if len(parts) == 3 else key
+
+    @staticmethod
+    def _final_session_keys(keys: list[str]) -> list[str]:
+        latest: dict[tuple[str, str], tuple[int, str]] = {}
+        for key in keys:
+            parts = key.rsplit("_", 2)
+            if len(parts) != 3:
+                latest[(key, "0")] = (0, key)
+                continue
+            uid, session, raw_index = parts
+            try:
+                index = int(raw_index)
+            except ValueError:
+                index = 0
+            previous = latest.get((uid, session))
+            if previous is None or index > previous[0]:
+                latest[(uid, session)] = (index, key)
+        return [item[1] for item in latest.values()]
+
+    @staticmethod
+    def _golden_prompt_uids(partition_id: str) -> set[str]:
+        """Return transient prompt groups that came from persistent replay."""
+        listed = tq.kv_list(partition_id) or {}
+        items = listed.get(partition_id, listed)
+        return {
+            uid
+            for uid, tag in items.items()
+            if tag.get("is_prompt", False) and tag.get("golden_replay_source", False)
+        }
+
+    @staticmethod
+    def _variational_value(rewards: list[float], kl_radius: float) -> float:
+        """Solve the Section-5 scalar dual without requiring scipy or gradients."""
+        mean = sum(rewards) / len(rewards)
+        variance = sum((reward - mean) ** 2 for reward in rewards) / len(rewards)
+        if not math.isfinite(variance) or variance <= 1e-12:
+            return 0.0
+
+        def dual(eta: float) -> tuple[float, float]:
+            # The KL-ball robust upper expectation is
+            # inf_eta eta*rho + eta*log(mean(exp(reward/eta))).
+            # Subtracting the maximum only stabilizes exponentiation; it does
+            # not change the dual value because the maximum is restored in
+            # log_z below.
+            scaled = [reward / eta for reward in rewards]
+            maximum = max(scaled)
+            exp_values = [math.exp(value - maximum) for value in scaled]
+            total = sum(exp_values)
+            log_z = maximum + math.log(total / len(exp_values))
+            weighted_reward = sum(reward * weight for reward, weight in zip(rewards, exp_values, strict=True)) / total
+            value = eta * kl_radius + eta * log_z
+            derivative = kl_radius + log_z - weighted_reward / eta
+            return value, derivative
+
+        low, high = 1e-8, 1.0
+        while dual(high)[1] < 0.0 and high < 1e8:
+            high *= 2.0
+        for _ in range(80):
+            middle = (low + high) / 2.0
+            if dual(middle)[1] < 0.0:
+                low = middle
+            else:
+                high = middle
+        # Keep the dual value on its original reward scale.  In particular, do
+        # not clamp negative groups to zero: their ordering relative to other
+        # groups is part of the retention objective.
+        return dual(high)[0]
+
+    def prepare_golden_replay(self, global_steps: int, partition_id: str, batch_size: int) -> int:
+        """Copy selected retained groups into the transient train partition.
+
+        Returns the number of fresh prompts that must be generated. The method is
+        a no-op unless the explicit golden-replay switch is enabled.
+        """
+        if not self.golden_replay_enabled or partition_id != "train":
+            return batch_size
+        if batch_size <= 1:
+            return batch_size
+        golden_partition = self._golden_partition_id(partition_id)
+        # Enforce limits before selecting a batch as well.  This matters after a
+        # restart (or an environment-variable change), when the persistent
+        # partition may already exceed the current configured bounds.
+        self._cleanup_golden_replay()
+        listed = tq.kv_list(golden_partition) or {}
+        items = listed.get(golden_partition, listed)
+        prompts = [
+            (uid, tag)
+            for uid, tag in items.items()
+            if tag.get("is_prompt", False) and tag.get("status") == "finished"
+        ]
+        prompts.sort(key=lambda item: float(item[1].get("golden_replay_value", 0.0)), reverse=True)
+        max_per_batch = _positive_env_int("VERL_GRPO_GOLDEN_REPLAY_MAX_GROUPS_PER_BATCH", batch_size - 1)
+        max_replay = min(batch_size - 1, max_per_batch or 0, len(prompts))
+        selected = prompts[:max_replay]
+        if not selected:
+            return batch_size
+
+        train_partition = partition_id
+        replayed = 0
+        for uid, golden_tag in selected:
+            all_trajectory_keys = [
+                key
+                for key, tag in items.items()
+                if not tag.get("is_prompt", False) and self._uid_from_key(key) == uid
+            ]
+            # A session may publish several attempts.  Only the highest-index
+            # (final) attempt is part of the retained group; copying abandoned
+            # attempts would reintroduce infrastructure failures and inflate the
+            # replay token budget.
+            trajectory_keys = self._final_session_keys(all_trajectory_keys)
+            if not trajectory_keys:
+                continue
+            fields = tq.kv_batch_get(keys=trajectory_keys, partition_id=golden_partition)
+            trajectory_tags = [dict(items[key]) | {"golden_replay_source": True} for key in trajectory_keys]
+            tq.kv_batch_put(
+                keys=trajectory_keys,
+                partition_id=train_partition,
+                fields=fields,
+                tags=trajectory_tags,
+            )
+            prompt_tag = {
+                "is_prompt": True,
+                "status": "finished",
+                "global_steps": global_steps,
+                "golden_replay_source": True,
+            }
+            tq.kv_batch_put(keys=[uid], partition_id=train_partition, tags=[prompt_tag])
+            replayed += 1
+        return batch_size - replayed
+
+    def consider_golden_replay(self, batch: KVBatchMeta, rewards: list[float], global_steps: int) -> dict[str, float]:
+        """Admit only valid, non-cutoff, non-zero-variance groups into persistence."""
+        if not self.golden_replay_enabled or batch.partition_id != "train":
+            return {}
+        if len(batch.keys) != len(rewards):
+            raise ValueError("Golden replay rewards must align with batch trajectory keys")
+        listed = tq.kv_list("train") or {}
+        items = listed.get("train", listed)
+        golden_partition = self._golden_partition_id("train")
+        golden_items = (tq.kv_list(golden_partition) or {}).get(golden_partition, {})
+        grouped: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        for key, reward in zip(batch.keys, rewards, strict=True):
+            grouped[self._uid_from_key(key)].append((key, float(reward)))
+
+        admitted = 0
+        rejected_zero_variance = 0
+        for uid, rows in grouped.items():
+            if uid in golden_items:
+                continue
+            final_rows = self._final_session_keys([key for key, _ in rows])
+            reward_by_key = dict(rows)
+            final_rewards = [reward_by_key[key] for key in final_rows if key in reward_by_key]
+            prompt_tag = items.get(uid, {})
+            cutoff = bool(prompt_tag.get("completion_ratio_cutoff", False))
+            trajectory_tags = [items.get(key, {}) for key, _ in rows]
+            cutoff = cutoff or any(tag.get("completion_ratio_cutoff", False) for tag in trajectory_tags)
+            final_tag_by_key = {key: items.get(key, {}) for key in final_rows}
+            infrastructure_failures = sum(
+                int(self._infrastructure_flag(tag)) for tag in final_tag_by_key.values()
+            )
+            threshold = self.infrastructure_failure_ratio_thresholds.get("train")
+            eligible = golden_group_is_eligible(
+                final_rewards,
+                completion_ratio_cutoff=cutoff,
+                infrastructure_failure_count=infrastructure_failures,
+                expected_rollout_count=self.expected_rollout_counts.get("train") or len(final_rewards),
+                infrastructure_failure_threshold=threshold,
+            )
+            if not eligible:
+                if final_rewards and len(set(final_rewards)) == 1:
+                    rejected_zero_variance += 1
+                continue
+            # Persist exactly one final attempt per GRPO session.  Intermediate
+            # retry attempts are rollout artifacts and must not enter replay.
+            trajectory_keys = [key for key in final_rows if key in items]
+            if not trajectory_keys:
+                continue
+            fields = tq.kv_batch_get(keys=trajectory_keys, partition_id="train")
+            token_cost = sum(int(items[key].get("seq_len", 0)) for key in trajectory_keys)
+            value = self._variational_value(final_rewards, self.golden_replay_kl_radius)
+            trajectory_tags = [dict(items[key]) | {"golden_replay_source": False} for key in trajectory_keys]
+            tq.kv_batch_put(keys=trajectory_keys, partition_id=golden_partition, fields=fields, tags=trajectory_tags)
+            tq.kv_batch_put(
+                keys=[uid],
+                partition_id=golden_partition,
+                tags=[
+                    {
+                        "is_prompt": True,
+                        "status": "finished",
+                        "global_steps": global_steps,
+                        "golden_replay_value": value,
+                        "golden_replay_tokens": token_cost,
+                    }
+                ],
+            )
+            admitted += 1
+
+        self._cleanup_golden_replay()
+        return {
+            "golden_replay/admitted_groups": float(admitted),
+            "golden_replay/rejected_zero_variance_groups": float(rejected_zero_variance),
+        }
+
+    def _cleanup_golden_replay(self) -> None:
+        if not self.golden_replay_enabled:
+            return
+        partition_id = self._golden_partition_id("train")
+        listed = tq.kv_list(partition_id) or {}
+        items = listed.get(partition_id, listed)
+        groups = [
+            (uid, tag)
+            for uid, tag in items.items()
+            if tag.get("is_prompt", False) and tag.get("status") == "finished"
+        ]
+        groups.sort(key=lambda item: float(item[1].get("golden_replay_value", 0.0)), reverse=True)
+        retained: set[str] = set()
+        tokens = 0
+        for uid, tag in groups:
+            cost = max(0, int(tag.get("golden_replay_tokens", 0)))
+            if len(retained) >= self.golden_replay_max_groups or tokens + cost > self.golden_replay_max_tokens:
+                continue
+            retained.add(uid)
+            tokens += cost
+        evicted = {uid for uid, _ in groups} - retained
+        if evicted:
+            trajectory_keys = [
+                key
+                for key, tag in items.items()
+                if not tag.get("is_prompt", False) and self._uid_from_key(key) in evicted
+            ]
+            tq.kv_clear(partition_id=partition_id, keys=[*evicted, *trajectory_keys])
 
     def _validate_mode_config(self) -> None:
         if self.filter_groups_metric is not None:
@@ -527,6 +853,12 @@ class ReplayBuffer:
         if self.sync_refill_failed_groups:
             materializable_uids = {key.split("_")[0] for key in self.partitions[partition_id]}
             failed_uids |= self.failure_keys[partition_id] - materializable_uids
+        # A replayed group is deliberately terminal and must remain sampleable;
+        # it is not a fresh rollout subject to refill/cutoff eviction policies.
+        golden_uids = self._golden_prompt_uids(partition_id)
+        cutoff_uids -= golden_uids
+        dapo_uids -= golden_uids
+        failed_uids -= golden_uids
         return set(), dapo_uids, failed_uids, dapo_counts
 
     def _sampleable_terminal_keys(
@@ -624,8 +956,9 @@ class ReplayBuffer:
         if threshold is None or cutoff_requested:
             return cutoff_requested, {}
 
-        terminal_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
-        inflight_uids = self.pending_keys[partition_id] | self.running_keys[partition_id]
+        golden_uids = self._golden_prompt_uids(partition_id)
+        terminal_uids = (self.finished_keys[partition_id] | self.failure_keys[partition_id]) - golden_uids
+        inflight_uids = (self.pending_keys[partition_id] | self.running_keys[partition_id]) - golden_uids
         total_groups = len(terminal_uids) + len(inflight_uids)
         required_groups = math.ceil(total_groups * threshold)
         if total_groups < batch_size or len(terminal_uids) < required_groups or not inflight_uids:

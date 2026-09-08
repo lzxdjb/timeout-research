@@ -86,6 +86,7 @@ from verl.trainer.ppo.v1.replay_buffer import (
     DAPO_FILTERED_REWARD_COUNTS_KEY,
     ReplayBuffer,
     ReplayBufferAsync,
+    golden_replay_enabled,
     infrastructure_failure_ratio_threshold,
 )
 from verl.trainer.ppo.v1.utils import (
@@ -313,6 +314,8 @@ class PPOTrainer(ABC):
         has_custom_sampler = bool(
             custom_sampler is not None and custom_sampler.get("path") and custom_sampler.get("name")
         )
+        if golden_replay_enabled() and has_custom_sampler:
+            raise ValueError("Golden replay is supported only with the built-in V1 ReplayBuffer")
         if has_custom_sampler:
             sampler_cls = load_extern_type(custom_sampler.path, custom_sampler.name)
         else:
@@ -350,6 +353,7 @@ class PPOTrainer(ABC):
                 infrastructure_group_filter_enabled = (
                     infrastructure_failure_ratio_threshold("train") is not None
                 )
+                golden_replay_enabled_for_config = golden_replay_enabled()
                 logger.info(
                     "V1 rollout threshold config: completion(train/val)=%s/%s "
                     "infra_failure(train/val)=%s/%s rollout_n(train/val)=%d/%d "
@@ -370,6 +374,7 @@ class PPOTrainer(ABC):
                         filter_groups_metric is not None
                         or sync_refill_failed_groups
                         or infrastructure_group_filter_enabled
+                        or golden_replay_enabled_for_config
                     )
                     else (self.config.data.get("gen_batch_size", None) or train_batch_size),
                     max_inflight_gen_batches=max_inflight_gen_batches,
@@ -704,7 +709,12 @@ class PPOTrainer(ABC):
         )
         sample_batch_size = train_batch_size // self.parameter_sync_step
 
-        self._add_batch_to_generate()
+        fresh_prompts = self.replay_buffer.prepare_golden_replay(
+            global_steps=self.global_steps,
+            partition_id="train",
+            batch_size=train_batch_size,
+        )
+        self._add_batch_to_generate(num_prompts=fresh_prompts)
 
         metrics_aggregator = MetricsAggregator()
         combined_keys: list = []
@@ -762,6 +772,23 @@ class PPOTrainer(ABC):
         # 7. compute advantage and return
         with marked_timer("adv", timing_raw, color="brown"):
             batch = self._compute_advantage(batch, metrics=metrics)
+
+        if self.replay_buffer.golden_replay_enabled:
+            reward_data = tq.kv_batch_get(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                select_fields=["rm_scores"],
+            )
+            rm_scores = reward_data["rm_scores"]
+            if hasattr(rm_scores, "to_padded_tensor"):
+                rm_scores = rm_scores.to_padded_tensor()
+            metrics.update(
+                self.replay_buffer.consider_golden_replay(
+                    batch,
+                    rm_scores.to(torch.float32).sum(dim=-1).detach().cpu().tolist(),
+                    global_steps=self.global_steps,
+                )
+            )
 
         # 8. [OPTIONAL] update critic.  Filtering can leave a batch with no
         # trainable rows; avoid invoking a worker with an empty loss mask.
@@ -890,6 +917,10 @@ class PPOTrainer(ABC):
             or sync_refill_failed_groups
             or infrastructure_group_filter_enabled
         )
+        if golden_replay_enabled():
+            # Replay replaces an arbitrary number of groups; one-row generation
+            # granularity preserves the fixed actor batch size exactly.
+            requires_exact_refill = True
         if requires_exact_refill:
             user_gen_batch_size = self.config.data.get("gen_batch_size", None)
             if user_gen_batch_size not in (None, 1):
@@ -1733,9 +1764,11 @@ class PPOTrainer(ABC):
         return self._submit_batch_to_rollout(batch)
 
     @SkipManager.annotate_tq(role="rollout_tq", phase="submit")
-    def _add_batch_to_generate(self):
+    def _add_batch_to_generate(self, num_prompts: int | None = None):
         """Add one training batch to the AgentLoopManager."""
-        batch = self._next_train_batch()
+        if num_prompts == 0:
+            return
+        batch = self._next_train_batch(num_prompts)
         self._submit_batch_to_rollout(batch)
 
     def _compute_reward_colocate(self, batch: KVBatchMeta, metrics: dict | None = None) -> KVBatchMeta:
