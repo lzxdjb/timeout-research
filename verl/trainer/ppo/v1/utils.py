@@ -72,6 +72,30 @@ def v1_success_values(extra_fields: list[Any], fallback_scores: list[Any]) -> li
     return [_optional_finite_float(score) for score in fallback_scores]
 
 
+def flatten_v1_extra_fields(extra_fields: list[Any]) -> dict[str, np.ndarray]:
+    """Flatten per-trajectory V1 reward metadata for ``compute_data_metrics``.
+
+    V0 places reward metadata directly in ``DataProto.non_tensor_batch``. V1
+    stores the same values in TransferQueue ``extra_fields``; this adapter
+    restores the V0 representation without changing the queue schema.
+    """
+    rows: list[dict[str, Any]] = []
+    for extra in extra_fields:
+        extra = getattr(extra, "data", extra)
+        extra = extra if isinstance(extra, dict) else {}
+        reward_info = extra.get("reward_extra_info", {})
+        reward_info = reward_info if isinstance(reward_info, dict) else {}
+        values = dict(extra)
+        values.update(reward_info)
+        values.pop("reward_extra_info", None)
+        rows.append(values)
+    keys = set().union(*(row.keys() for row in rows)) if rows else set()
+    return {
+        key: np.asarray([row.get(key) for row in rows], dtype=object)
+        for key in keys
+    }
+
+
 def compute_v1_success_ratio_metrics(
     *,
     batch_keys: list[str],
@@ -80,6 +104,7 @@ def compute_v1_success_ratio_metrics(
     prefix: str,
     infrastructure_failure_ratio_threshold: float | None,
     expected_rollout_count: int,
+    metric_sources: list[Any] | None = None,
 ) -> dict[str, float]:
     """Compute trajectory success ratios after excluding whole V1 prompt groups.
 
@@ -96,6 +121,10 @@ def compute_v1_success_ratio_metrics(
         )
     if expected_rollout_count <= 0:
         raise ValueError(f"expected_rollout_count must be positive, got {expected_rollout_count}")
+    if metric_sources is not None and len(metric_sources) != len(batch_keys):
+        raise ValueError(
+            f"metric_sources must have length {len(batch_keys)}, got {len(metric_sources)}"
+        )
 
     final_by_session: dict[tuple[str, str], tuple[int, int]] = {}
     group_cutoff: dict[str, bool] = defaultdict(bool)
@@ -116,7 +145,7 @@ def compute_v1_success_ratio_metrics(
         if session not in final_by_session or output_index > final_by_session[session][0]:
             final_by_session[session] = (output_index, row_index)
 
-    final_rows: list[tuple[str, float | None, bool]] = []
+    final_rows: list[tuple[str, float | None, bool, Any]] = []
     failures_by_group: Counter[str] = Counter()
     for (uid, _session_id), (_output_index, row_index) in final_by_session.items():
         success = _optional_finite_float(success_values[row_index])
@@ -126,7 +155,8 @@ def compute_v1_success_ratio_metrics(
         except (TypeError, ValueError, OverflowError):
             infrastructure_failure = False
         failures_by_group[uid] += int(infrastructure_failure)
-        final_rows.append((uid, success, group_cutoff[uid]))
+        source = metric_sources[row_index] if metric_sources is not None else None
+        final_rows.append((uid, success, group_cutoff[uid], source))
 
     infrastructure_groups: set[str] = set()
     if infrastructure_failure_ratio_threshold is not None:
@@ -136,7 +166,7 @@ def compute_v1_success_ratio_metrics(
             if failure_count / expected_rollout_count > infrastructure_failure_ratio_threshold
         }
 
-    cutoff_rows = [(uid, success) for uid, success, cutoff in final_rows if not cutoff and success is not None]
+    cutoff_rows = [(uid, success) for uid, success, cutoff, _source in final_rows if not cutoff and success is not None]
     valid_rows = [
         (uid, success) for uid, success in cutoff_rows if uid not in infrastructure_groups and success is not None
     ]
@@ -151,7 +181,7 @@ def compute_v1_success_ratio_metrics(
     valid_ratio, valid_successes, valid_eligible = ratio(valid_rows)
     metric_root = f"{prefix}/success_ratio"
     cutoff_name, valid_name = _SUCCESS_RATIO_VARIANTS
-    return {
+    metrics = {
         f"{metric_root}/{cutoff_name}": cutoff_ratio,
         f"{metric_root}/{cutoff_name}_successful_count": cutoff_successes,
         f"{metric_root}/{cutoff_name}_eligible_count": cutoff_eligible,
@@ -163,6 +193,47 @@ def compute_v1_success_ratio_metrics(
         ),
         f"{metric_root}/excluded_infrastructure_group_count": float(len(infrastructure_groups)),
     }
+    if metric_sources is None:
+        return metrics
+
+    # Emit the same metrics under each benchmark/source.  This is deliberately
+    # additive: existing aggregate keys remain unchanged for dashboards that
+    # already consume them.
+    source_names = {
+        str(source) if source not in (None, "") else "unknown"
+        for _uid, _success, _cutoff, source in final_rows
+    }
+    for source in source_names:
+        source_rows = [
+            (uid, success, cutoff)
+            for uid, success, cutoff, row_source in final_rows
+            if (str(row_source) if row_source not in (None, "") else "unknown") == source
+            and success is not None
+        ]
+        source_cutoff_rows = [(uid, success) for uid, success, cutoff in source_rows if not cutoff]
+        source_valid_rows = [
+            (uid, success) for uid, success in source_cutoff_rows if uid not in infrastructure_groups
+        ]
+        source_cutoff_ratio, source_cutoff_successes, source_cutoff_eligible = ratio(source_cutoff_rows)
+        source_valid_ratio, source_valid_successes, source_valid_eligible = ratio(source_valid_rows)
+        source_root = f"{prefix}/{source}/success_ratio"
+        metrics.update(
+            {
+                f"{source_root}/{cutoff_name}": source_cutoff_ratio,
+                f"{source_root}/{cutoff_name}_successful_count": source_cutoff_successes,
+                f"{source_root}/{cutoff_name}_eligible_count": source_cutoff_eligible,
+                f"{source_root}/{valid_name}": source_valid_ratio,
+                f"{source_root}/{valid_name}_successful_count": source_valid_successes,
+                f"{source_root}/{valid_name}_eligible_count": source_valid_eligible,
+                f"{source_root}/excluded_completion_cutoff_group_count": float(
+                    len({uid for uid, _success, cutoff in source_rows if cutoff})
+                ),
+                f"{source_root}/excluded_infrastructure_group_count": float(
+                    len({uid for uid, _success in source_cutoff_rows if uid in infrastructure_groups})
+                ),
+            }
+        )
+    return metrics
 
 
 class MetricsAggregator:

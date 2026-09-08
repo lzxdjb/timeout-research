@@ -92,6 +92,7 @@ from verl.trainer.ppo.v1.utils import (
     MetricsAggregator,
     compute_advantage_for_multi_trajectories,
     compute_v1_success_ratio_metrics,
+    flatten_v1_extra_fields,
     v1_success_values,
 )
 from verl.utils import tensordict_utils as tu
@@ -1382,6 +1383,7 @@ class PPOTrainer(ABC):
                 prefix="validation",
                 infrastructure_failure_ratio_threshold=infrastructure_failure_ratio_threshold("val"),
                 expected_rollout_count=int(self.config.actor_rollout_ref.rollout.val_kwargs.n),
+                metric_sources=data_sources,
             )
         )
         return validation_metrics
@@ -1541,6 +1543,72 @@ class PPOTrainer(ABC):
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        # V0 also exposed aggregate protocol/* diagnostics.  Validation keeps
+        # the benchmark-scoped val-aux metrics above and adds these compatible
+        # aliases for consumers that compare V0 and V1 runs directly.
+        for var_name, values in reward_extra_infos_dict.items():
+            numeric_values = []
+            for value in values:
+                try:
+                    value = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if np.isfinite(value):
+                    numeric_values.append(value)
+            if numeric_values and var_name not in {"reward", "uid"}:
+                metric_dict[f"protocol/{var_name}/mean"] = float(np.mean(numeric_values))
+
+        def _numeric_array(name: str) -> np.ndarray:
+            values = reward_extra_infos_dict.get(name, [])
+            result = []
+            for value in values:
+                try:
+                    value = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    result.append(np.nan)
+                    continue
+                result.append(value if np.isfinite(value) else np.nan)
+            return np.asarray(result, dtype=float)
+
+        observed = _numeric_array("observed_infrastructure_failure")
+        if observed.size and np.isfinite(observed).any():
+            observed_mask = np.nan_to_num(observed, nan=0.0).astype(bool)
+            metric_dict["protocol/infra/observed_rate"] = float(np.mean(observed_mask))
+            metric_dict["protocol/infra/count"] = float(np.sum(observed_mask))
+            codes = _numeric_array("observed_infrastructure_failure_code")
+            if codes.size == observed.size:
+                for code, name in ((1, "queue"), (2, "transport"), (3, "timeout"), (4, "reward"), (5, "other"), (6, "oom")):
+                    metric_dict[f"protocol/infra/{name}_failure_rate"] = float(
+                        np.mean(observed_mask & (np.nan_to_num(codes, nan=-1) == code))
+                    )
+
+        outcome_codes = _numeric_array("diagnostic_outcome_code")
+        if outcome_codes.size and np.isfinite(outcome_codes).any():
+            for code, name in (
+                (0, "no_patch"),
+                (1, "invalid_patch"),
+                (2, "valid_no_verification"),
+                (3, "valid_stale_verification"),
+                (4, "fresh_verification_no_submission"),
+                (5, "fresh_verification_hidden_fail"),
+                (6, "fresh_verification_hidden_pass"),
+                (7, "fresh_verification_no_hidden_score"),
+                (8, "infrastructure_oom"),
+            ):
+                metric_dict[f"protocol/outcome/{name}"] = float(np.nanmean(outcome_codes == code))
+
+        phase_codes = _numeric_array("hidden_failure_phase_code")
+        if phase_codes.size and np.isfinite(phase_codes).any():
+            for code, name in (
+                (5, "patch_check_failed"),
+                (6, "patch_apply_failed"),
+                (3, "verifier_staging_failed"),
+                (4, "verifier_setup_failed"),
+                (7, "test_execution_failed"),
+                (8, "test_timeout"),
+            ):
+                metric_dict[f"protocol/hidden/{name}_rate"] = float(np.nanmean(phase_codes == code))
 
         if len(sample_turns) > 0:
             sample_turns = np.array(sample_turns)
@@ -2340,6 +2408,7 @@ class PPOTrainer(ABC):
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
+        rollout_batch = batch
         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
         fields = [
             "prompts",
@@ -2368,10 +2437,22 @@ class PPOTrainer(ABC):
             extra_fields = tq.kv_batch_get(
                 keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"]
             ).pop("extra_fields").tolist()
-        except (KeyError, ValueError):
+        except (KeyError, TypeError, ValueError):
             # ``extra_fields`` is optional for generic V1 rollouts. Falling back
             # to reward scores preserves the pre-existing metric path there.
             extra_fields = [{} for _ in batch.keys]
+        metric_sources = None
+        for source_field in ("metric_data_source", "data_source"):
+            try:
+                source_data = tq.kv_batch_get(
+                    keys=batch.keys, partition_id=batch.partition_id, select_fields=[source_field]
+                )
+                candidate_sources = _to_validation_metric_source_list(source_data[source_field])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if len(candidate_sources) == len(batch.keys):
+                metric_sources = candidate_sources
+                break
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
@@ -2401,6 +2482,7 @@ class PPOTrainer(ABC):
         data["prompt_length"] = prompt_length.float()
         data["response_length"] = response_length.float()
         batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
+        batch.non_tensor_batch.update(flatten_v1_extra_fields(extra_fields))
         metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
 
         # 2. compute metrics
@@ -2416,12 +2498,13 @@ class PPOTrainer(ABC):
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
         metrics.update(
             compute_v1_success_ratio_metrics(
-                batch_keys=batch.keys,
-                batch_tags=batch.tags,
+                batch_keys=rollout_batch.keys,
+                batch_tags=rollout_batch.tags,
                 success_values=success_values,
                 prefix="training",
                 infrastructure_failure_ratio_threshold=infrastructure_failure_ratio_threshold("train"),
                 expected_rollout_count=int(self.config.actor_rollout_ref.rollout.n),
+                metric_sources=metric_sources,
             )
         )
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))

@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
-from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_v1_success_ratio_metrics
+from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_v1_success_ratio_metrics, flatten_v1_extra_fields
 
 
 def test_empty_aggregator_returns_empty():
@@ -259,3 +259,46 @@ def test_v1_success_ratios_use_final_output():
 
     assert metrics["validation/success_ratio/excluding_completion_cutoff"] == 1.0
     assert metrics["validation/success_ratio/excluding_completion_cutoff_eligible_count"] == 1.0
+
+
+def test_v1_success_ratios_are_split_by_metric_source():
+    metrics = compute_v1_success_ratio_metrics(
+        batch_keys=["g1_0_0", "g2_0_0", "g3_0_0", "g4_0_0"],
+        batch_tags=[{}, {}, {"completion_ratio_cutoff": True}, {}],
+        success_values=[1, 0, 1, 1],
+        metric_sources=["benchmark_a", "benchmark_a", "benchmark_a", "benchmark_b"],
+        prefix="validation",
+        infrastructure_failure_ratio_threshold=None,
+        expected_rollout_count=1,
+    )
+
+    assert metrics["validation/success_ratio/excluding_completion_cutoff"] == pytest.approx(2 / 3)
+    assert metrics["validation/benchmark_a/success_ratio/excluding_completion_cutoff"] == 0.5
+    assert metrics["validation/benchmark_a/success_ratio/excluding_completion_cutoff_eligible_count"] == 2.0
+    assert metrics["validation/benchmark_a/success_ratio/excluded_completion_cutoff_group_count"] == 1.0
+    assert metrics["validation/benchmark_b/success_ratio/excluding_completion_cutoff"] == 1.0
+    assert metrics["validation/benchmark_b/success_ratio/excluding_completion_cutoff_eligible_count"] == 1.0
+
+
+def test_benchmark_success_ratios_are_weighted_by_their_eligible_counts():
+    metric = "training/benchmark_a/success_ratio/excluding_completion_cutoff"
+    agg = MetricsAggregator()
+    agg.add_step_metrics({metric: 1.0, f"{metric}_eligible_count": 1.0}, sample_count=8)
+    agg.add_step_metrics({metric: 0.0, f"{metric}_eligible_count": 3.0}, sample_count=8)
+
+    metrics = agg.get_aggregated_metrics()
+    assert metrics[metric] == 0.25
+    assert metrics[f"{metric}_eligible_count"] == 4.0
+
+
+def test_flatten_v1_extra_fields_restores_reward_metadata_arrays():
+    flattened = flatten_v1_extra_fields(
+        [
+            {"reward_extra_info": {"hidden_pass": 1, "verification_fresh": 0}},
+            {"reward_extra_info": {"hidden_pass": 0}, "trajectory_timeout": 1},
+        ]
+    )
+
+    assert flattened["hidden_pass"].tolist() == [1, 0]
+    assert flattened["verification_fresh"].tolist() == [0, None]
+    assert flattened["trajectory_timeout"].tolist() == [None, 1]
