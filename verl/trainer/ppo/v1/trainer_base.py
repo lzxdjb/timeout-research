@@ -60,7 +60,7 @@ from verl.trainer.ppo.metric_utils import (
     get_metric_data_with_optional_routed_experts,
     process_validation_metrics,
 )
-from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
+from verl.trainer.ppo.padding_utils import repair_v1_incomplete_rows, upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import (
     _task_filter_enabled,
     apply_kl_penalty,
@@ -250,6 +250,25 @@ def _resolve_v1_sequence_lengths(batch: KVBatchMeta) -> torch.Tensor:
         )
 
     return torch.tensor(lengths, dtype=torch.int64)
+
+
+def _v1_train_sample_mask_from_tags(keys: list[str], tags: list[dict]) -> torch.Tensor:
+    """Build the sequence-level mask for cutoff, padding, and explicitly excluded rows."""
+    cutoff_uids = {
+        str(key).rsplit("_", 2)[0]
+        for key, tag in zip(keys, tags, strict=True)
+        if isinstance(tag, dict) and bool(tag.get("completion_ratio_cutoff", False))
+    }
+    keep = []
+    for key, tag in zip(keys, tags, strict=True):
+        tag = tag if isinstance(tag, dict) else {}
+        uid = str(key).rsplit("_", 2)[0]
+        keep.append(
+            uid not in cutoff_uids
+            and not bool(tag.get("is_padding", False))
+            and bool(tag.get("train_sample_mask", True))
+        )
+    return torch.tensor(keep, dtype=torch.bool)
 
 
 def _tq_supports_checkpoint() -> bool:
@@ -780,8 +799,10 @@ class PPOTrainer(ABC):
                 select_fields=["rm_scores"],
             )
             rm_scores = reward_data["rm_scores"]
-            if hasattr(rm_scores, "to_padded_tensor"):
-                rm_scores = rm_scores.to_padded_tensor()
+            if getattr(rm_scores, "is_nested", False):
+                # Reward padding must be neutral because these scores are summed
+                # to decide whether a group is eligible for golden replay.
+                rm_scores = rm_scores.to_padded_tensor(padding=0.0)
             metrics.update(
                 self.replay_buffer.consider_golden_replay(
                     batch,
@@ -1887,6 +1908,13 @@ class PPOTrainer(ABC):
         min_padding_seq_len = (
             tensor_parallel_size * context_parallel_size if context_parallel_size > 1 else 2
         )
+        batch, repaired_rows = repair_v1_incomplete_rows(
+            batch,
+            self.tokenizer.eos_token_id,
+            min_seq_len=min_padding_seq_len,
+        )
+        if repaired_rows:
+            metrics["training/incomplete_queue_rows_replaced"] = float(repaired_rows)
         batch = upsample_batch_to_divisible_size(
             batch,
             batch_multiple,
@@ -2118,7 +2146,9 @@ class PPOTrainer(ABC):
         timeout_mask = data.batch.get("train_sample_mask")
         task_filter_metrics = apply_training_task_filter(data, per_sample_infrastructure_filter=per_sample)
         if timeout_mask is not None:
-            data.batch["train_sample_mask"] = data.batch["train_sample_mask"] & timeout_mask
+            data.batch["train_sample_mask"] = (
+                data.batch["train_sample_mask"].to(timeout_mask.device) & timeout_mask
+            )
         data.meta_info["task_filter_all_excluded"] = not data.batch["train_sample_mask"].any().item()
         metrics.update(task_filter_metrics)
 
@@ -2160,6 +2190,16 @@ class PPOTrainer(ABC):
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
 
+        # Completion-ratio cancellation is a training exclusion independent of
+        # timeout prediction. Keep it sequence-level so every trajectory in a
+        # cancelled group is removed from actor and critic gradients.
+        base_train_sample_mask = _v1_train_sample_mask_from_tags(batch.keys, batch.tags)
+        has_base_exclusions = not bool(base_train_sample_mask.all().item())
+        if has_base_exclusions:
+            data.batch["train_sample_mask"] = base_train_sample_mask.to(
+                device=data.batch["response_mask"].device
+            )
+
         if self.timeout_prediction_enabled:
             reward_tensor, train_sample_mask, prediction_targets = self._apply_v1_timeout_prediction(
                 data,
@@ -2168,7 +2208,8 @@ class PPOTrainer(ABC):
                 direct_fields,
             )
             data.batch["token_level_scores"] = reward_tensor
-            data.batch["train_sample_mask"] = train_sample_mask
+            base_mask = base_train_sample_mask.to(device=train_sample_mask.device)
+            data.batch["train_sample_mask"] = train_sample_mask & base_mask
             data.batch["rm_scores"] = reward_tensor
             self._update_v1_timeout_predictor(data, prediction_targets)
 
@@ -2219,7 +2260,7 @@ class PPOTrainer(ABC):
         output = {}
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
-        if self.timeout_prediction_enabled or _task_filter_enabled():
+        if self.timeout_prediction_enabled or _task_filter_enabled() or "train_sample_mask" in data.batch:
             output["rm_scores"] = response_to_nested(data.batch["rm_scores"], response_mask)
             output["train_sample_mask"] = data.batch["train_sample_mask"]
         output = TensorDict(output, batch_size=len(batch))

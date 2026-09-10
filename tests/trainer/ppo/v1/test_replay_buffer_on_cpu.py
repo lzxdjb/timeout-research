@@ -347,6 +347,127 @@ def test_sync_completion_ratio_cancels_tail_and_returns_complete_groups(
         _clear_partition(partition_id)
 
 
+def test_golden_replay_groups_count_toward_training_completion_ratio(tq_init, monkeypatch) -> None:
+    partition_id = "train"
+    _clear_partition(partition_id)
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", "0.5")
+    golden = [PromptSpec(uid=_uid(), status="finished", sessions=2) for _ in range(4)]
+    fresh = PromptSpec(uid=_uid(), status="finished", sessions=2)
+    _produce(partition_id, [*golden, fresh]).join_and_check()
+    for spec in golden:
+        tq.kv_put(
+            key=spec.uid,
+            partition_id=partition_id,
+            tag={
+                "is_prompt": True,
+                "status": "finished",
+                "global_steps": 0,
+                "golden_replay_source": True,
+            },
+        )
+    running_uids = [_uid() for _ in range(5)]
+    for uid in running_uids:
+        tq.kv_put(
+            key=uid,
+            partition_id=partition_id,
+            tag={"is_prompt": True, "status": "running", "global_steps": 0},
+        )
+    cancelled: list[list[str]] = []
+
+    def cancel_fn(uids: list[str], validate: bool = False) -> int:
+        assert not validate
+        cancelled.append(uids)
+        for uid in uids:
+            tq.kv_put(
+                key=uid,
+                partition_id=partition_id,
+                tag={
+                    "is_prompt": True,
+                    "status": "failure",
+                    "global_steps": 0,
+                    "completion_ratio_cutoff": True,
+                },
+            )
+        return len(uids)
+
+    rb = _make_rb(train_batch_size=10, cancel_fn=cancel_fn)
+    rb.golden_replay_enabled = True
+    try:
+        batch, metrics = rb.sample(global_steps=0, partition_id=partition_id, batch_size=10)
+
+        assert cancelled == [sorted(running_uids)]
+        assert _uids_of(batch.keys) == {spec.uid for spec in golden} | {fresh.uid}
+        assert metrics["training/completion_ratio/required_groups"] == 5.0
+        assert metrics["training/completion_ratio/replayed_groups"] == 4.0
+        assert metrics["training/completion_ratio/fresh_terminal_groups"] == 1.0
+        assert metrics["training/completion_ratio/terminal_groups"] == 5.0
+        assert metrics["training/completion_ratio/total_groups"] == 10.0
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_golden_replay_completion_ratio_requires_one_fresh_group(tq_init, monkeypatch) -> None:
+    partition_id = "train"
+    _clear_partition(partition_id)
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", "0.5")
+    golden = [PromptSpec(uid=_uid(), status="finished", sessions=2) for _ in range(5)]
+    _produce(partition_id, golden).join_and_check()
+    for spec in golden:
+        tq.kv_put(
+            key=spec.uid,
+            partition_id=partition_id,
+            tag={
+                "is_prompt": True,
+                "status": "finished",
+                "global_steps": 0,
+                "golden_replay_source": True,
+            },
+        )
+    running_uids = [_uid() for _ in range(5)]
+    for uid in running_uids:
+        tq.kv_put(
+            key=uid,
+            partition_id=partition_id,
+            tag={"is_prompt": True, "status": "running", "global_steps": 0},
+        )
+    cancelled: list[list[str]] = []
+
+    def cancel_fn(uids: list[str], validate: bool = False) -> int:
+        cancelled.append(uids)
+        return len(uids)
+
+    rb = _make_rb(train_batch_size=10, cancel_fn=cancel_fn)
+    rb.golden_replay_enabled = True
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        cutoff_requested, metrics = rb._maybe_apply_completion_ratio_cutoff(
+            partition_id, batch_size=10, cutoff_requested=False
+        )
+        assert not cutoff_requested
+        assert not metrics
+        assert not cancelled
+
+        fresh_uid = running_uids.pop()
+        tq.kv_put(
+            key=_trajectory_key(fresh_uid),
+            partition_id=partition_id,
+            fields={"input_ids": torch.tensor([1, 2, 3])},
+            tag={"is_prompt": False, "seq_len": 3, "global_steps": 0},
+        )
+        _set_prompt_status(partition_id, fresh_uid, "finished", global_steps=0)
+        rb._sync_metadata_from_transfer_queue()
+        cutoff_requested, metrics = rb._maybe_apply_completion_ratio_cutoff(
+            partition_id, batch_size=10, cutoff_requested=False
+        )
+
+        assert cutoff_requested
+        assert cancelled == [sorted(running_uids)]
+        assert metrics["training/completion_ratio/replayed_groups"] == 5.0
+        assert metrics["training/completion_ratio/fresh_terminal_groups"] == 1.0
+    finally:
+        _clear_partition(partition_id)
+
+
 def test_completion_ratio_keeps_cutoff_groups_with_materialized_sessions() -> None:
     rb = _make_rb()
     complete_uid = _uid()

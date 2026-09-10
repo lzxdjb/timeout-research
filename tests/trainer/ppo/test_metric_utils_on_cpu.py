@@ -456,6 +456,9 @@ class TestComputeDataMetrics(unittest.TestCase):
             "noninfra_raw_score": np.array([None, 1.0], dtype=object),
             "noninfra_shaped_score": np.array([None, 1.0], dtype=object),
             "verification_attempt_count": np.array([2, 0]),
+            "verification_loop_aux_reward_applied": np.array([1, 0]),
+            "verification_loop_aux_reward": np.array([0.01, 0.0]),
+            "verification_diversity_aux_reward_applied": np.array([0, 1]),
             "diagnostic_outcome_code": np.array([1, 6]),
             "hidden_failure_phase_code": np.array([8, 0]),
         }
@@ -467,6 +470,9 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertEqual(metrics["protocol/infra_raw_score/mean"], 0.0)
         self.assertEqual(metrics["protocol/noninfra_shaped_score/mean"], 1.0)
         self.assertEqual(metrics["protocol/infra_rate_verification_2plus"], 1.0)
+        self.assertEqual(metrics["protocol/verification_loop_aux_reward_applied/mean"], 0.5)
+        self.assertAlmostEqual(metrics["protocol/verification_loop_aux_reward/mean"], 0.005)
+        self.assertEqual(metrics["protocol/verification_diversity_aux_reward_applied/mean"], 0.5)
         self.assertEqual(metrics["protocol/outcome/invalid_patch"], 0.5)
         self.assertEqual(metrics["protocol/hidden/test_timeout_rate"], 0.5)
 

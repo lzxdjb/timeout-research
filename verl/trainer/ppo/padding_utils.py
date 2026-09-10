@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import uuid
 from typing import Any
 
@@ -38,6 +39,153 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
+
+
+def _single_input_ids_length(input_ids: Any) -> int | None:
+    """Return the length of one persisted input-id sequence when available."""
+    if not isinstance(input_ids, torch.Tensor):
+        try:
+            length = len(input_ids)
+            if length == 1 and isinstance(input_ids[0], (list, tuple, torch.Tensor)):
+                length = len(input_ids[0])
+        except (TypeError, AttributeError):
+            return None
+    elif input_ids.is_nested:
+        offsets = input_ids.offsets()
+        if offsets.numel() != 2:
+            return None
+        length = int((offsets[1] - offsets[0]).item())
+    elif input_ids.ndim == 1:
+        length = input_ids.numel()
+    elif input_ids.ndim >= 2 and input_ids.shape[0] == 1:
+        length = input_ids.shape[-1]
+    else:
+        return None
+    return int(length) if int(length) > 0 else None
+
+
+def _tag_seq_len(tag: Any) -> int | None:
+    """Normalize the positive sequence length stored in a queue tag."""
+    if not isinstance(tag, dict):
+        return None
+    value = tag.get("seq_len")
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or not numeric.is_integer() or numeric <= 0:
+        return None
+    return int(numeric)
+
+
+def repair_v1_incomplete_rows(
+    batch: KVBatchMeta,
+    eos_token_id: int,
+    min_seq_len: int = 2,
+) -> tuple[KVBatchMeta, int]:
+    """Repair V1 rows whose queue publication was interrupted.
+
+    A cancelled agent loop can leave a user key registered in TransferQueue
+    without its ``input_ids`` field. Ready rows with a missing tag are repaired
+    from ``input_ids``; rows whose fields are unavailable are replaced by
+    explicit masked padding rows so balancing and downstream workers retain a
+    valid, divisible batch.
+    """
+    missing_tag_indices = [
+        index for index, tag in enumerate(batch.tags) if _tag_seq_len(tag) is None
+    ]
+    if not missing_tag_indices:
+        return batch, 0
+
+    unresolved_indices: list[int] = []
+    for index in missing_tag_indices:
+        key = batch.keys[index]
+        try:
+            data = tq.kv_batch_get(keys=[key], partition_id=batch.partition_id, select_fields=["input_ids"])
+            length = _single_input_ids_length(data["input_ids"])
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            length = None
+        if length is None:
+            unresolved_indices.append(index)
+        else:
+            if not isinstance(batch.tags[index], dict):
+                batch.tags[index] = {}
+            batch.tags[index]["seq_len"] = length
+
+    if not unresolved_indices:
+        logger.warning(
+            "Recovered missing V1 seq_len metadata from input_ids for %d row(s); sample keys: %s",
+            len(missing_tag_indices),
+            [batch.keys[index] for index in missing_tag_indices[:5]],
+        )
+        return batch, 0
+
+    # Find a fully materialized row to preserve optional field shapes and
+    # metadata when constructing replacement records.
+    source_td = None
+    source_tag = None
+    for index, tag in enumerate(batch.tags):
+        if index in unresolved_indices:
+            continue
+        try:
+            candidate = tq.kv_batch_get(keys=[batch.keys[index]], partition_id=batch.partition_id)[0]
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            continue
+        source_td = candidate
+        source_tag = tag if isinstance(tag, dict) else {}
+        break
+    if source_td is None or source_tag is None:
+        raise RuntimeError(
+            "V1 batch contains incomplete rows but no fully materialized row is available "
+            "to construct masked padding replacements"
+        )
+
+    invalid_keys = [batch.keys[index] for index in unresolved_indices]
+    tq.kv_clear(keys=invalid_keys, partition_id=batch.partition_id)
+
+    template_sample, template_tag = construct_minimal_padding_template(
+        source_td,
+        source_tag,
+        eos_token_id,
+        min_seq_len=min_seq_len,
+    )
+    pad_uid = f"pad{uuid.uuid4().hex}"
+    template_sample["uid"] = pad_uid
+    template_tag.update(is_padding=True, train_sample_mask=False, fill_reason="incomplete_queue_row")
+
+    pad_keys: list[str] = []
+    pad_tags: list[dict] = []
+    pad_fields: list[dict] = []
+    for local_idx in range(len(unresolved_indices)):
+        sample = copy.deepcopy(template_sample)
+        pad_keys.append(f"{pad_uid}_{local_idx}_0")
+        if "session_id" in sample:
+            sample["session_id"] = local_idx
+        pad_fields.append(sample)
+        pad_tags.append(copy.deepcopy(template_tag))
+
+    tq.kv_batch_put(
+        keys=pad_keys,
+        partition_id=batch.partition_id,
+        fields=list_of_dict_to_tensordict(pad_fields),
+        tags=pad_tags,
+    )
+    kept_indices = [index for index in range(len(batch)) if index not in unresolved_indices]
+    repaired = KVBatchMeta(
+        keys=[batch.keys[index] for index in kept_indices] + pad_keys,
+        tags=[batch.tags[index] for index in kept_indices] + pad_tags,
+        partition_id=batch.partition_id,
+        fields=batch.fields,
+        extra_info=batch.extra_info,
+    )
+    logger.warning(
+        "Replaced %d incomplete V1 queue row(s) with masked padding; sample keys: %s",
+        len(invalid_keys),
+        invalid_keys[:5],
+    )
+    return repaired, len(invalid_keys)
 
 
 def build_padding_position_ids(source_position_ids: Any, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -128,7 +276,13 @@ def construct_minimal_padding_template(
         template_sample.pop("routed_experts", None)
 
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
-    template_tag.update(is_padding=True, prompt_len=prompt_len, response_len=1, seq_len=min_seq_len)
+    template_tag.update(
+        is_padding=True,
+        train_sample_mask=False,
+        prompt_len=prompt_len,
+        response_len=1,
+        seq_len=min_seq_len,
+    )
     return template_sample, template_tag
 
 

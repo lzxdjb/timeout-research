@@ -24,6 +24,7 @@ from verl.trainer.ppo.v1.trainer_base import (
     PPOTrainer,
     _get_off_policy_step_arrays,
     _resolve_v1_sequence_lengths,
+    _v1_train_sample_mask_from_tags,
 )
 
 
@@ -104,6 +105,18 @@ def test_v1_sequence_lengths_raise_contextual_error_when_recovery_fails():
         pytest.raises(RuntimeError, match=r"could not recover.*row_0"),
     ):
         _resolve_v1_sequence_lengths(batch)
+
+
+def test_v1_cutoff_mask_excludes_entire_uid_group_and_padding() -> None:
+    keys = ["group-a_0_0", "group-a_1_0", "group-b_0_0", "pad123_0_0"]
+    tags = [
+        {"completion_ratio_cutoff": True},
+        {},
+        {},
+        {"is_padding": True},
+    ]
+
+    assert _v1_train_sample_mask_from_tags(keys, tags).tolist() == [False, False, True, False]
 
 
 def test_off_policy_steps_sync_fall_back_to_sample_step():

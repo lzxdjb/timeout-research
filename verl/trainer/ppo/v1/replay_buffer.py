@@ -957,33 +957,78 @@ class ReplayBuffer:
             return cutoff_requested, {}
 
         golden_uids = self._golden_prompt_uids(partition_id)
-        terminal_uids = (self.finished_keys[partition_id] | self.failure_keys[partition_id]) - golden_uids
+        all_terminal_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
         inflight_uids = (self.pending_keys[partition_id] | self.running_keys[partition_id]) - golden_uids
-        total_groups = len(terminal_uids) + len(inflight_uids)
-        required_groups = math.ceil(total_groups * threshold)
-        if total_groups < batch_size or len(terminal_uids) < required_groups or not inflight_uids:
+        golden_training_cutoff = self.golden_replay_enabled and partition_id == "train"
+        if golden_training_cutoff:
+            # Replayed groups already provide complete, usable trajectories for
+            # this step, so count them toward the fixed batch-level target. Keep
+            # one fresh completed group per step to avoid a replay-only loop.
+            terminal_uids = all_terminal_uids
+            fresh_terminal_uids = terminal_uids - golden_uids
+            total_groups = len(terminal_uids) + len(inflight_uids)
+            required_groups = math.ceil(batch_size * threshold)
+            has_required_fresh_group = bool(fresh_terminal_uids)
+        else:
+            # Preserve the original completion-ratio behavior when golden replay
+            # is disabled and for validation, where replay is not supported.
+            terminal_uids = all_terminal_uids - golden_uids
+            fresh_terminal_uids = terminal_uids
+            total_groups = len(terminal_uids) + len(inflight_uids)
+            required_groups = math.ceil(total_groups * threshold)
+            has_required_fresh_group = True
+        if (
+            total_groups < batch_size
+            or len(terminal_uids) < required_groups
+            or not has_required_fresh_group
+            or not inflight_uids
+        ):
             return False, {}
         if self.cancel_fn is None:
             raise RuntimeError("Completion-ratio rollout cutoff requires an agent-loop cancellation callback")
 
         cancelled = int(self.cancel_fn(sorted(inflight_uids), validate=partition_id == "val"))
         prefix = self._metrics_prefix(partition_id)
-        logger.info(
-            "Applied %s completion-ratio cutoff: terminal=%s total=%s threshold=%s requested=%s cancelled=%s",
-            partition_id,
-            len(terminal_uids),
-            total_groups,
-            threshold,
-            len(inflight_uids),
-            cancelled,
-        )
-        return True, {
+        if golden_training_cutoff:
+            logger.info(
+                "Applied %s completion-ratio cutoff: terminal=%s total=%s threshold=%s "
+                "required=%s replayed=%s fresh_terminal=%s requested=%s cancelled=%s",
+                partition_id,
+                len(terminal_uids),
+                total_groups,
+                threshold,
+                required_groups,
+                len(golden_uids),
+                len(fresh_terminal_uids),
+                len(inflight_uids),
+                cancelled,
+            )
+        else:
+            logger.info(
+                "Applied %s completion-ratio cutoff: terminal=%s total=%s threshold=%s requested=%s cancelled=%s",
+                partition_id,
+                len(terminal_uids),
+                total_groups,
+                threshold,
+                len(inflight_uids),
+                cancelled,
+            )
+        metrics = {
             f"{prefix}/completion_ratio/threshold": threshold,
             f"{prefix}/completion_ratio/terminal_groups": float(len(terminal_uids)),
             f"{prefix}/completion_ratio/total_groups": float(total_groups),
             f"{prefix}/completion_ratio/cutoff_groups": float(len(inflight_uids)),
             f"{prefix}/completion_ratio/cancelled_groups": float(cancelled),
         }
+        if golden_training_cutoff:
+            metrics.update(
+                {
+                    f"{prefix}/completion_ratio/required_groups": float(required_groups),
+                    f"{prefix}/completion_ratio/replayed_groups": float(len(golden_uids)),
+                    f"{prefix}/completion_ratio/fresh_terminal_groups": float(len(fresh_terminal_uids)),
+                }
+            )
+        return True, metrics
 
     @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
     def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:

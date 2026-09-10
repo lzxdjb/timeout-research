@@ -79,6 +79,30 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         if self.prompt_tasks[partition_id].get(uid) is task:
             del self.prompt_tasks[partition_id][uid]
 
+    def _ready_trajectory_keys(self, partition_id: str, keys: list[str]) -> list[str]:
+        """Return published trajectory keys whose token fields are materialized.
+
+        TransferQueue can expose a key/tag before an async field publication
+        finishes. Cancellation must not mark such metadata-only keys as valid
+        partial trajectories because the trainer cannot consume them.
+        """
+        ready, unready = [], []
+        for key in keys:
+            try:
+                tq.kv_batch_get(keys=[key], partition_id=partition_id, select_fields=["input_ids"])
+            except (KeyError, TypeError, ValueError, RuntimeError):
+                unready.append(key)
+            else:
+                ready.append(key)
+        if unready:
+            tq.kv_clear(keys=unready, partition_id=partition_id)
+            logger.warning(
+                "Removed %d incomplete trajectory publication(s) after cancellation; sample keys: %s",
+                len(unready),
+                unready[:5],
+            )
+        return ready
+
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
         validate = batch["validate"] if "validate" in batch else False
@@ -157,6 +181,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             if tag.get("status") not in {"pending", "running"}:
                 continue
             trajectory_keys = [key for key in items if key.startswith(f"{uid}_")]
+            trajectory_keys = self._ready_trajectory_keys(partition_id, trajectory_keys)
             if trajectory_keys:
                 trajectory_tags = []
                 for key in trajectory_keys:
@@ -220,6 +245,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
             items = (tq.kv_list(partition_id) or {}).get(partition_id, {})
             trajectory_keys = [key for key in items if key.startswith(f"{uid}_")]
+            trajectory_keys = self._ready_trajectory_keys(partition_id, trajectory_keys)
             if trajectory_keys:
                 trajectory_tags = []
                 for key in trajectory_keys:
