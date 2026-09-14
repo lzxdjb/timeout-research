@@ -1263,7 +1263,14 @@ class PPOTrainer(ABC):
             if self.reward_loop_manager.reward_loop_worker_handles is None:
                 self.checkpoint_manager.sleep_replicas()
                 batch = self._compute_reward_colocate(batch)
-                self.checkpoint_manager.update_weights()
+                if not self.config.trainer.get("val_only", False):
+                    self.checkpoint_manager.update_weights()
+                else:
+                    # ``sleep_replicas`` releases the inference weights before
+                    # the colocated reward computation.  Validation-only runs
+                    # do not need to export actor weights again, so explicitly
+                    # restore the synchronized rollout weights for the next batch.
+                    self.checkpoint_manager.wake_up_replicas()
 
             if self.timeout_prediction_enabled:
                 # Validation normally skips policy inference.  Compute the same

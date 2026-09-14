@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -265,7 +266,34 @@ class vLLMHttpServer:
 
             set_expandable_segments(True)
 
-        quantization, hf_overrides = self._apply_quantization()
+        quantization, quant_hf_overrides = self._apply_quantization()
+
+        # Some checkpoints produced by the Omni/ASR training path retain the
+        # ``Qwen3_5OmniMoeForConditionalGeneration`` architecture marker even
+        # when they contain the ordinary Qwen3.5 MoE vision/text backbone.
+        # vLLM currently dispatches by the exact architecture name and does
+        # not register the Omni variant.  For text/vision rollout (the only
+        # path served here), use the compatible conditional-generation class
+        # without modifying the checkpoint on disk.  Keep any user-provided
+        # hf_overrides and quantization overrides intact.
+        user_hf_overrides = engine_kwargs.pop("hf_overrides", {}) or {}
+        if not isinstance(user_hf_overrides, Mapping):
+            raise TypeError("rollout.engine_kwargs.vllm.hf_overrides must be a mapping")
+        hf_overrides = dict(user_hf_overrides)
+        hf_overrides.update(quant_hf_overrides)
+        architectures = getattr(self.model_config.hf_config, "architectures", None) or []
+        overridden_architectures = hf_overrides.get("architectures")
+        if (
+            isinstance(architectures, (list, tuple))
+            and "Qwen3_5OmniMoeForConditionalGeneration" in architectures
+            and overridden_architectures is None
+        ):
+            hf_overrides["architectures"] = ["Qwen3_5MoeForConditionalGeneration"]
+            logger.warning(
+                "Checkpoint declares unsupported Omni architecture %s; serving its "
+                "vision/text backbone as Qwen3_5MoeForConditionalGeneration in vLLM.",
+                architectures,
+            )
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):

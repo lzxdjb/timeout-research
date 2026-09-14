@@ -444,6 +444,26 @@ def apply_patch():
 
 
 def apply_patch_mbridge():
+    """Apply compatibility fixes for the legacy mbridge backend.
+
+    Qwen3.5 checkpoints exist in two equivalent Hugging Face layouts.  Recent
+    checkpoints store MoE experts in fused tensors (``gate_up_proj``), while
+    checkpoints produced by the ASR merge pipeline store one ``gate_proj`` /
+    ``up_proj`` / ``down_proj`` tensor per expert.  mbridge 0.15 only maps the
+    former layout, and silently leaves every expert randomly initialized when
+    given the latter.  That is especially dangerous because the model still
+    builds and inference produces plausible-looking, but collapsed, output.
+
+    Keep the upstream behavior for fused checkpoints and adapt only the
+    per-expert layout by overriding the name mapping for the duration of
+    ``load_weights``.  This patch is intentionally local to the deprecated
+    vanilla-mbridge path; Megatron-Bridge and unrelated models are untouched.
+    """
+    import json
+    import os
+    import types
+    import warnings
+
     try:
         from megatron.core.utils import get_tensor_model_parallel_group_if_none
     except ImportError:
@@ -471,6 +491,90 @@ def apply_patch_mbridge():
             return tp_group
 
         megatron.core.utils.get_tensor_model_parallel_group_if_none = get_tensor_model_parallel_group_if_none
+
+    # mbridge's Qwen3.5 mapping targets fused expert keys.  Detect the
+    # unpacked layout from the safetensors index (a tiny JSON read; no tensor
+    # data is loaded) and provide the equivalent per-expert names.
+    try:
+        from mbridge.core.bridge import Bridge
+    except ImportError:
+        return
+
+    if getattr(Bridge, "_verl_unpacked_qwen35_patch", False):
+        return
+
+    original_load_weights = Bridge.load_weights
+
+    def _checkpoint_has_unpacked_qwen35_experts(bridge, weights_path: str) -> bool:
+        try:
+            resolved = bridge._get_actual_hf_path(weights_path)
+            index_path = os.path.join(resolved, "model.safetensors.index.json")
+            if not os.path.exists(index_path):
+                return False
+            with open(index_path, "r") as stream:
+                weight_map = json.load(stream).get("weight_map", {})
+            return any(
+                key.startswith("model.language_model.layers.")
+                and ".mlp.experts.0.gate_proj.weight" in key
+                for key in weight_map
+            )
+        except (OSError, TypeError, ValueError):
+            # Preserve mbridge's normal path for remote/unusual checkpoints.
+            return False
+
+    def _load_weights_with_unpacked_qwen35_support(self, models, weights_path, memory_efficient=False):
+        if not _checkpoint_has_unpacked_qwen35_experts(self, weights_path):
+            return original_load_weights(self, models, weights_path, memory_efficient=memory_efficient)
+
+        if not getattr(self, "_verl_warned_unpacked_qwen35", False):
+            warnings.warn(
+                "Detected unpacked Qwen3.5 MoE expert weights; mapping per-expert "
+                "gate/up/down projections instead of fused gate_up_proj tensors.",
+                stacklevel=2,
+            )
+            self._verl_warned_unpacked_qwen35 = True
+
+        original_mapping = getattr(self, "_weight_name_mapping_mlp", None)
+        original_weight_to_mcore = getattr(self, "_weight_to_mcore_format", None)
+        if original_mapping is None or original_weight_to_mcore is None:
+            return original_load_weights(self, models, weights_path, memory_efficient=memory_efficient)
+
+        def mapping_with_unpacked_experts(bridge, name):
+            if "language_model.decoder.layers." in name and ".mlp.experts.linear_fc" in name:
+                parts = name.split(".")
+                # ... layers.<layer>.mlp.experts.linear_fc{1,2}.weight<expert>
+                layer_number = parts[3]
+                projection, expert = name.rsplit(".weight", 1)
+                expert_index = int(expert)
+                prefix = f"model.language_model.layers.{layer_number}.mlp.experts.{expert_index}"
+                if projection.endswith("linear_fc1"):
+                    return [f"{prefix}.gate_proj.weight", f"{prefix}.up_proj.weight"]
+                if projection.endswith("linear_fc2"):
+                    return [f"{prefix}.down_proj.weight"]
+            return original_mapping(name)
+
+        def weight_to_mcore_with_unpacked_experts(bridge, name, hf_weights):
+            # The upstream Qwen3.5 converter assumes a single HF expert tensor
+            # is fused as [num_experts, ...] and indexes it by expert id.  In
+            # the unpacked layout each HF tensor is already one expert, so that
+            # indexing would incorrectly drop the first dimension (e.g.
+            # [2048, 512] -> [512]).
+            if ".mlp.experts.linear_fc2.weight" in name and len(hf_weights) == 1:
+                return hf_weights[0]
+            return original_weight_to_mcore(name, hf_weights)
+
+        # Bind to the instance so the upstream loader can call it normally;
+        # restore it even if loading raises.
+        self._weight_name_mapping_mlp = types.MethodType(mapping_with_unpacked_experts, self)
+        self._weight_to_mcore_format = types.MethodType(weight_to_mcore_with_unpacked_experts, self)
+        try:
+            return original_load_weights(self, models, weights_path, memory_efficient=memory_efficient)
+        finally:
+            self._weight_name_mapping_mlp = original_mapping
+            self._weight_to_mcore_format = original_weight_to_mcore
+
+    Bridge.load_weights = _load_weights_with_unpacked_qwen35_support
+    Bridge._verl_unpacked_qwen35_patch = True
 
 
 def apply_patch_megatron_v012_with_torch_v28_v29() -> None:
