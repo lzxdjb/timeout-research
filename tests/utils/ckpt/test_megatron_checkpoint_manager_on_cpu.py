@@ -20,6 +20,7 @@ save_checkpoint / load_checkpoint dispatch, and edge cases.
 Uses real megatron.core with gloo backend on a single CPU process.
 """
 
+import json
 import os
 import shutil
 import tempfile
@@ -29,6 +30,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state as mpu
+from safetensors.torch import load_file, save_file
 
 from verl.trainer.config import CheckpointConfig
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
@@ -655,3 +657,45 @@ class TestModelShardedStateDictNotBuiltUnnecessarily:
 
         mgr.load_checkpoint(ckpt_path)
         mgr.model[0].sharded_state_dict.assert_called_once()
+
+
+class TestOmniAudioPreservation:
+    @pytest.fixture(autouse=True)
+    def _tmpdir(self, tmp_path):
+        self.source = tmp_path / "source"
+        self.destination = tmp_path / "destination"
+        self.source.mkdir()
+        self.destination.mkdir()
+
+    def _manager_for_source(self, omni=True):
+        mgr = _make_manager(save_contents=["model"])
+        mgr.model_path = str(self.source)
+        mgr.hf_config.verl_omni_audio = omni
+        mgr.hf_config.audio_config = {} if omni else None
+        return mgr
+
+    def test_audio_tensors_are_restored_without_overwriting_trained_weights(self):
+        audio = {
+            "model.audio_tower.proj.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+            "model.audio_tower.proj.bias": torch.ones(2),
+        }
+        trained_key = "model.language_model.embed.weight"
+        source_file = self.source / "model-00001-of-00001.safetensors"
+        save_file({**audio, trained_key: torch.zeros(3)}, str(source_file))
+        (self.source / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: source_file.name for key in [*audio, trained_key]}})
+        )
+        save_file({trained_key: torch.full((3,), 7.0)}, str(self.destination / "model.safetensors"))
+
+        self._manager_for_source()._preserve_omni_audio_weights(str(self.destination))
+
+        restored = load_file(str(self.destination / "audio_tower.safetensors"))
+        assert set(restored) == set(audio)
+        assert torch.equal(load_file(str(self.destination / "model.safetensors"))[trained_key], torch.full((3,), 7.0))
+        index = json.loads((self.destination / "model.safetensors.index.json").read_text())
+        assert all(index["weight_map"][key] == "audio_tower.safetensors" for key in audio)
+
+    def test_non_omni_checkpoint_is_a_noop(self):
+        save_file({"model.audio_tower.x": torch.ones(1)}, str(self.source / "model.safetensors"))
+        self._manager_for_source(omni=False)._preserve_omni_audio_weights(str(self.destination))
+        assert not (self.destination / "audio_tower.safetensors").exists()

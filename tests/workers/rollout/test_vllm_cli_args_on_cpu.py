@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 from verl.workers.rollout.vllm_rollout.utils import (
     _resolve_vllm_weight_sync_local_rank,
     build_cli_args_from_config,
@@ -132,6 +133,24 @@ class TestBuildCliArgsFromConfig:
         config = {"sizes": [42]}
         result = build_cli_args_from_config(config)
         assert result == ["--sizes", "42"]
+
+    def test_allowed_local_media_path(self):
+        config = {"allowed_local_media_path": "/mnt/datasets"}
+        assert build_cli_args_from_config(config) == ["--allowed_local_media_path", "/mnt/datasets"]
+
+
+class TestVllmEngineKwargsPreprocessing:
+    def test_normalizes_allowed_local_media_path(self, tmp_path):
+        server = object.__new__(vLLMHttpServer)
+        engine_kwargs = {"allowed_local_media_path": str(tmp_path / ".." / tmp_path.name)}
+        server._preprocess_engine_kwargs(engine_kwargs)
+        assert engine_kwargs["allowed_local_media_path"] == str(tmp_path.resolve())
+
+    def test_rejects_missing_allowed_local_media_path(self, tmp_path):
+        server = object.__new__(vLLMHttpServer)
+        engine_kwargs = {"allowed_local_media_path": str(tmp_path / "missing")}
+        with pytest.raises(ValueError, match="must be an existing directory"):
+            server._preprocess_engine_kwargs(engine_kwargs)
 
 
 class TestVllmColocateZmqHandle:

@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
 from pprint import pprint
 from typing import Any, Optional
 
@@ -49,6 +50,7 @@ from verl.single_controller.ray import (
 )
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.audio_benchmark import run_audio_benchmarks
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     RolloutMoELoadBalanceMetricsAccumulator,
@@ -1445,7 +1447,40 @@ class PPOTrainer(ABC):
                 metric_sources=data_sources,
             )
         )
+        validation_metrics.update(self._run_optional_audio_validation())
         return validation_metrics
+
+    def _run_optional_audio_validation(self) -> dict[str, float]:
+        """Run the opt-in GAGE suite against the live rollout endpoint."""
+        audio_config = self.config.trainer.get("audio_benchmark", None)
+        if not audio_config or not bool(audio_config.get("enabled", False)):
+            return {}
+        try:
+            model_config = self.config.actor_rollout_ref.model
+            model_path = str(
+                model_config.get("local_path")
+                or model_config.get("path")
+                or os.environ.get("MODEL_PATH", "")
+            )
+            output_dir = audio_config.get("output_dir")
+            if not output_dir:
+                base = self.config.trainer.get("validation_data_dir") or "."
+                output_dir = str(Path(base) / "audio_benchmark")
+            resolved = dict(audio_config)
+            resolved["output_dir"] = output_dir
+            return run_audio_benchmarks(
+                resolved,
+                server_addresses=list(self.llm_server_manager.get_addresses()),
+                model_path=model_path,
+                experiment_name=str(self.config.trainer.experiment_name),
+                global_step=int(self.global_steps),
+            )
+        except Exception as exc:  # noqa: BLE001
+            policy = str(audio_config.get("failure_policy", "warn")).lower()
+            logger.warning("Optional audio validation failed: %s", exc, exc_info=True)
+            if policy in {"error", "strict", "raise"}:
+                raise
+            return {"val-audio/status/error": 1.0}
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""

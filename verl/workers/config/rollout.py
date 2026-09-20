@@ -256,6 +256,11 @@ class RolloutConfig(BaseConfig):
 
     limit_images: Optional[int] = None
 
+    # Opt-in serving support for the frozen Qwen3.5-Omni audio tower.
+    enable_audio: bool = False
+
+    limit_audio: Optional[int] = None
+
     skip_tokenizer_init: bool = True
 
     quantization: Optional[str] = None

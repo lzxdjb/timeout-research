@@ -1014,6 +1014,108 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             else:
                 self.bridge.save_hf_weights(self.model, hf_ckpt_path, strict=self.checkpoint_config.strict)
 
+    def _is_omni_audio_checkpoint(self) -> bool:
+        """Whether the source checkpoint carries a frozen Omni audio tower."""
+        return bool(
+            getattr(self.hf_config, "verl_omni_audio", False) is True
+            and getattr(self.hf_config, "audio_config", None) is not None
+        )
+
+    def _preserve_omni_audio_weights(self, hf_ckpt_path: str):
+        """Restore only frozen audio tensors after the Megatron HF export."""
+        if not self._is_omni_audio_checkpoint():
+            return
+
+        source_dir = self.model_path
+        if not isinstance(source_dir, str) or not os.path.isdir(source_dir):
+            raise RuntimeError(
+                "Omni audio preservation requires a local source model directory; "
+                f"got {source_dir!r}"
+            )
+
+        source_index_path = os.path.join(source_dir, "model.safetensors.index.json")
+        source_single_path = os.path.join(source_dir, "model.safetensors")
+        source_weight_map = None
+        if os.path.isfile(source_index_path):
+            try:
+                with open(source_index_path, encoding="utf-8") as f:
+                    source_weight_map = json.load(f).get("weight_map", {})
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Unable to read source safetensors index {source_index_path}") from exc
+        elif not os.path.isfile(source_single_path):
+            raise RuntimeError(
+                "Omni audio preservation requires model.safetensors.index.json or model.safetensors"
+            )
+
+        try:
+            from safetensors import safe_open
+            from safetensors.torch import save_file
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("Omni audio preservation requires safetensors") from exc
+
+        if source_weight_map is None:
+            with safe_open(source_single_path, framework="pt", device="cpu") as src:
+                source_weight_map = {key: os.path.basename(source_single_path) for key in src.keys()}
+        audio_keys = {
+            key: shard_name
+            for key, shard_name in source_weight_map.items()
+            if key.startswith("model.audio_tower.")
+        }
+        if not audio_keys:
+            logger.warning("Omni checkpoint declares audio support but contains no model.audio_tower.* tensors")
+            return
+
+        audio_tensors = {}
+        audio_keys_by_shard = {}
+        for key, shard_name in audio_keys.items():
+            audio_keys_by_shard.setdefault(shard_name, []).append(key)
+        for shard_name, shard_keys in audio_keys_by_shard.items():
+            shard_path = os.path.join(source_dir, shard_name)
+            if not os.path.isfile(shard_path):
+                raise RuntimeError(f"Source audio tensor shard is missing: {shard_path}")
+            with safe_open(shard_path, framework="pt", device="cpu") as src:
+                source_keys = set(src.keys())
+                for key in shard_keys:
+                    if key not in source_keys:
+                        raise RuntimeError(f"Source shard {shard_path} does not contain indexed tensor {key}")
+                    audio_tensors[key] = src.get_tensor(key)
+
+        os.makedirs(hf_ckpt_path, exist_ok=True)
+        destination_audio_name = "audio_tower.safetensors"
+        destination_audio_path = os.path.join(hf_ckpt_path, destination_audio_name)
+        destination_index_path = os.path.join(hf_ckpt_path, "model.safetensors.index.json")
+        if os.path.isfile(destination_index_path):
+            with open(destination_index_path, encoding="utf-8") as f:
+                destination_index = json.load(f)
+            destination_weight_map = dict(destination_index.get("weight_map", {}))
+        else:
+            destination_weight_map = {}
+            destination_model_path = os.path.join(hf_ckpt_path, "model.safetensors")
+            if os.path.isfile(destination_model_path):
+                with safe_open(destination_model_path, framework="pt", device="cpu") as dst:
+                    destination_weight_map = {
+                        key: os.path.basename(destination_model_path) for key in dst.keys()
+                    }
+            destination_index = {"weight_map": destination_weight_map}
+
+        for key, existing_shard in destination_weight_map.items():
+            if not key.startswith("model.audio_tower.") or key not in audio_tensors:
+                continue
+            existing_path = os.path.join(hf_ckpt_path, existing_shard)
+            if not os.path.isfile(existing_path):
+                continue
+            with safe_open(existing_path, framework="pt", device="cpu") as dst:
+                if key in dst.keys() and not torch.equal(dst.get_tensor(key), audio_tensors[key]):
+                    raise RuntimeError(f"Conflicting destination audio tensor for {key} in {existing_path}")
+
+        save_file(audio_tensors, destination_audio_path)
+        for key in audio_tensors:
+            destination_weight_map[key] = destination_audio_name
+        destination_index["weight_map"] = destination_weight_map
+        with open(destination_index_path, "w", encoding="utf-8") as f:
+            json.dump(destination_index, f, indent=2, sort_keys=True)
+        logger.info("Preserved %d frozen Omni audio tensors in %s", len(audio_tensors), destination_audio_path)
+
     def _save_hf_config_and_tokenizer(self, local_path: str):
         """Rank-0 saves HF config, tokenizer, and generation config."""
         if self.rank != 0:
@@ -1276,6 +1378,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             hf_ckpt_path = get_hf_model_checkpoint_path(local_path)
             log_with_rank(f"Saving HF model checkpoint to {hf_ckpt_path} with bridge", rank=self.rank, logger=logger)
             self._save_model_as_hf_via_bridge(hf_ckpt_path)
+            if self._is_omni_audio_checkpoint():
+                torch.distributed.barrier()
+                if self.rank == 0:
+                    self._preserve_omni_audio_weights(hf_ckpt_path)
+                torch.distributed.barrier()
             log_with_rank(f"Saved bridge checkpoint to {hf_ckpt_path}", rank=self.rank, logger=logger)
 
         # ── 4. Transformer config (rank 0, at checkpoint root) ──────────────

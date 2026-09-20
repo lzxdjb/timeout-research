@@ -324,6 +324,17 @@ trace:
   max_samples_per_step_per_worker: null
 
 
+# Maximum number of image items per prompt in the vLLM rollout.
+limit_images: null
+
+# Serve the frozen Qwen3.5-Omni audio tower in the rollout. Training data and
+# the Megatron training graph remain text/vision-only.
+enable_audio: False
+
+# Maximum number of audio items per prompt when audio serving is enabled.
+limit_audio: null
+
+
 # Whether to skip tokenizer initialization for rollout engine
 # When enabled (True), the rollout assume token in token out for generation
 skip_tokenizer_init: True

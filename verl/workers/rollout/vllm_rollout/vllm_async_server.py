@@ -19,6 +19,7 @@ import logging
 import os
 import uuid
 from collections.abc import Mapping
+from pathlib import Path
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -54,6 +55,7 @@ from verl.workers.rollout.utils import (
     qwen2_5_vl_dedup_image_tokens,
     run_uvicorn,
 )
+from verl.workers.rollout.vllm_rollout.audio_debug import audio_debug_enabled, log_audio_registration_debug
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -136,6 +138,7 @@ class vLLMHttpServer:
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
         self._validate_configs()
+        log_audio_registration_debug(logger, "ray_server_actor_initialized", vllm_config=self.model_config)
 
         if self.config.full_determinism:
             from verl.workers.engine.utils import enable_full_determinism
@@ -252,6 +255,9 @@ class vLLMHttpServer:
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if self.config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
+        if self.config.get("limit_audio", None):
+            engine_kwargs.setdefault("limit_mm_per_prompt", {})
+            engine_kwargs["limit_mm_per_prompt"]["audio"] = self.config.get("limit_audio")
 
         self._preprocess_engine_kwargs(engine_kwargs)
 
@@ -283,7 +289,32 @@ class vLLMHttpServer:
         hf_overrides.update(quant_hf_overrides)
         architectures = getattr(self.model_config.hf_config, "architectures", None) or []
         overridden_architectures = hf_overrides.get("architectures")
-        if (
+        if self.config.get("enable_audio", False):
+            log_audio_registration_debug(logger, "ray_server_before_adapter_import", vllm_config=self.model_config)
+            from verl.workers.rollout.vllm_rollout.qwen35_omni import (
+                ARCHITECTURE as QWEN35_OMNI_ARCHITECTURE,
+                PLUGIN_NAME as QWEN35_OMNI_PLUGIN_NAME,
+                register as register_qwen35_omni,
+                validate_plugin_installation,
+            )
+
+            if overridden_architectures is not None and overridden_architectures != [QWEN35_OMNI_ARCHITECTURE]:
+                raise ValueError(
+                    "rollout.enable_audio=True conflicts with explicit "
+                    f"hf_overrides.architectures={overridden_architectures!r}; "
+                    f"use {[QWEN35_OMNI_ARCHITECTURE]!r} or unset it"
+                )
+            validate_plugin_installation()
+            register_qwen35_omni()
+            configured_plugins = [
+                item.strip() for item in os.environ.get("VLLM_PLUGINS", "").split(",") if item.strip()
+            ]
+            if QWEN35_OMNI_PLUGIN_NAME not in configured_plugins:
+                configured_plugins.append(QWEN35_OMNI_PLUGIN_NAME)
+                os.environ["VLLM_PLUGINS"] = ",".join(configured_plugins)
+            hf_overrides["architectures"] = [QWEN35_OMNI_ARCHITECTURE]
+            logger.info("Audio rollout registered architecture %s", QWEN35_OMNI_ARCHITECTURE)
+        elif (
             isinstance(architectures, (list, tuple))
             and "Qwen3_5OmniMoeForConditionalGeneration" in architectures
             and overridden_architectures is None
@@ -464,6 +495,7 @@ class vLLMHttpServer:
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
+        log_audio_registration_debug(logger, "ray_server_engine_config_created", vllm_config=vllm_config)
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}
@@ -478,11 +510,18 @@ class vLLMHttpServer:
         await engine_client.reset_mm_cache()
         # A sampled <|image_pad|>/<|video_pad|> has no image behind it, and every consumer of the
         # sequence assumes it does. Mask them out with the OOV tail, so the policy cannot pick one.
+        banned_token_ids = get_vision_placeholder_token_ids(self.model_config.processor)
+        if self.config.get("enable_audio", False):
+            audio_pad_token_id = self.model_config.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
+            unk_token_id = getattr(self.model_config.tokenizer, "unk_token_id", None)
+            if isinstance(audio_pad_token_id, int) and audio_pad_token_id >= 0 and audio_pad_token_id != unk_token_id:
+                if audio_pad_token_id not in banned_token_ids:
+                    banned_token_ids.append(audio_pad_token_id)
         await engine_client.collective_rpc(
             method="monkey_patch_model",
             kwargs={
                 "vocab_size": len(self.model_config.tokenizer),
-                "banned_token_ids": get_vision_placeholder_token_ids(self.model_config.processor),
+                "banned_token_ids": banned_token_ids,
             },
         )
 
@@ -1003,6 +1042,17 @@ class vLLMHttpServer:
 
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
         """Mutate engine_kwargs in-place before the CLI args dict is built."""
+        allowed_media_root = engine_kwargs.get("allowed_local_media_path")
+        if allowed_media_root:
+            allowed_media_path = Path(str(allowed_media_root)).expanduser().resolve()
+            if not allowed_media_path.is_dir():
+                raise ValueError(
+                    "rollout.engine_kwargs.vllm.allowed_local_media_path must be an existing directory; "
+                    f"got {allowed_media_path}"
+                )
+            engine_kwargs["allowed_local_media_path"] = str(allowed_media_path)
+            logger.info("vLLM local media access is restricted to %s", allowed_media_path)
+
         if _VLLM_VERSION < version.parse("0.22.0"):
             # Work around multimodal processor cache desync across pause/resume.
             # See: https://github.com/vllm-project/vllm/pull/43001/
@@ -1183,6 +1233,15 @@ class vLLMReplica(RolloutReplica):
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
             }
+            if self.config.get("enable_audio", False):
+                configured_plugins = [
+                    item.strip() for item in os.environ.get("VLLM_PLUGINS", "").split(",") if item.strip()
+                ]
+                if "verl_qwen35_omni" not in configured_plugins:
+                    configured_plugins.append("verl_qwen35_omni")
+                env_vars["VLLM_PLUGINS"] = ",".join(configured_plugins)
+            if audio_debug_enabled():
+                env_vars["VERL_AUDIO_DEBUG"] = os.environ.get("VERL_AUDIO_DEBUG", "1")
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(

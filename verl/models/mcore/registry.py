@@ -32,6 +32,9 @@ class SupportedVLM(Enum):
     QWEN3_VL = "Qwen3VLForConditionalGeneration"
     QWEN3_5_MOE_VL = "Qwen3_5MoeForConditionalGeneration"
     QWEN3_5_VL = "Qwen3_5ForConditionalGeneration"
+    # The Megatron backend trains only the Qwen3.5 vision/text modules. The
+    # frozen audio tower is preserved separately in HF-format checkpoints.
+    QWEN3_5_OMNI_MOE_VL = "Qwen3_5OmniMoeForConditionalGeneration"
 
 
 supported_vlm = [member.value for member in SupportedVLM]
