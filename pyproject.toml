@@ -23,6 +23,9 @@ license = {text = "Apache-2.0"}  # Changed from file to text format
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
 
+[project.entry-points."vllm.general_plugins"]
+verl_qwen35_omni = "verl.workers.rollout.vllm_rollout.qwen35_omni:register"
+
 # -------------------------------
 # tool.ruff - Linting configuration
 # -------------------------------
