@@ -229,9 +229,12 @@ class vLLMColocateWorkerExtension:
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def update_weights_from_ipc(
+        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False, global_steps: int | None = None
+    ):
         """Update the weights of the rollout model."""
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+        from verl.workers.rollout.vllm_rollout.frozen_audio import audio_weight_name, restore_frozen_audio_tower
 
         if self.device is None:
             # vLLM workers may leave self.device unset on non-CUDA platforms (e.g. NPU);
@@ -287,8 +290,12 @@ class vLLMColocateWorkerExtension:
         # the bucketed transport may split one across buckets. Accumulate and
         # apply only after ``is_last``; standard base weights load per bucket.
         lora_weights: dict[str, torch.Tensor] | None = {} if (peft_config and base_sync_done) else None
+        received_audio_names: set[str] = set()
 
         def on_bucket_received(weights: list[tuple[str, torch.Tensor]], is_last: bool) -> None:
+            received_audio_names.update(
+                audio_name for name, _ in weights if (audio_name := audio_weight_name(name)) is not None
+            )
             if lora_weights is not None:
                 # Clone: add_lora keeps these past the callback (reused IPC buffer, #6454).
                 lora_weights.update((name, tensor.clone()) for name, tensor in weights)
@@ -308,6 +315,17 @@ class vLLMColocateWorkerExtension:
             )
 
         receiver.receive_weights(on_bucket_received=on_bucket_received)
+
+        # All IPC buckets have been acknowledged before a checkpoint read can
+        # fail. The actor never exports this frozen tower; level-2 sleep drops
+        # it, so restore it after every update, including the initial sync.
+        restore_frozen_audio_tower(
+            self.model_runner.model,
+            self.model_runner.vllm_config.model_config,
+            received_audio_names,
+            rank=getattr(self, "rank", self.local_rank),
+            global_steps=global_steps,
+        )
 
         # =========================== step 3: process weights after loading ===========================
         if self._is_qat_model:

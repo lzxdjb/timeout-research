@@ -476,6 +476,24 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertEqual(metrics["protocol/outcome/invalid_patch"], 0.5)
         self.assertEqual(metrics["protocol/hidden/test_timeout_rate"], 0.5)
 
+    def test_partial_rewards_have_training_namespace_and_exclude_unknown_counts(self):
+        self.batch.non_tensor_batch = {
+            "partial_hidden_reward_applied": np.array([1, 0]),
+            "partial_hidden_reward_score": np.array([0.8, 0.0]),
+            "partial_hidden_reward_passed_count": np.array([8, -1]),
+            "partial_hidden_reward_total_count": np.array([10, -1]),
+            "partial_hidden_reward_contract_version": np.array([1, -1]),
+            "partial_hidden_reward_reason": np.array(["partial_hidden_reward", "unsupported_contract"]),
+            "partial_hidden_reward_count_reason": np.array(["complete", "unsupported_contract"]),
+        }
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+        self.assertEqual(metrics["training/partial_reward/applied/mean"], 0.5)
+        self.assertAlmostEqual(metrics["training/partial_reward/score/mean"], 0.4)
+        self.assertEqual(metrics["training/partial_reward/passed_count/mean"], 8)
+        self.assertEqual(metrics["training/partial_reward/total_count/mean"], 10)
+        self.assertEqual(metrics["training/partial_reward/reason/unsupported_contract"], 0.5)
+        self.assertNotIn("protocol/partial_hidden_reward_score/mean", metrics)
+
 
 class TestComputeTimingMetrics(unittest.TestCase):
     """Tests for the compute_timing_metrics function."""

@@ -1579,6 +1579,14 @@ class PPOTrainer(ABC):
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+            try:
+                extra_fields = tq.kv_batch_get(
+                    keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"]
+                ).get("extra_fields")
+            except (KeyError, TypeError, ValueError):
+                # Generic V1 rollouts may omit diagnostics. Fetch this optional
+                # field separately so its absence cannot prevent rollout dumps.
+                extra_fields = None
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
 
@@ -1609,6 +1617,18 @@ class PPOTrainer(ABC):
             scores = [scores[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            if extra_fields is not None:
+                reward_infos = []
+                for extra in extra_fields.tolist():
+                    extra = getattr(extra, "data", extra)
+                    info = extra.get("reward_extra_info", {}) if isinstance(extra, dict) else {}
+                    reward_infos.append(info if isinstance(info, dict) else {})
+                diagnostic_keys = {"raw_score", "shaped_score"}
+                diagnostic_keys.update(
+                    key for info in reward_infos for key in info if key.startswith("partial_hidden_reward_")
+                )
+                for key in sorted(diagnostic_keys):
+                    reward_extra_infos_dict[key] = [reward_infos[i].get(key) for i in sorted_indices]
 
             self._dump_generations(
                 inputs=inputs,

@@ -703,6 +703,24 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         if values.size:
             metrics[f"protocol/{field}/mean"] = float(np.mean(values))
 
+    # Separate namespace: validation's protocol aliases must not masquerade as
+    # training partial-reward diagnostics. Unknown counts (-1) are not averaged.
+    for field, raw_values in batch.non_tensor_batch.items():
+        if not field.startswith("partial_hidden_reward_") or field.endswith(("reason", "reason_code")):
+            continue
+        values = _coerce_numeric_values(raw_values)
+        values = values[values >= 0]
+        if values.size:
+            metrics[f"training/partial_reward/{field.removeprefix('partial_hidden_reward_')}/mean"] = float(
+                np.mean(values)
+            )
+    reasons = batch.non_tensor_batch.get("partial_hidden_reward_reason", [])
+    if len(reasons):
+        for reason in sorted({str(reason) for reason in reasons}):
+            metrics[f"training/partial_reward/reason/{reason}"] = float(
+                np.mean([str(value) == reason for value in reasons])
+            )
+
     # Conditional reward metrics use sparse values: each trajectory contributes
     # only to its matching infrastructure/non-infrastructure population.
     for field in (

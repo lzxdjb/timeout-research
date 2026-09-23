@@ -17,7 +17,9 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
+from safetensors.torch import save_file
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -243,3 +245,124 @@ def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
     expected = torch.tensor([5, 6, 7, 8], dtype=torch.float32)
     torch.testing.assert_close(main_model.model.layers[0].e_score_correction_bias, expected)
     torch.testing.assert_close(drafter_model.model.layers[0].e_score_correction_bias, expected)
+
+
+class _AudioTower(torch.nn.Linear):
+    @torch.no_grad()
+    def load_weights(self, weights):
+        names = set()
+        params = dict(self.named_parameters())
+        for name, tensor in weights:
+            params[name].copy_(tensor)
+            names.add(name)
+        return names
+
+
+def _audio_update_worker(tmp_path, monkeypatch, events, actor_audio=False):
+    # Load the real restoration helper without importing the heavyweight
+    # rollout package while its IPC transport is replaced by a CPU fake.
+    module_name = "verl.workers.rollout.vllm_rollout.frozen_audio"
+    spec = importlib.util.spec_from_file_location(
+        module_name, _REPO_ROOT / "verl/workers/rollout/vllm_rollout/frozen_audio.py"
+    )
+    audio_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(audio_module)
+    monkeypatch.setitem(sys.modules, module_name, audio_module)
+    model = _ToyModel()
+    model.audio_tower = _AudioTower(4, 2)
+    save_file(
+        {
+            "model.audio_tower.weight": torch.full((2, 4), 7.0),
+            "model.audio_tower.bias": torch.full((2,), 8.0),
+            "model.language_model.weight": torch.full((4, 4), -999.0),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.model_runner = _FakeModelRunner(model)
+    worker.model_runner.vllm_config.model_config = types.SimpleNamespace(
+        model=str(tmp_path),
+        hf_config=types.SimpleNamespace(architectures=["GageQwen3_5OmniMoeForConditionalGeneration"]),
+    )
+    worker.device = torch.device("cpu")
+    worker.local_rank = 0
+    worker.rank = 0
+    worker._is_qat_model = False
+    worker._is_modelopt_qat = False
+    worker._get_zmq_handle = lambda: "ipc:///tmp/fake-audio-update.sock"
+
+    @torch.no_grad()
+    def load_weights(weights):
+        params = dict(model.named_parameters())
+        for name, tensor in weights:
+            target = name.removeprefix("model.") if name.startswith("model.audio_tower.") else name
+            params[target].copy_(tensor)
+        events.append("actor_weights_loaded")
+
+    model.load_weights = load_weights
+
+    class Receiver:
+        def __init__(self, **kwargs):
+            pass
+
+        def receive_weights(self, on_bucket_received):
+            first = [("model.layers.0.linear.weight", torch.full((4, 4), 99.0))]
+            second = []
+            if actor_audio:
+                first.append(("model.audio_tower.weight", torch.full((2, 4), 51.0)))
+                second.append(("model.audio_tower.bias", torch.full((2,), 52.0)))
+            on_bucket_received(first, False)
+            events.append("first_ack")
+            on_bucket_received(second, True)
+            events.append("final_ack")
+
+    receiver_module = types.ModuleType("verl.workers.rollout.vllm_rollout.bucketed_weight_transfer")
+    receiver_module.BucketedWeightReceiver = Receiver
+    monkeypatch.setitem(sys.modules, receiver_module.__name__, receiver_module)
+    post_module = types.ModuleType("vllm.model_executor.model_loader.utils")
+
+    def post_process(inner_model, config, device):
+        assert events[-1] == "final_ack"
+        assert torch.isfinite(inner_model.audio_tower.weight).all()
+        expected_weight = 51.0 if actor_audio else 7.0
+        torch.testing.assert_close(inner_model.audio_tower.weight, torch.full((2, 4), expected_weight))
+        events.append("post_process")
+
+    post_module.process_weights_after_loading = post_process
+    monkeypatch.setitem(sys.modules, post_module.__name__, post_module)
+    return worker, model
+
+
+def test_audio_restored_after_every_ipc_round_before_post_processing(tmp_path, monkeypatch, caplog):
+    events = []
+    worker, model = _audio_update_worker(tmp_path, monkeypatch, events)
+    for step in [0, 2]:
+        with torch.no_grad():
+            model.audio_tower.weight.fill_(float("nan"))
+            model.audio_tower.bias.fill_(float("nan"))
+        worker.update_weights_from_ipc(global_steps=step)
+        assert events[-2:] == ["final_ack", "post_process"]
+        torch.testing.assert_close(model.model.layers[0].linear.weight, torch.full((4, 4), 99.0))
+        torch.testing.assert_close(model.audio_tower.bias, torch.full((2,), 8.0))
+    assert "step=2" in caplog.text
+    assert caplog.text.count("Restored frozen Omni audio") == 2
+
+
+def test_audio_load_failure_propagates_after_all_ipc_buckets_acknowledged(tmp_path, monkeypatch):
+    events = []
+    worker, model = _audio_update_worker(tmp_path, monkeypatch, events)
+    (tmp_path / "model.safetensors").unlink()
+    with pytest.raises(FileNotFoundError, match="local safetensors checkpoint"):
+        worker.update_weights_from_ipc(global_steps=4)
+    assert events[-1] == "final_ack"
+    assert "post_process" not in events
+
+
+def test_actor_audio_across_multiple_ipc_buckets_is_preserved(tmp_path, monkeypatch):
+    events = []
+    worker, model = _audio_update_worker(tmp_path, monkeypatch, events, actor_audio=True)
+    # A complete actor stream must not need any fallback checkpoint files.
+    (tmp_path / "model.safetensors").unlink()
+    worker.update_weights_from_ipc(global_steps=6)
+    assert events[-1] == "post_process"
+    torch.testing.assert_close(model.audio_tower.bias, torch.full((2,), 52.0))
