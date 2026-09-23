@@ -19,6 +19,28 @@ from unittest.mock import MagicMock, call, patch
 from verl.utils.tracking import DapoFilteredRewardTableLogger, Tracking, ValidationGenerationsLogger
 
 
+def test_tracking_commit_is_forwarded_only_to_wandb():
+    tracking = Tracking.__new__(Tracking)
+    tracking.logger = {"wandb": MagicMock(), "console": MagicMock()}
+    metrics = {"val-audio/score": 70.0}
+
+    tracking.log(metrics, step=17, commit=True)
+
+    tracking.logger["wandb"].log.assert_called_once_with(data=metrics, step=17, commit=True)
+    tracking.logger["console"].log.assert_called_once_with(data=metrics, step=17)
+
+
+def test_tracking_preserves_existing_accumulation_and_backend_filter():
+    tracking = Tracking.__new__(Tracking)
+    tracking.logger = {"wandb": MagicMock(), "console": MagicMock()}
+
+    tracking.log({"loss": 0.5}, step=17)
+    tracking.log({"accuracy": 0.7}, step=17, backend=["console"], commit=True)
+
+    tracking.logger["wandb"].log.assert_called_once_with(data={"loss": 0.5}, step=17)
+    assert tracking.logger["console"].log.call_count == 2
+
+
 def test_tracking_finish_finalizes_wandb_once():
     tracking = Tracking.__new__(Tracking)
     tracking.logger = {"wandb": MagicMock()}

@@ -187,10 +187,18 @@ class Tracking:
         if "rl_insight" in default_backend:
             self.logger["rl_insight"] = RLInsightLogger(project_name, experiment_name, config)
 
-    def log(self, data, step, backend=None):
+    def log(self, data, step, backend=None, *, commit: bool | None = None):
+        """Log metrics, optionally finalizing the W&B row after all same-step data.
+
+        Leaving ``commit`` unset preserves accumulation for existing callers.
+        Other backends do not receive this W&B-specific option.
+        """
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                if default_backend == "wandb" and commit is not None:
+                    logger_instance.log(data=data, step=step, commit=commit)
+                else:
+                    logger_instance.log(data=data, step=step)
 
     def finish(self, exit_code: int = 0):
         """Flush and finalize every configured backend exactly once."""

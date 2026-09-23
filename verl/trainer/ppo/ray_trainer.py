@@ -2153,7 +2153,7 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            logger.log(data=val_metrics, step=self.global_steps, commit=True)
             if self.config.trainer.get("val_only", False):
                 self._close_swe_prefetchers()
                 self._shutdown_dump_executor()
@@ -2602,7 +2602,7 @@ class RayPPOTrainer:
                 )
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                logger.log(data=metrics, step=self.global_steps, commit=True)
 
                 progress_bar.update(1)
                 self.global_steps += 1

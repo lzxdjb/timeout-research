@@ -633,7 +633,7 @@ class PPOTrainer(ABC):
             self.on_validate_end()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            self.logger.log(data=val_metrics, step=self.global_steps)
+            self.logger.log(data=val_metrics, step=self.global_steps, commit=True)
             if self.config.trainer.get("val_only", False):
                 self._shutdown_dump_executor()
                 return
@@ -703,11 +703,13 @@ class PPOTrainer(ABC):
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 
             dapo_filtered_reward_counts = metrics.pop(DAPO_FILTERED_REWARD_COUNTS_KEY, None)
-            self.logger.log(data=metrics, step=self.global_steps)
             if dapo_filtered_reward_counts:
                 self.dapo_filtered_reward_logger.log(
                     self.config.trainer.logger, dapo_filtered_reward_counts, self.global_steps
                 )
+            # Finalize only after all same-step tables; W&B rejects late writes
+            # to an already committed step and otherwise buffers until the next step.
+            self.logger.log(data=metrics, step=self.global_steps, commit=True)
             progress_bar.update(1)
             self.global_steps += 1
             SkipManager.set_step(self.global_steps)
