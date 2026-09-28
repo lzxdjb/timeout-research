@@ -33,6 +33,7 @@ from torch import Tensor
 
 from verl.models.mcore.util import preprocess_packed_seqs, preprocess_thd_engine
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
+from verl.utils.megatron.moe_loss_mask import packed_moe_router_mask
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.model import CausalLMOutputForPPO
 
@@ -269,6 +270,7 @@ def fused_forward_model_engine(vision_model: bool = False):
         local_cp_size: int | None = None,
         router_padding_mask: Tensor | None = None,
         pad_to_length_bucket: int | None = None,
+        moe_train_sample_mask: Tensor | None = None,
     ):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
@@ -292,6 +294,15 @@ def fused_forward_model_engine(vision_model: bool = False):
         input_ids_rmpad = input_ids_rmpad.contiguous()
 
         model_kwargs = {}
+        if moe_train_sample_mask is not None:
+            router_padding_mask = packed_moe_router_mask(
+                moe_train_sample_mask,
+                packed_seq_params.cu_seqlens_q_padded,
+                cp_size=parallel_state.get_context_parallel_world_size(),
+                cp_rank=parallel_state.get_context_parallel_rank(),
+                cp_layout=cp_layout,
+                existing_mask=router_padding_mask,
+            )
         if router_padding_mask is not None:
             model_kwargs["padding_mask"] = router_padding_mask
         if "pixel_values" in multi_modal_inputs:

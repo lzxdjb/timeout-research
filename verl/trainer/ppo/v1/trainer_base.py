@@ -836,7 +836,14 @@ class PPOTrainer(ABC):
     def _has_active_training_samples(self, batch: KVBatchMeta) -> bool:
         """Check the persisted sequence mask without changing the default path."""
         if not _task_filter_enabled():
-            return True
+            if not OmegaConf.select(
+                self.config, "actor_rollout_ref.actor.megatron.moe_loss_respects_train_sample_mask", default=False
+            ):
+                return True
+            if not getattr(self, "timeout_prediction_enabled", False):
+                # Cutoff/padding exclusions also apply without infrastructure
+                # filtering; an all-ones mask may not be persisted in the queue.
+                return bool(_v1_train_sample_mask_from_tags(batch.keys, batch.tags).any().item())
         data = tq.kv_batch_get(
             keys=batch.keys,
             partition_id=batch.partition_id,

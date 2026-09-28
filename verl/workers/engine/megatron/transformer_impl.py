@@ -44,6 +44,11 @@ from verl.utils.dynamic_cp_scheduler import (
     get_megatron_dynamic_cp_scheduler_cls,
     postprocess_dynamic_cp_batch,
 )
+from verl.utils.megatron.moe_loss_mask import (
+    install_moe_loss_mask_support,
+    moe_mask_batch_counts,
+    validate_moe_loss_mask_config,
+)
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 from verl.utils.megatron.router_replay_utils import (
@@ -580,8 +585,12 @@ class MegatronEngine(BaseEngine):
         self._hf_export_tasks = None
         self._build_tf_config()
         _check_dcp_unsupported_features(self.engine_config, self.model_config, tf_config=self.tf_config)
+        validate_moe_loss_mask_config(self.engine_config, self.model_config, self.tf_config)
 
         self.module = self._build_megatron_module()
+        if self.engine_config.moe_loss_respects_train_sample_mask:
+            validate_moe_loss_mask_config(self.engine_config, self.model_config, self.tf_config)
+            install_moe_loss_mask_support(self.module)
 
         if self._qat_enabled and not self.engine_config.forward_only:
             from verl.utils.modelopt import apply_qat_to_modules
@@ -821,6 +830,33 @@ class MegatronEngine(BaseEngine):
             offload_megatron_model_to_cpu(self.module)
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.optimizer)
+
+    def train_batch(self, data: TensorDict, loss_function: Callable) -> Any:
+        if not getattr(self.engine_config, "moe_loss_respects_train_sample_mask", False):
+            return super().train_batch(data, loss_function)
+        counts = moe_mask_batch_counts(data, device=get_device_id(), dp_group=self.get_data_parallel_group())
+        active, total, active_tokens, total_tokens = counts.tolist()
+        metrics = {
+            "moe_mask/active_sequences": active,
+            "moe_mask/excluded_sequences": total - active,
+            "moe_mask/active_input_tokens": active_tokens,
+            "moe_mask/active_input_token_fraction": active_tokens / max(total_tokens, 1),
+            "moe_mask/update_skipped": float(active == 0),
+        }
+        if active == 0:
+            # Every DP rank makes the same decision. Do not apply Adam momentum,
+            # weight decay, or an LR scheduler step to a globally excluded batch.
+            self.optimizer_zero_grad()
+            return {
+                "loss": [0.0],
+                "model_output": {},
+                "metrics": {**metrics, "grad_norm": 0.0},
+                "optimizer_step_skipped": True,
+            }
+        output = super().train_batch(data, loss_function)
+        if self.is_mp_src_rank_with_outputs():
+            output["metrics"].update(metrics)
+        return output
 
     def _routed_num_tokens(self, data: TensorDict) -> torch.Tensor:
         """Real (unpadded) tokens fed to the MoE router: attention_mask in the padded RL
@@ -1285,6 +1321,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
             router_padding_mask = router_padding_mask.to(input_ids.device, non_blocking=True).unsqueeze(0)
         loss_mask = model_inputs["loss_mask"]
 
+        moe_mask_kwargs = {}
+        if getattr(self.engine_config, "moe_loss_respects_train_sample_mask", False) and torch.is_grad_enabled():
+            moe_mask_kwargs["moe_train_sample_mask"] = batch.get("train_sample_mask")
+
         unwrapped_model = unwrap_model(model)
         cp_layout = self._get_context_parallel_layout(unwrapped_model)
         if hasattr(unwrapped_model, "vp_stage"):
@@ -1337,6 +1377,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                     local_cp_size=local_cp_size,
                     router_padding_mask=router_padding_mask,
                     pad_to_length_bucket=pad_to_length_bucket,
+                    **moe_mask_kwargs,
                 )
             except RuntimeError as error:
                 # Preserve the original exception, but capture the exact micro-batch
@@ -1424,6 +1465,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 forced_max_seqlen=tu.get_non_tensor_data(data=batch, key="forced_max_seqlen", default=None),
                 pad_to_length_bucket=pad_to_length_bucket,
                 cp_layout=cp_layout,
+                **moe_mask_kwargs,
             )
 
         # Router replay: record routing decisions for R2 mode

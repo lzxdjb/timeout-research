@@ -16,8 +16,10 @@
 from typing import Optional
 
 import torch
+from megatron.core import parallel_state
 from torch.nested._internal.nested_tensor import NestedTensor
 
+from verl.utils.megatron.moe_loss_mask import packed_moe_router_mask
 from verl.utils.megatron_utils import unwrap_model
 from verl.workers.config import MtpConfig
 
@@ -278,6 +280,7 @@ def gptmodel_forward_model_engine(
     cp_layout: str = "zigzag",
     router_padding_mask: torch.Tensor | None = None,
     mtp_loss_normalization_factor: float | None = None,
+    moe_train_sample_mask: torch.Tensor | None = None,
 ):
     """Default forward pass for GPT models with optional sequence packing."""
 
@@ -349,6 +352,15 @@ def gptmodel_forward_model_engine(
         if vision_model:
             input_ids_rmpad, attention_mask = build_vlm_attn_mask_thd(input_ids, pad_token_id)
 
+        if moe_train_sample_mask is not None:
+            router_padding_mask = packed_moe_router_mask(
+                moe_train_sample_mask,
+                packed_seq_params.cu_seqlens_q_padded,
+                cp_size=parallel_state.get_context_parallel_world_size(),
+                cp_rank=parallel_state.get_context_parallel_rank(),
+                cp_layout=cp_layout,
+                existing_mask=router_padding_mask,
+            )
         if router_padding_mask is not None:
             model_kwargs["padding_mask"] = router_padding_mask
 

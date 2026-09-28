@@ -114,9 +114,13 @@ def run_audio_benchmarks(
 
     summary_path = suite_dir / "suite_summary.json"
     logger.info(
-        "Running GAGE audio validation: step=%s run_id=%s api_base=%s expected_summary=%s",
+        "audio_benchmark_pressure step=%s run_id=%s benchmarks=%s max_samples=%s "
+        "concurrency=%s api_base=%s expected_summary=%s",
         global_step,
         run_id,
+        benchmarks,
+        max_samples,
+        config.get("concurrency", 4),
         api_base,
         summary_path,
     )

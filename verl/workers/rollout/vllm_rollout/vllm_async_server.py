@@ -370,6 +370,18 @@ class vLLMHttpServer:
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
+        logger.info(
+            "vllm_rollout_memory_config gpu_memory_utilization=%s max_model_len=%s "
+            "max_num_batched_tokens=%s max_num_seqs=%s limit_mm_per_prompt=%s enable_audio=%s "
+            "enable_sleep_mode=%s",
+            args.get("gpu_memory_utilization"),
+            args.get("max_model_len"),
+            args.get("max_num_batched_tokens"),
+            args.get("max_num_seqs"),
+            args.get("limit_mm_per_prompt"),
+            self.config.get("enable_audio", False),
+            self.config.enable_sleep_mode,
+        )
 
         # update profiler args
         profiler_args = build_vllm_profiler_args(
@@ -690,8 +702,33 @@ class vLLMHttpServer:
 
             # Get final response
             final_res: Optional[RequestOutput] = None
-            async for output in generator:
-                final_res = output
+            request_states = getattr(getattr(self.engine, "output_processor", None), "request_states", {})
+            # Client-side outstanding requests include queued work, not just GPU-scheduled sequences.
+            pending = len(request_states)
+            pressure = (pending + 1, len(prompt_ids), max_tokens)
+            previous = getattr(self, "_memory_pressure_highwater", (0, 0, 0))
+            if any(value > old for value, old in zip(pressure, previous, strict=True)):
+                self._memory_pressure_highwater = tuple(
+                    max(value, old) for value, old in zip(pressure, previous, strict=True)
+                )
+                logger.info(
+                    "vllm_request_pressure replica=%s step=%s pending_before_submit=%s "
+                    "prompt_tokens=%s max_tokens=%s modalities=%s",
+                    self.replica_rank, self.global_steps, pending, len(prompt_ids), max_tokens,
+                    list(multi_modal_data),
+                )
+            try:
+                async for output in generator:
+                    final_res = output
+            except Exception:
+                # EngineCore OOMs may arrive as EngineDeadError rather than CUDA exceptions.
+                logger.exception(
+                    "vllm_request_failed replica=%s step=%s request_id=%s pending=%s "
+                    "prompt_tokens=%s max_tokens=%s modalities=%s",
+                    self.replica_rank, self.global_steps, request_id, len(request_states),
+                    len(prompt_ids), max_tokens, list(multi_modal_data),
+                )
+                raise
             assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
@@ -838,6 +875,9 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return
 
+        # This is the HTTP process; CUDA counters belong in the worker logs.
+        logger.info("vllm_memory_phase phase=before_wake replica=%s step=%s tags=%s",
+                    self.replica_rank, self.global_steps, tags or self._get_wake_up_tags())
         if self.rollout_mode == RolloutMode.HYBRID:
             # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
             # processes across all DP shards (unlike collective_rpc which only reaches
@@ -854,17 +894,20 @@ class vLLMHttpServer:
             await self.engine.reset_prefix_cache(reset_connector=True)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
+        logger.info("vllm_memory_phase phase=after_wake replica=%s step=%s", self.replica_rank, self.global_steps)
 
     async def sleep(self):
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
+        logger.info("vllm_memory_phase phase=before_sleep replica=%s step=%s", self.replica_rank, self.global_steps)
         if self.rollout_mode == RolloutMode.HYBRID:
             await self._sleep_hybrid()
         elif self.rollout_mode == RolloutMode.COLOCATED:
             await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
+        logger.info("vllm_memory_phase phase=after_sleep replica=%s step=%s", self.replica_rank, self.global_steps)
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:

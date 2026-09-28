@@ -119,6 +119,53 @@ def test_v1_cutoff_mask_excludes_entire_uid_group_and_padding() -> None:
     assert _v1_train_sample_mask_from_tags(keys, tags).tolist() == [False, False, True, False]
 
 
+@pytest.mark.parametrize("retained", [False, True])
+def test_active_training_guard_honors_cutoff_without_infrastructure_filter(retained):
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.config = OmegaConf.create(
+        {"actor_rollout_ref": {"actor": {"megatron": {"moe_loss_respects_train_sample_mask": True}}}}
+    )
+    batch = KVBatchMeta(
+        partition_id="train",
+        keys=["group-a_0_0", "group-a_1_0", "group-b_0_0"],
+        tags=[{"completion_ratio_cutoff": True}, {}, {} if retained else {"is_padding": True}],
+    )
+    with (
+        patch("verl.trainer.ppo.v1.trainer_base._task_filter_enabled", return_value=False),
+        patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get") as fetch,
+    ):
+        assert trainer._has_active_training_samples(batch) is retained
+        fetch.assert_not_called()
+
+
+@pytest.mark.parametrize("timeout,infra", [(True, False), (False, True)])
+def test_active_training_guard_uses_final_persisted_mask(timeout, infra):
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.config = OmegaConf.create(
+        {"actor_rollout_ref": {"actor": {"megatron": {"moe_loss_respects_train_sample_mask": True}}}}
+    )
+    trainer.timeout_prediction_enabled = timeout
+    with (
+        patch("verl.trainer.ppo.v1.trainer_base._task_filter_enabled", return_value=infra),
+        patch(
+            "verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get",
+            return_value={"train_sample_mask": torch.tensor([False])},
+        ),
+    ):
+        assert trainer._has_active_training_samples(_batch_with_tags([{}])) is False
+
+
+def test_active_training_guard_keeps_default_path_without_opt_in():
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.config = OmegaConf.create({})
+    with (
+        patch("verl.trainer.ppo.v1.trainer_base._task_filter_enabled", return_value=False),
+        patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get") as fetch,
+    ):
+        assert trainer._has_active_training_samples(_batch_with_tags([{"completion_ratio_cutoff": True}])) is True
+        fetch.assert_not_called()
+
+
 def test_off_policy_steps_sync_fall_back_to_sample_step():
     tags = [
         {"global_steps": 3, "min_global_steps": None, "max_global_steps": None},

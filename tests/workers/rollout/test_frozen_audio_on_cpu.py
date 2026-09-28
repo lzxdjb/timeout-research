@@ -210,3 +210,11 @@ def test_prefix_matching_is_exact():
     assert _AUDIO.audio_weight_name("model.audio_tower.proj.weight") == "proj.weight"
     assert _AUDIO.audio_weight_name("audio_tower.proj.weight") == "proj.weight"
     assert _AUDIO.audio_weight_name("model.language_model.audio_projection.weight") is None
+
+
+def test_cuda_memory_snapshot_is_safe_without_cuda(caplog):
+    caplog.set_level("INFO", logger="frozen_audio")
+    snapshot = _AUDIO.cuda_memory_snapshot()
+    assert snapshot.get("cuda_available") is False or "memory_query_error" in snapshot
+    _AUDIO.log_cuda_memory_snapshot("cpu_test", rank=0, global_steps=7)
+    assert "vllm_cuda_memory phase=cpu_test" in caplog.text

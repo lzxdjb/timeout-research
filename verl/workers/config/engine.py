@@ -192,6 +192,8 @@ class McoreEngineConfig(EngineConfig):
     virtual_pipeline_model_parallel_size: Optional[int] = None
     context_parallel_size: int = 1
     dynamic_context_parallel: bool = False
+    # Exclude train_sample_mask=False sequences from native MoE regularization.
+    moe_loss_respects_train_sample_mask: bool = False
     entropy_from_logits_with_chunking: bool = False
     entropy_from_logits_chunk_size: int = 2048
     max_seqlen_per_dp_cp_rank: Optional[int] = None

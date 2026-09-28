@@ -1323,7 +1323,20 @@ class RayPPOTrainer:
             # pad to be divisible by dp_size
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            print(
+                f"validation_memory_phase phase=before_generate step={self.global_steps} "
+                f"batch_index={batch_index} samples={len(test_gen_batch)} "
+                f"padded_samples={len(test_gen_batch_padded)} "
+                f"repeat_n={self.config.actor_rollout_ref.rollout.val_kwargs.n} "
+                f"agent_workers={size_divisor}",
+                flush=True,
+            )
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            print(
+                f"validation_memory_phase phase=after_generate step={self.global_steps} "
+                f"batch_index={batch_index}",
+                flush=True,
+            )
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model

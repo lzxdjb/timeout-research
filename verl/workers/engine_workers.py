@@ -284,6 +284,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # update
             output_lst = []
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+            if getattr(self.engine_config, "moe_loss_respects_train_sample_mask", False):
+                self._moe_mask_pending_scheduler_step = False
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 maybe_fix_3d_position_ids(mini_batch_td)
@@ -366,19 +368,30 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
-        if update_lr_scheduler:
+        optimizer_step_skipped = output.pop("optimizer_step_skipped", False)
+        scheduler_has_update = not optimizer_step_skipped
+        if getattr(self.engine_config, "moe_loss_respects_train_sample_mask", False):
+            # The scheduler normally advances once after all optimizer mini-batches.
+            # An excluded final mini-batch must not hide earlier eligible updates.
+            scheduler_has_update |= getattr(self, "_moe_mask_pending_scheduler_step", False)
+            self._moe_mask_pending_scheduler_step = scheduler_has_update
+        if update_lr_scheduler and scheduler_has_update:
             lr = self.engine.lr_scheduler_step()
         else:
             lr = None
+        if update_lr_scheduler and getattr(self.engine_config, "moe_loss_respects_train_sample_mask", False):
+            self._moe_mask_pending_scheduler_step = False
 
         if self.engine.is_mp_src_rank_with_outputs():
             # we don't need model_output in training. Maybe we change out mind later
             output.pop("model_output")
             if lr is not None:
                 output["metrics"]["lr"] = lr
+            if optimizer_step_skipped:
+                output["metrics"]["mfu"] = 0.0
             final_output = self._postprocess_output(
                 output,
-                global_token_num=global_token_num,
+                global_token_num=None if optimizer_step_skipped else global_token_num,
                 delta_time=delta_time,
                 forward_only=False,
                 images_seqlens=images_seqlens,

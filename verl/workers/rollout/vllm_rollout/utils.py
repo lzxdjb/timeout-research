@@ -234,12 +234,27 @@ class vLLMColocateWorkerExtension:
     ):
         """Update the weights of the rollout model."""
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
-        from verl.workers.rollout.vllm_rollout.frozen_audio import audio_weight_name, restore_frozen_audio_tower
+        from verl.workers.rollout.vllm_rollout.frozen_audio import (
+            audio_weight_name,
+            log_cuda_memory_snapshot,
+            restore_frozen_audio_tower,
+        )
 
         if self.device is None:
             # vLLM workers may leave self.device unset on non-CUDA platforms (e.g. NPU);
             # fall back to the worker's local rank on the current accelerator.
             self.device = torch.device(f"{get_device_name()}:{self.local_rank}")
+
+        sync_rank = getattr(self, "rank", self.local_rank)
+        log_cuda_memory_snapshot(
+            "weight_sync_before_receive",
+            device=self.device,
+            rank=sync_rank,
+            global_steps=global_steps,
+            extra={
+                "has_audio_tower": isinstance(getattr(self.model_runner.model, "audio_tower", None), torch.nn.Module),
+            },
+        )
 
         # =========================== step 1: prepare for weight loading ===========================
         quant_reload_states = None
@@ -291,8 +306,13 @@ class vLLMColocateWorkerExtension:
         # apply only after ``is_last``; standard base weights load per bucket.
         lora_weights: dict[str, torch.Tensor] | None = {} if (peft_config and base_sync_done) else None
         received_audio_names: set[str] = set()
+        received_tensor_count = 0
+        received_tensor_bytes = 0
 
         def on_bucket_received(weights: list[tuple[str, torch.Tensor]], is_last: bool) -> None:
+            nonlocal received_tensor_count, received_tensor_bytes
+            received_tensor_count += len(weights)
+            received_tensor_bytes += sum(tensor.numel() * tensor.element_size() for _, tensor in weights)
             received_audio_names.update(
                 audio_name for name, _ in weights if (audio_name := audio_weight_name(name)) is not None
             )
@@ -314,7 +334,33 @@ class vLLMColocateWorkerExtension:
                 base_sync_done=base_sync_done,
             )
 
-        receiver.receive_weights(on_bucket_received=on_bucket_received)
+        try:
+            receiver.receive_weights(on_bucket_received=on_bucket_received)
+        except torch.cuda.OutOfMemoryError:
+            log_cuda_memory_snapshot(
+                "weight_sync_receive_oom",
+                device=self.device,
+                rank=sync_rank,
+                global_steps=global_steps,
+                extra={
+                    "received_tensor_count": received_tensor_count,
+                    "received_tensor_bytes": received_tensor_bytes,
+                    "received_audio_tensors": len(received_audio_names),
+                },
+            )
+            raise
+
+        log_cuda_memory_snapshot(
+            "weight_sync_after_receive",
+            device=self.device,
+            rank=sync_rank,
+            global_steps=global_steps,
+            extra={
+                "received_tensor_count": received_tensor_count,
+                "received_tensor_bytes": received_tensor_bytes,
+                "received_audio_tensors": len(received_audio_names),
+            },
+        )
 
         # All IPC buckets have been acknowledged before a checkpoint read can
         # fail. The actor never exports this frozen tower; level-2 sleep drops
@@ -323,36 +369,62 @@ class vLLMColocateWorkerExtension:
             self.model_runner.model,
             self.model_runner.vllm_config.model_config,
             received_audio_names,
-            rank=getattr(self, "rank", self.local_rank),
+            rank=sync_rank,
             global_steps=global_steps,
+        )
+        log_cuda_memory_snapshot(
+            "weight_sync_after_audio_restore",
+            device=self.device,
+            rank=sync_rank,
+            global_steps=global_steps,
+            extra={
+                "received_tensor_count": received_tensor_count,
+                "received_tensor_bytes": received_tensor_bytes,
+                "received_audio_tensors": len(received_audio_names),
+            },
         )
 
         # =========================== step 3: process weights after loading ===========================
-        if self._is_qat_model:
-            # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
-            from verl.utils.qat import manual_process_weights_after_loading
+        try:
+            if self._is_qat_model:
+                # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
+                from verl.utils.qat import manual_process_weights_after_loading
 
-            for model in self._iter_all_models():
-                manual_process_weights_after_loading(model)
-            logger.info("QAT: process_weights_after_loading completed")
-        elif self._is_modelopt_qat:
-            from verl.utils.modelopt.vllm_modelopt_patch import modelopt_process_weights_after_loading
+                for model in self._iter_all_models():
+                    manual_process_weights_after_loading(model)
+                logger.info("QAT: process_weights_after_loading completed")
+            elif self._is_modelopt_qat:
+                from verl.utils.modelopt.vllm_modelopt_patch import modelopt_process_weights_after_loading
 
-            modelopt_process_weights_after_loading(self.model_runner.model)
-            logger.info("ModelOpt QAT: process_weights_after_loading completed")
-        elif peft_config and base_sync_done:
-            logger.info("LoRA adapter sync, no post-process needed")
-        elif is_fp8_model(self.model_runner.vllm_config):
-            from verl.utils.vllm.vllm_quant_utils import process_quanted_weights_after_loading
+                modelopt_process_weights_after_loading(self.model_runner.model)
+                logger.info("ModelOpt QAT: process_weights_after_loading completed")
+            elif peft_config and base_sync_done:
+                logger.info("LoRA adapter sync, no post-process needed")
+            elif is_fp8_model(self.model_runner.vllm_config):
+                from verl.utils.vllm.vllm_quant_utils import process_quanted_weights_after_loading
 
-            for model, reload_state in quant_reload_states:
-                process_quanted_weights_after_loading(model, reload_state)
-        else:
-            # Some post-load transforms are non-idempotent; run once after all buckets.
-            from vllm.model_executor.model_loader.utils import process_weights_after_loading
+                for model, reload_state in quant_reload_states:
+                    process_quanted_weights_after_loading(model, reload_state)
+            else:
+                # Some post-load transforms are non-idempotent; run once after all buckets.
+                from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-            for model, model_config in self._iter_all_models_with_config():
-                process_weights_after_loading(model, model_config, self.device)
+                for model, model_config in self._iter_all_models_with_config():
+                    process_weights_after_loading(model, model_config, self.device)
+        except torch.cuda.OutOfMemoryError:
+            log_cuda_memory_snapshot(
+                "weight_sync_postprocess_oom",
+                device=self.device,
+                rank=sync_rank,
+                global_steps=global_steps,
+            )
+            raise
+        log_cuda_memory_snapshot(
+            "weight_sync_after_postprocess",
+            device=self.device,
+            rank=sync_rank,
+            global_steps=global_steps,
+        )
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.

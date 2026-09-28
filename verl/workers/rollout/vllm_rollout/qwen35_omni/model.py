@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import torch
@@ -24,12 +25,15 @@ from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 
+from ..frozen_audio import cuda_memory_snapshot
 from .processor import (
     HybridDummyInputsBuilder,
     HybridMultiModalProcessor,
     HybridProcessingInfo,
 )
 from .routing import check_runtime_version, validate_hybrid_config
+
+logger = logging.getLogger(__name__)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -79,7 +83,46 @@ class GageQwen3_5OmniMoeForConditionalGeneration(Qwen3_5MoeForConditionalGenerat
         return Qwen2_5OmniConditionalGenerationMixin._parse_and_validate_audio_input(self, **kwargs)
 
     def _process_audio_input(self, audio_input: Any) -> tuple[torch.Tensor, ...]:
-        return Qwen3OmniMoeConditionalGenerationMixin._process_audio_input(self, audio_input)
+        input_features = audio_input["input_features"]
+        feature_lengths = audio_input["audio_feature_lengths"]
+        # Reduce on CPU so diagnostics do not allocate CUDA reduction tensors.
+        lengths = feature_lengths.tolist()
+        max_length = max(lengths, default=0)
+        batch_size = len(lengths)
+        min_length = min(lengths, default=0)
+        total_length = sum(lengths)
+        debug_key = (batch_size, max_length, total_length)
+        previous = getattr(self, "_audio_debug_max", None)
+        if previous is None or any(value > old for value, old in zip(debug_key, previous, strict=True)):
+            self._audio_debug_max = debug_key if previous is None else tuple(
+                max(value, old) for value, old in zip(debug_key, previous, strict=True)
+            )
+            logger.info(
+                "audio_encoder_input batch=%s feature_shape=%s max_feature_length=%s "
+                "min_feature_length=%s total_feature_length=%s dtype=%s memory=%s",
+                batch_size,
+                tuple(input_features.shape),
+                max_length,
+                min_length,
+                total_length,
+                input_features.dtype,
+                cuda_memory_snapshot(input_features.device),
+            )
+        try:
+            return Qwen3OmniMoeConditionalGenerationMixin._process_audio_input(self, audio_input)
+        except torch.cuda.OutOfMemoryError:
+            logger.exception(
+                "audio_encoder_oom batch=%s feature_shape=%s max_feature_length=%s "
+                "min_feature_length=%s total_feature_length=%s conv_chunksize=%s memory=%s",
+                batch_size,
+                tuple(input_features.shape),
+                max_length,
+                min_length,
+                total_length,
+                getattr(self.audio_tower, "conv_chunksize", None),
+                cuda_memory_snapshot(input_features.device),
+            )
+            raise
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
         """Encode media and carry a modality tag through cache and prefill slicing."""
