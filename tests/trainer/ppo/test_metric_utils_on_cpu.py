@@ -29,9 +29,11 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+    usable_validation_metrics,
 )
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _get_validation_metric_sources
 from verl.trainer.ppo.v1.trainer_base import (
+    PPOTrainer,
     _resolve_validation_metric_sources,
     _to_validation_metric_source_list,
 )
@@ -42,6 +44,39 @@ from verl.utils.metric.utils import (
     AggregationType,
     Metric,
 )
+
+
+def test_usable_validation_metrics_excludes_infrastructure_failed_groups() -> None:
+    sources, uids, infos, coverage = usable_validation_metrics(
+        ["bench"] * 6,
+        ["a", "a", "b", "b", "c", "c"],
+        {"reward": [0, 1, 1, 1, 0, 0], "observed_infrastructure_failure": [0, 0, 0, 1, 0, 0]},
+    )
+    assert uids == ["a", "a", "c", "c"]
+    assert infos["reward"] == [0, 1, 0, 0]
+    assert coverage["bench"]["valid_count"] == 4
+    assert coverage["bench"]["excluded_count"] == 2
+    assert coverage["bench"]["coverage"] == 4 / 6
+    assert process_validation_metrics(sources, uids, infos)["bench"]["reward"]["mean@2"] == 0.25
+
+
+def test_usable_validation_metrics_omits_all_failed_source() -> None:
+    sources, uids, infos, coverage = usable_validation_metrics(
+        ["bench"], ["a"], {"reward": [0], "observed_infrastructure_failure": [1]}
+    )
+    assert (sources, uids, infos["reward"]) == ([], [], [])
+    assert coverage["bench"]["coverage"] == 0
+
+
+def test_trainer_core_metrics_exclude_infrastructure_failures() -> None:
+    sources = ["bench"] * 6
+    uids = ["a", "a", "b", "b", "c", "c"]
+    infos = {"reward": [0, 1, 1, 1, 0, 0], "observed_infrastructure_failure": [0, 0, 0, 1, 0, 0]}
+    for trainer_class in (RayPPOTrainer, PPOTrainer):
+        metrics = trainer_class._val_metrics_update(None, sources, uids, infos, [])
+        assert metrics["val-core/bench/reward/mean@2"] == 0.25
+        assert metrics["val-aux/bench/reward/mean@2"] == 0.5
+        assert metrics["val-aux/bench/infrastructure_filter/excluded_count"] == 2
 
 
 class TestReduceMetrics(unittest.TestCase):

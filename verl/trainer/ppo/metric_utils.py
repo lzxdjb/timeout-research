@@ -1102,6 +1102,48 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
+def usable_validation_metrics(data_sources, sample_uids, infos_dict):
+    """Return metrics inputs containing only complete, infrastructure-clean UID groups."""
+    from collections import Counter
+
+    group_sizes = Counter(zip(data_sources, sample_uids))
+    expected = {}
+    for (source, _), count in group_sizes.items():
+        expected[source] = max(expected.get(source, 0), count)
+    failed = set()
+    failures = infos_dict.get("observed_infrastructure_failure", [])
+    for index, key in enumerate(zip(data_sources, sample_uids)):
+        try:
+            if index < len(failures) and float(failures[index]) == 1.0:
+                failed.add(key)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    eligible = {
+        key for key, count in group_sizes.items()
+        if key not in failed and (not failed or count == expected[key[0]])
+    }
+    indices = [index for index, key in enumerate(zip(data_sources, sample_uids)) if key in eligible]
+    counts = Counter(data_sources)
+    valid = Counter(data_sources[index] for index in indices)
+    infra = Counter(source for source, _ in failed)
+    coverage = {
+        source: {
+            "total_count": total,
+            "valid_count": valid[source],
+            "excluded_count": total - valid[source],
+            "infrastructure_failed_groups": infra[source],
+            "coverage": valid[source] / total,
+        }
+        for source, total in counts.items()
+    }
+    return (
+        [data_sources[index] for index in indices],
+        [sample_uids[index] for index in indices],
+        {name: [values[index] for index in indices] for name, values in infos_dict.items()},
+        coverage,
+    )
+
+
 def process_validation_metrics(
     data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
 ) -> dict[str, dict[str, dict[str, float]]]:

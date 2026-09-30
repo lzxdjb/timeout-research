@@ -61,6 +61,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     get_metric_data_with_optional_routed_experts,
     process_validation_metrics,
+    usable_validation_metrics,
 )
 from verl.trainer.ppo.padding_utils import repair_v1_incomplete_rows, upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import (
@@ -1712,22 +1713,26 @@ class PPOTrainer(ABC):
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        core_sources, core_uids, core_infos, coverage = usable_validation_metrics(
+            data_sources, sample_uids, reward_extra_infos_dict
+        )
+        core_metrics = process_validation_metrics(core_sources, core_uids, core_infos) if core_sources else {}
         metric_dict = {}
+        for data_source, counts in coverage.items():
+            for name, value in counts.items():
+                metric_dict[f"val-aux/{data_source}/infrastructure_filter/{name}"] = value
         for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    pfx = f"val-aux/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        for data_source, var2metric2val in core_metrics.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for metric_name, metric_val in var2metric2val.get(core_var, {}).items():
+                n_max = max(int(name.split("@")[-1].split("/")[0]) for name in var2metric2val[core_var])
+                if metric_name.startswith(("mean", "maj", "best")) and f"@{n_max}" in metric_name:
+                    metric_dict[f"val-core/{data_source}/{core_var}/{metric_name}"] = metric_val
 
         # V0 also exposed aggregate protocol/* diagnostics.  Validation keeps
         # the benchmark-scoped val-aux metrics above and adds these compatible
