@@ -58,6 +58,26 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _aggregate_mini_batch_metric_value(value):
+    """Normalize a metric gathered across DP ranks for mini-batch aggregation.
+
+    DP gathering produces a list for every metric. Most existing metrics are
+    lists themselves (one value per micro-batch), while metrics emitted as
+    scalars are gathered into a list of scalars. Only the former should be
+    flattened.
+    """
+    if not isinstance(value, list) or not value:
+        return value
+    if isinstance(value[0], Metric):
+        return Metric.aggregate_dp(value)
+    try:
+        iter(value[0])
+    except TypeError:
+        return value
+    else:
+        return list(chain.from_iterable(value))
+
+
 def _with_routing_replay_flag(enabled: bool):
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
 
@@ -322,11 +342,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     for key, val in output.items():
                         # flattn dp and micro batch
                         if isinstance(val, list):
-                            output[key] = (
-                                Metric.aggregate_dp(val)
-                                if isinstance(val[0], Metric)
-                                else list(chain.from_iterable(val))
-                            )
+                            output[key] = _aggregate_mini_batch_metric_value(val)
                     append_to_dict(metrics, output)
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()

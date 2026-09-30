@@ -25,6 +25,7 @@ def test_rollout_dump_keeps_counts_with_matching_trajectory(monkeypatch, tmp_pat
     }
     data["prompts"].to_padded_tensor.return_value = keys
     data["responses"].to_padded_tensor.return_value = keys
+    data["responses"].offsets.return_value.diff.return_value = torch.tensor([3, 4, 5])
     if with_metadata:
         data["extra_fields"] = np.array(
             [
@@ -58,6 +59,8 @@ def test_rollout_dump_keeps_counts_with_matching_trajectory(monkeypatch, tmp_pat
                 raise error_type("Optional field is unavailable")
             return {"extra_fields": data["extra_fields"]} if with_metadata else {}
         assert "extra_fields" not in kwargs["select_fields"]
+        if kwargs["select_fields"] in (["train_sample_mask"], ["train_exclusion_code"]):
+            raise KeyError("Optional training diagnostics are unavailable")
         return data
 
     monkeypatch.setattr(trainer_base.tq, "kv_batch_get", get)
@@ -67,7 +70,9 @@ def test_rollout_dump_keeps_counts_with_matching_trajectory(monkeypatch, tmp_pat
         PPOTrainer._write_generations(**kwargs, global_steps=7)
 
     trainer._dump_generations = dump
-    PPOTrainer._log_rollout_data(trainer, SimpleNamespace(keys=keys, partition_id="train"), {}, str(tmp_path))
+    PPOTrainer._log_rollout_data(
+        trainer, SimpleNamespace(keys=keys, tags=[{}, {}, {}], partition_id="train"), {}, str(tmp_path)
+    )
     rows = [json.loads(line) for line in (tmp_path / "7.jsonl").read_text().splitlines()]
     assert [row["uid"] for row in rows] == ["a_0_0", "b_0_0", "c_0_0"]
     assert rows[1]["score"] == pytest.approx(0.8)

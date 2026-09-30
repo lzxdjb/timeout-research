@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TARGET_VERL="${TARGET_VERL:-/cpfs01/nlp/leizhengxing/swe/verl}"
-SWE_SOURCE="${SWE_SOURCE:-/cpfs01/nlp/leizhengxing/swe/stock-rl-reflect}"
-MODEL_PATH="${MODEL_PATH:-/cpfs01/nlp/leizhengxing/stock-rl-reflect/data/Qwen3.5-35-A3B}"
+TARGET_VERL="${TARGET_VERL:-/cpfs01/thscc/sharestorage/iwc/HithinkOmni/user_workspace/leizhengxing/leizhengxing/swe/verl}"
+SWE_SOURCE="${SWE_SOURCE:-/cpfs01/thscc/sharestorage/iwc/HithinkOmni/user_workspace/leizhengxing/leizhengxing/swe/stock-rl-reflect}"
+MODEL_PATH="${MODEL_PATH:-/cpfs01/thscc/sharestorage/iwc/HithinkOmni/user_workspace/leizhengxing/leizhengxing/stock-rl-reflect/data/Qwen3.5-35-A3B}"
 
 # Use quoted Hydra lists, for example:
 #   TRAIN_FILES='["/path/train.parquet"]'

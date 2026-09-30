@@ -95,6 +95,7 @@ from verl.trainer.ppo.v1.utils import (
     MetricsAggregator,
     compute_advantage_for_multi_trajectories,
     compute_v1_success_ratio_metrics,
+    compute_v1_trajectory_debug_metrics,
     flatten_v1_extra_fields,
     v1_success_values,
 )
@@ -1588,6 +1589,7 @@ class PPOTrainer(ABC):
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+            response_tokens = data["responses"].offsets().diff().tolist()
             try:
                 extra_fields = tq.kv_batch_get(
                     keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"]
@@ -1603,6 +1605,9 @@ class PPOTrainer(ABC):
             inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
             outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
             scores = data["rm_scores"].sum(dim=1).tolist()
+            successes = v1_success_values(
+                extra_fields.tolist() if extra_fields is not None else [{} for _ in scores], scores
+            )
 
             reward_model = data.pop("reward_model", None)
             if reward_model is not None:
@@ -1626,15 +1631,72 @@ class PPOTrainer(ABC):
             scores = [scores[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            reward_extra_infos_dict["success_value"] = [successes[i] for i in sorted_indices]
+            reward_extra_infos_dict["response_tokens"] = [response_tokens[i] for i in sorted_indices]
+            reward_extra_infos_dict["is_padding"] = [bool(batch.tags[i].get("is_padding", False)) for i in sorted_indices]
+            reward_extra_infos_dict["completion_ratio_cutoff"] = [
+                bool(batch.tags[i].get("completion_ratio_cutoff", False)) for i in sorted_indices
+            ]
+            try:
+                mask_data = tq.kv_batch_get(
+                    keys=batch.keys, partition_id=batch.partition_id, select_fields=["train_sample_mask"]
+                )["train_sample_mask"]
+                train_mask = mask_data.tolist()
+                mask_source = "final_training_mask"
+            except (KeyError, TypeError, ValueError):
+                train_mask = _v1_train_sample_mask_from_tags(batch.keys, batch.tags).tolist()
+                mask_source = "batch_tags_fallback"
+            try:
+                exclusion_codes = tq.kv_batch_get(
+                    keys=batch.keys, partition_id=batch.partition_id, select_fields=["train_exclusion_code"]
+                )["train_exclusion_code"].tolist()
+            except (KeyError, TypeError, ValueError):
+                cutoff_uids = {
+                    key.rsplit("_", 2)[0]
+                    for key, tag in zip(batch.keys, batch.tags, strict=True)
+                    if tag.get("completion_ratio_cutoff", False)
+                }
+                exclusion_codes = [
+                    int(bool(tag.get("is_padding", False)))
+                    | (2 if key.rsplit("_", 2)[0] in cutoff_uids else 0)
+                    | (4 if not bool(tag.get("train_sample_mask", True)) else 0)
+                    for key, tag in zip(batch.keys, batch.tags, strict=True)
+                ]
+            reward_extra_infos_dict["train_sample_mask"] = [bool(train_mask[i]) for i in sorted_indices]
+            reward_extra_infos_dict["train_sample_mask_source"] = [mask_source] * len(sorted_indices)
+            reward_extra_infos_dict["train_exclusion_code"] = [int(exclusion_codes[i]) for i in sorted_indices]
+            reward_extra_infos_dict["train_exclusion_reason"] = [
+                ",".join(
+                    reason
+                    for bit, reason in (
+                        (1, "padding"),
+                        (2, "completion_ratio_cutoff"),
+                        (4, "tag_mask"),
+                        (8, "timeout_prediction"),
+                        (16, "infrastructure_filter"),
+                    )
+                    if int(exclusion_codes[i]) & bit
+                ) or ("other_filter" if not train_mask[i] else "none")
+                for i in sorted_indices
+            ]
             if extra_fields is not None:
                 reward_infos = []
                 for extra in extra_fields.tolist():
                     extra = getattr(extra, "data", extra)
                     info = extra.get("reward_extra_info", {}) if isinstance(extra, dict) else {}
-                    reward_infos.append(info if isinstance(info, dict) else {})
-                diagnostic_keys = {"raw_score", "shaped_score"}
+                    info = info if isinstance(info, dict) else {}
+                    if isinstance(extra, dict):
+                        info = {
+                            **info,
+                            **{key: value for key, value in extra.items() if key.startswith("trajectory_")},
+                        }
+                    reward_infos.append(info)
+                diagnostic_keys = {"raw_score", "shaped_score", "acc"}
                 diagnostic_keys.update(
                     key for info in reward_infos for key in info if key.startswith("partial_hidden_reward_")
+                )
+                diagnostic_keys.update(
+                    key for info in reward_infos for key in info if key.startswith("trajectory_")
                 )
                 for key in sorted(diagnostic_keys):
                     reward_extra_infos_dict[key] = [reward_infos[i].get(key) for i in sorted_indices]
@@ -2265,6 +2327,22 @@ class PPOTrainer(ABC):
         # timeout prediction. Keep it sequence-level so every trajectory in a
         # cancelled group is removed from actor and critic gradients.
         base_train_sample_mask = _v1_train_sample_mask_from_tags(batch.keys, batch.tags)
+        cutoff_uids = {
+            key.rsplit("_", 2)[0]
+            for key, tag in zip(batch.keys, batch.tags, strict=True)
+            if tag.get("completion_ratio_cutoff", False)
+        }
+        # Bit flags retain overlapping exclusions without changing the loss mask.
+        exclusion_codes = torch.tensor(
+            [
+                int(bool(tag.get("is_padding", False)))
+                | (2 if key.rsplit("_", 2)[0] in cutoff_uids else 0)
+                | (4 if not bool(tag.get("train_sample_mask", True)) else 0)
+                for key, tag in zip(batch.keys, batch.tags, strict=True)
+            ],
+            dtype=torch.int64,
+            device=data.batch["response_mask"].device,
+        )
         has_base_exclusions = not bool(base_train_sample_mask.all().item())
         if has_base_exclusions:
             data.batch["train_sample_mask"] = base_train_sample_mask.to(
@@ -2281,10 +2359,14 @@ class PPOTrainer(ABC):
             data.batch["token_level_scores"] = reward_tensor
             base_mask = base_train_sample_mask.to(device=train_sample_mask.device)
             data.batch["train_sample_mask"] = train_sample_mask & base_mask
+            exclusion_codes |= (~train_sample_mask.to(exclusion_codes.device).bool()).long() * 8
             data.batch["rm_scores"] = reward_tensor
             self._update_v1_timeout_predictor(data, prediction_targets)
 
         self._apply_v1_task_filter(data, extra_fields, metrics, direct_fields)
+        task_excluded = data.non_tensor_batch.get("task_filter_excluded")
+        if task_excluded is not None:
+            exclusion_codes |= torch.as_tensor(task_excluded, device=exclusion_codes.device).long() * 16
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -2318,6 +2400,7 @@ class PPOTrainer(ABC):
             norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
             config=self.config.algorithm,
         )
+        metrics.update(data.meta_info.get("grpo_metrics", {}))
 
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]
@@ -2328,7 +2411,7 @@ class PPOTrainer(ABC):
             if "rollout_is_weights" in data.batch:
                 fields.append("rollout_is_weights")
 
-        output = {}
+        output = {"train_exclusion_code": exclusion_codes}
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
         if self.timeout_prediction_enabled or _task_filter_enabled() or "train_sample_mask" in data.batch:
@@ -2641,6 +2724,27 @@ class PPOTrainer(ABC):
             )
         )
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+        try:
+            mask_values = tq.kv_batch_get(
+                keys=rollout_batch.keys,
+                partition_id=rollout_batch.partition_id,
+                select_fields=["train_sample_mask"],
+            )["train_sample_mask"].tolist()
+        except (KeyError, TypeError, ValueError):
+            mask_values = _v1_train_sample_mask_from_tags(rollout_batch.keys, rollout_batch.tags).tolist()
+        metrics.update(
+            compute_v1_trajectory_debug_metrics(
+                batch_keys=rollout_batch.keys,
+                batch_tags=rollout_batch.tags,
+                extra_fields=extra_fields,
+                scores=trajectory_scores,
+                success_values=success_values,
+                response_tokens=response_length.tolist(),
+                train_mask=mask_values,
+                expected_rollout_count=int(self.config.actor_rollout_ref.rollout.n),
+                include_grpo_groups=self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO,
+            )
+        )
         metrics.update(
             compute_v1_success_ratio_metrics(
                 batch_keys=rollout_batch.keys,

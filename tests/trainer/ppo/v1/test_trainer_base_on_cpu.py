@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -26,6 +28,7 @@ from verl.trainer.ppo.v1.trainer_base import (
     _resolve_v1_sequence_lengths,
     _v1_train_sample_mask_from_tags,
 )
+from verl.utils import tensordict_utils as tu
 
 
 class _StubTrainer(PPOTrainer):
@@ -117,6 +120,97 @@ def test_v1_cutoff_mask_excludes_entire_uid_group_and_padding() -> None:
     ]
 
     assert _v1_train_sample_mask_from_tags(keys, tags).tolist() == [False, False, True, False]
+
+
+@pytest.mark.parametrize("persisted", [False, True])
+def test_rollout_debug_dump_keeps_sorted_row_alignment(tmp_path, persisted):
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.tokenizer = SimpleNamespace(pad_token_id=0, decode=lambda ids, **_kwargs: str(ids.tolist()))
+    batch = KVBatchMeta(
+        partition_id="train", keys=["z_0_0", "a_1_0", "a_0_0"],
+        tags=[{}, {}, {"completion_ratio_cutoff": True}],
+    )
+    trainer._dump_generations = lambda **kwargs: trainer._write_generations(**kwargs, global_steps=7)
+
+    def fake_get(**kwargs):
+        fields = kwargs["select_fields"]
+        if fields == ["extra_fields"]:
+            return {"extra_fields": SimpleNamespace(tolist=lambda: [
+                {"reward_extra_info": {"acc": 1}, "trajectory_tool_dispatches": 5},
+                {"reward_extra_info": {"acc": 0}, "trajectory_tool_dispatches": 6},
+                {"reward_extra_info": {"acc": 0.5}, "trajectory_tool_dispatches": 7},
+            ])}
+        if fields == ["train_sample_mask"]:
+            if not persisted:
+                raise KeyError("train_sample_mask")
+            return {"train_sample_mask": torch.tensor([True, False, False])}
+        if fields == ["train_exclusion_code"]:
+            if not persisted:
+                raise KeyError("train_exclusion_code")
+            return {"train_exclusion_code": torch.tensor([0, 18, 2])}
+        return {
+            "uid": torch.tensor([0, 1, 2]),
+            "prompts": torch.nested.nested_tensor([torch.tensor([1])] * 3, layout=torch.jagged),
+            "responses": torch.nested.nested_tensor([
+                torch.tensor([9]), torch.tensor([2, 3]), torch.tensor([4, 5, 6]),
+            ], layout=torch.jagged),
+            "rm_scores": torch.tensor([[0.1], [0.2], [0.3]]),
+        }
+
+    with patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get", side_effect=fake_get):
+        trainer._log_rollout_data(batch, {}, str(tmp_path))
+    rows = [json.loads(line) for line in (tmp_path / "7.jsonl").read_text().splitlines()]
+    assert [row["uid"] for row in rows] == ["a_0_0", "a_1_0", "z_0_0"]
+    assert [row["response_tokens"] for row in rows] == [3, 2, 1]
+    assert [row["trajectory_tool_dispatches"] for row in rows] == [7, 6, 5]
+    assert [row["success_value"] for row in rows] == [0.5, 0, 1]
+    assert [row["train_sample_mask"] for row in rows] == [False, False, True]
+    assert rows[1]["train_exclusion_reason"] == (
+        "completion_ratio_cutoff,infrastructure_filter" if persisted else "completion_ratio_cutoff"
+    )
+
+
+def test_advantage_queue_write_preserves_exclusion_codes_and_loss_mask(monkeypatch):
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.timeout_prediction_enabled = False
+    trainer.config = OmegaConf.create({
+        "algorithm": {"adv_estimator": "grpo", "use_kl_in_reward": False, "gamma": 1, "lam": 1},
+        "actor_rollout_ref": {"rollout": {"n": 2}},
+    })
+    keys = [f"{group}_{session}_0" for group in ("cutoff", "infra", "keep") for session in range(2)]
+    batch = KVBatchMeta(partition_id="train", keys=keys, tags=[{"completion_ratio_cutoff": True}] + [{}] * 5)
+    queue_data = tu.get_tensordict(
+        {
+            "uid": torch.tensor([0, 0, 1, 1, 2, 2]),
+            "response_mask": torch.nested.nested_tensor([torch.tensor([1, 1])] * 6, layout=torch.jagged),
+            "rm_scores": torch.nested.nested_tensor([
+                torch.tensor([0.0, float(i % 2)]) for i in range(6)
+            ], layout=torch.jagged),
+            "extra_fields": [
+                {"reward_extra_info": {"observed_infrastructure_failure": int(i == 2)}} for i in range(6)
+            ],
+        },
+    )
+    monkeypatch.setenv("SWE_AGENT_TASK_FILTER_TRAINING_ENABLED", "1")
+    monkeypatch.setenv("SWE_AGENT_TASK_FILTER_MIN_GROUP_ATTEMPTS", "2")
+    monkeypatch.setenv("SWE_AGENT_TASK_FILTER_INFRA_RATIO_THRESHOLD", "0.25")
+
+    def get(**kwargs):
+        if len(kwargs["select_fields"]) == 1:
+            raise KeyError(kwargs["select_fields"][0])
+        return queue_data
+
+    metrics = {}
+    with (
+        patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get", side_effect=get),
+        patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_put", return_value=batch) as put,
+    ):
+        trainer._compute_advantage(batch, metrics)
+    output = put.call_args.kwargs["fields"]
+    assert output["train_exclusion_code"].dtype == torch.int64
+    assert output["train_exclusion_code"].tolist() == [2, 2, 16, 16, 0, 0]
+    assert output["train_sample_mask"].tolist() == [False, False, False, False, True, True]
+    assert metrics["grpo/mixed_groups"] == 3
 
 
 @pytest.mark.parametrize("retained", [False, True])

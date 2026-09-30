@@ -22,11 +22,111 @@ down the per-key aggregation rules (weighted mean/sum/max/min/last/time_sum).
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
+from verl.protocol import DataProto
+from verl.trainer.ppo.core_algos import AdvantageEstimator
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
-from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_v1_success_ratio_metrics, flatten_v1_extra_fields
+from verl.trainer.ppo.v1.utils import (
+    MetricsAggregator,
+    compute_advantage_for_multi_trajectories,
+    compute_v1_success_ratio_metrics,
+    compute_v1_trajectory_debug_metrics,
+    flatten_v1_extra_fields,
+)
+
+
+def test_multi_output_advantages_preserve_grpo_diagnostics():
+    data = DataProto.from_dict(
+        tensors={
+            "response_mask": torch.ones(3, 1),
+            "token_level_rewards": torch.tensor([[99.0], [1.0], [0.0]]),
+        },
+        non_tensors={"uid": np.array(["a", "a", "a"])},
+        meta_info={"row_metadata": [1, 2, 3]},
+    )
+    result = compute_advantage_for_multi_trajectories(
+        data, batch_keys=["a_0_0", "a_0_1", "a_1_0"], adv_estimator=AdvantageEstimator.GRPO,
+        num_repeat=2,
+    )
+    assert result.meta_info["grpo_metrics"]["grpo/mixed_groups"] == 1
+    assert result.meta_info["row_metadata"] == [1, 2, 3]
+    assert result.batch["advantages"][0].item() == pytest.approx(result.batch["advantages"][1].item())
+
+
+def test_trajectory_debug_uses_final_sessions_and_actual_mask():
+    keys = ["a_0_0", "a_0_1", "a_1_0", "b_0_0", "b_1_0", "pad_0_0"]
+    metrics = compute_v1_trajectory_debug_metrics(
+        batch_keys=keys,
+        batch_tags=[{}, {}, {}, {}, {}, {"is_padding": True}],
+        extra_fields=[{"trajectory_tool_dispatches": value} for value in (999, 2, 4, 10, 20, 999)],
+        scores=[100, 1, 0, 1, 1, 100],
+        success_values=[1, 1, 0, 1, 1, 1],
+        response_tokens=[999, 10, 30, 40, 50, 999],
+        train_mask=[True, True, True, False, False, False],
+        expected_rollout_count=2,
+        include_grpo_groups=True,
+    )
+    assert metrics["trajectory_debug/final_sessions"] == 4
+    assert metrics["trajectory_debug/trainable_sessions"] == 2
+    assert metrics["trajectory_debug/trainable_token_fraction"] == pytest.approx(40 / 130)
+    assert metrics["trajectory_debug/trainable/trajectory_tool_dispatches_mean"] == 3
+    assert metrics["trajectory_debug/success/response_tokens_mean"] == 10
+    assert metrics["trajectory_debug/failure/response_tokens_mean"] == 30
+    assert metrics["trajectory_debug/grpo_complete_groups"] == 2
+    assert metrics["trajectory_debug/grpo_trainable_complete_groups"] == 1
+    assert metrics["trajectory_debug/grpo_trainable_mixed_groups"] == 1
+
+
+def test_trajectory_debug_complete_constant_groups_and_missing_metadata():
+    metrics = compute_v1_trajectory_debug_metrics(
+        batch_keys=["a_0_0", "a_1_0", "b_0_0"], batch_tags=[{}, {}, {}],
+        extra_fields=[{}, {}, {}], scores=[1, 1, 0], success_values=[None, None, None],
+        response_tokens=[10, 10, 10], train_mask=[True, True, True],
+        expected_rollout_count=2, include_grpo_groups=True,
+    )
+    assert metrics["trajectory_debug/grpo_complete_groups"] == 1
+    assert metrics["trajectory_debug/grpo_trainable_constant_groups"] == 1
+    assert metrics["trajectory_debug/grpo_trainable_mixed_fraction"] == 0
+    assert metrics["trajectory_debug/success/count"] == 0
+    assert "trajectory_debug/all/trajectory_tool_dispatches_mean" not in metrics
+
+
+def test_trajectory_debug_success_split_uses_verifier_not_shaped_reward():
+    metrics = compute_v1_trajectory_debug_metrics(
+        batch_keys=["a_0_0", "a_1_0"], batch_tags=[{}, {}],
+        extra_fields=[{"reward_extra_info": {"raw_score": 0}}, {"reward_extra_info": {"raw_score": 1}}],
+        scores=[0.5, 0.5], success_values=[0.5, 0.5], response_tokens=[10, 20],
+        train_mask=[True, True], expected_rollout_count=2, include_grpo_groups=True,
+    )
+    assert metrics["trajectory_debug/success/response_tokens_mean"] == 20
+    assert metrics["trajectory_debug/failure/response_tokens_mean"] == 10
+
+
+def test_trajectory_debug_aggregation_sums_counts_and_tokens():
+    agg = MetricsAggregator()
+    for count, tokens, active_tokens, mean, groups, mixed in (
+        (1, 1000, 0, 10, 1, 0), (3, 30, 30, 2, 3, 3),
+    ):
+        agg.add_step_metrics({
+            "trajectory_debug/all/count": count,
+            "trajectory_debug/all/response_tokens_mean": mean,
+            "trajectory_debug/all_response_tokens_total": tokens,
+            "trajectory_debug/trainable_response_tokens_total": active_tokens,
+            "trajectory_debug/trainable_token_fraction": active_tokens / tokens,
+            "trajectory_debug/grpo_trainable_complete_groups": groups,
+            "trajectory_debug/grpo_trainable_mixed_groups": mixed,
+            "trajectory_debug/grpo_trainable_mixed_fraction": mixed / groups,
+            "grpo/constant_groups": groups - mixed,
+        }, sample_count=100)
+    result = agg.get_aggregated_metrics()
+    assert result["trajectory_debug/all/count"] == 4
+    assert result["trajectory_debug/all/response_tokens_mean"] == 4
+    assert result["trajectory_debug/trainable_token_fraction"] == pytest.approx(30 / 1030)
+    assert result["trajectory_debug/grpo_trainable_mixed_fraction"] == pytest.approx(0.75)
+    assert result["grpo/constant_groups"] == 1
 
 
 def test_empty_aggregator_returns_empty():

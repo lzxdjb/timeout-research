@@ -28,6 +28,11 @@ _SUCCESS_RATIO_VARIANTS = (
     "excluding_completion_cutoff_and_infrastructure",
 )
 
+_TRAJECTORY_TOOL_NAMES = (
+    "repo_status", "read_file", "search_files", "search_text", "write_file", "apply_patch",
+    "run_shell", "run_tests", "build_project", "Bash", "Read", "Write", "Edit", "Glob", "Grep",
+)
+
 
 def _optional_finite_float(value: Any) -> float | None:
     """Return a finite scalar, or ``None`` for missing/non-numeric metadata."""
@@ -94,6 +99,115 @@ def flatten_v1_extra_fields(extra_fields: list[Any]) -> dict[str, np.ndarray]:
         key: np.asarray([row.get(key) for row in rows], dtype=object)
         for key in keys
     }
+
+
+def compute_v1_trajectory_debug_metrics(
+    *,
+    batch_keys: list[str],
+    batch_tags: list[dict[str, Any]],
+    extra_fields: list[Any],
+    scores: list[float],
+    success_values: list[float | None],
+    response_tokens: list[float],
+    train_mask: list[bool],
+    expected_rollout_count: int,
+    include_grpo_groups: bool,
+) -> dict[str, float]:
+    """Summarize final trajectory sessions with their actual training eligibility."""
+    size = len(batch_keys)
+    if not all(
+        len(values) == size
+        for values in (batch_tags, extra_fields, scores, success_values, response_tokens, train_mask)
+    ):
+        raise ValueError("V1 trajectory diagnostics require one value per batch row")
+    final_sessions: dict[tuple[str, str], tuple[int, int]] = {}
+    for row, (key, tag) in enumerate(zip(batch_keys, batch_tags, strict=True)):
+        if tag.get("is_padding", False):
+            continue
+        parts = key.rsplit("_", 2)
+        if len(parts) == 3:
+            uid, session_id = parts[:2]
+            try:
+                output_index = int(parts[2])
+            except ValueError:
+                output_index = 0
+        else:
+            uid, session_id, output_index = key, "0", 0
+        session = (uid, session_id)
+        if session not in final_sessions or output_index > final_sessions[session][0]:
+            final_sessions[session] = (output_index, row)
+
+    rows = [row for _, row in final_sessions.values()]
+    active = [row for row in rows if bool(train_mask[row])]
+    all_response_tokens = float(sum(response_tokens[row] for row in rows))
+    trainable_response_tokens = float(sum(response_tokens[row] for row in active))
+    metrics: dict[str, float] = {
+        "trajectory_debug/final_sessions": float(len(rows)),
+        "trajectory_debug/trainable_sessions": float(len(active)),
+        "trajectory_debug/excluded_sessions": float(len(rows) - len(active)),
+        "trajectory_debug/all_response_tokens_total": all_response_tokens,
+        "trajectory_debug/trainable_response_tokens_total": trainable_response_tokens,
+        "trajectory_debug/trainable_token_fraction": (
+            trainable_response_tokens / all_response_tokens if all_response_tokens else 0.0
+        ),
+    }
+
+    def field(row: int, name: str) -> float | None:
+        extra = getattr(extra_fields[row], "data", extra_fields[row])
+        if not isinstance(extra, dict):
+            return None
+        value = extra.get(name)
+        if value is None and isinstance(extra.get("reward_extra_info"), dict):
+            value = extra["reward_extra_info"].get(name)
+        return _optional_finite_float(value)
+
+    # A positive shaped/partial reward is not proof that the task was solved.
+    def solved(row: int) -> bool | None:
+        value = field(row, "raw_score")
+        if value is None:
+            value = _optional_finite_float(success_values[row])
+        return value >= 1.0 if value is not None and 0.0 <= value <= 1.0 else None
+
+    outcomes = {row: solved(row) for row in active}
+    successes = [row for row in active if outcomes[row] is True]
+    failures = [row for row in active if outcomes[row] is False]
+    for label, selected in (("all", rows), ("trainable", active), ("success", successes), ("failure", failures)):
+        metrics[f"trajectory_debug/{label}/count"] = float(len(selected))
+        if not selected:
+            continue
+        metrics[f"trajectory_debug/{label}/response_tokens_mean"] = float(
+            np.mean([response_tokens[row] for row in selected])
+        )
+        for name in (
+            "trajectory_assistant_tokens", "trajectory_observation_tokens", "trajectory_tool_dispatches",
+            "trajectory_tool_returns", "trajectory_tool_call_exceptions", "trajectory_tool_error_returns",
+            "trajectory_bash_dispatches", "trajectory_repeated_bash_dispatches", "trajectory_budget_reached",
+            *(f"trajectory_tool_{name}_dispatches" for name in _TRAJECTORY_TOOL_NAMES),
+        ):
+            values = [field(row, name) for row in selected]
+            valid = [value for value in values if value is not None and value >= 0]
+            if valid:
+                key = f"trajectory_debug/{label}/{name}_mean"
+                metrics[key] = float(np.mean(valid))
+                metrics[f"{key}_eligible_count"] = float(len(valid))
+
+    if include_grpo_groups:
+        groups: dict[str, list[int]] = defaultdict(list)
+        for (uid, _session_id), (_output_index, row) in final_sessions.items():
+            groups[uid].append(row)
+        complete = [group for group in groups.values() if len(group) == expected_rollout_count]
+        trainable = [group for group in complete if all(bool(train_mask[row]) for row in group)]
+        mixed = sum(len({float(scores[row]) for row in group}) > 1 for group in trainable)
+        metrics.update(
+            {
+                "trajectory_debug/grpo_complete_groups": float(len(complete)),
+                "trajectory_debug/grpo_trainable_complete_groups": float(len(trainable)),
+                "trajectory_debug/grpo_trainable_mixed_groups": float(mixed),
+                "trajectory_debug/grpo_trainable_constant_groups": float(len(trainable) - mixed),
+                "trajectory_debug/grpo_trainable_mixed_fraction": float(mixed / len(trainable)) if trainable else 0.0,
+            }
+        )
+    return metrics
 
 
 def compute_v1_success_ratio_metrics(
@@ -289,6 +403,15 @@ class MetricsAggregator:
 
     def _get_metric_weight(self, metric_name: str, metrics: dict[str, Any], sample_count: int) -> int:
         """Return the sample weight used when reducing per-iteration average metrics."""
+        if metric_name.startswith("trajectory_debug/") and metric_name.endswith("_mean"):
+            label = metric_name.split("/", 2)[1]
+            return int(
+                metrics.get(
+                    f"{metric_name}_eligible_count", metrics.get(f"trajectory_debug/{label}/count", sample_count)
+                )
+            )
+        if metric_name == "trajectory_debug/grpo_trainable_mixed_fraction":
+            return int(metrics.get("trajectory_debug/grpo_trainable_complete_groups", sample_count))
         if "/success_ratio/" in metric_name and metric_name.rsplit("/", 1)[-1] in _SUCCESS_RATIO_VARIANTS:
             eligible_count = metrics.get(f"{metric_name}_eligible_count", sample_count)
             if isinstance(eligible_count, torch.Tensor):
@@ -312,6 +435,16 @@ class MetricsAggregator:
         return sample_count
 
     def _get_aggregation_type(self, metric_name: str) -> str:
+        if metric_name.startswith("grpo/") and metric_name.endswith("_groups"):
+            return "sum"
+        if metric_name.startswith("trajectory_debug/") and (
+            metric_name.endswith("/count")
+            or metric_name.endswith("_groups")
+            or metric_name.endswith("_sessions")
+            or metric_name.endswith("_total")
+            or metric_name.endswith("_eligible_count")
+        ):
+            return "sum"
         for agg_type, metric_list in self.aggregation_rules.items():
             if metric_name in metric_list:
                 return agg_type
@@ -365,6 +498,11 @@ class MetricsAggregator:
 
     def _special_metrics_aggregate(self, aggregated: dict[str, Any]) -> dict[str, Any]:
         """Recompute derived metrics that cannot be reduced from their per-iteration values."""
+        if "trajectory_debug/all_response_tokens_total" in aggregated:
+            total = aggregated["trajectory_debug/all_response_tokens_total"]
+            aggregated["trajectory_debug/trainable_token_fraction"] = (
+                aggregated.get("trajectory_debug/trainable_response_tokens_total", 0.0) / total if total else 0.0
+            )
         if {"global_seqlen/minmax_diff", "global_seqlen/max", "global_seqlen/min"}.issubset(aggregated):
             aggregated["global_seqlen/minmax_diff"] = aggregated["global_seqlen/max"] - aggregated["global_seqlen/min"]
 
@@ -437,6 +575,8 @@ def compute_advantage_for_multi_trajectories(
         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         config=config,
     )
+    if "grpo_metrics" in final_data.meta_info:
+        data.meta_info["grpo_metrics"] = final_data.meta_info["grpo_metrics"]
     first_nnz_indices = final_data.batch["response_mask"].argmax(dim=1)
     final_scores = final_data.batch["advantages"][torch.arange(len(final_data)), first_nnz_indices]
 
