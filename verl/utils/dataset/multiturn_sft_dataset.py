@@ -187,7 +187,7 @@ class MultiTurnSFTDataset(Dataset):
     def _process_single_message(
         self,
         index: int,
-        message: dict[str, Any],
+        message: dict[str, Any] | list[dict[str, Any]],
         full_message: list,
         tools: Optional[list[dict[str, Any]]] = None,
         enable_thinking: Optional[bool] = None,
@@ -211,9 +211,11 @@ class MultiTurnSFTDataset(Dataset):
         if enable_thinking is not None:
             apply_chat_template_kwargs["enable_thinking"] = enable_thinking
 
+        messages = message if isinstance(message, list) else [message]
+        role = messages[-1]["role"]
         inputs = apply_chat_template(
             processor,
-            messages=[message],
+            messages=messages,
             tools=tools,
             add_generation_prompt=False,
             tokenize=True,
@@ -227,11 +229,11 @@ class MultiTurnSFTDataset(Dataset):
         attention_mask = inputs.pop("attention_mask")[0]
 
         # remove system prompt if exists
-        if index != 0 and message["role"] != "system":
+        if index != 0 and role != "system":
             input_ids = input_ids[len(self.system_prompt) :]
             attention_mask = attention_mask[len(self.system_prompt) :]
 
-        if message["role"] == "assistant":
+        if role == "assistant":
             loss_mask = torch.ones_like(attention_mask)
             # mask out generation prompt if assistant message
             loss_mask[: len(self.generation_prompt)] = 0
@@ -300,7 +302,16 @@ class MultiTurnSFTDataset(Dataset):
 
         # 1. tokenize each message
         input_ids, loss_mask, attention_mask, multi_modal_inputs = [], [], [], {}
-        for i, message in enumerate(messages):
+        indexed_messages: list[tuple[int, dict[str, Any] | list[dict[str, Any]]]] = list(enumerate(messages))
+        if messages and messages[0]["role"] == "system":
+            if len(messages) < 2 or messages[1]["role"] != "user":
+                raise ValueError("A leading system message must be followed by a user message")
+            # Some templates, including Qwen3.5, reject a system-only render.
+            # System and first user are both prompt tokens, so render them as
+            # one zero-loss group and keep the remaining per-turn path intact.
+            indexed_messages = [(0, messages[:2]), *list(enumerate(messages[2:], start=2))]
+
+        for i, message in indexed_messages:
             _input_ids, _loss_mask, _attention_mask, _inputs = self._process_single_message(
                 index=i,
                 message=message,

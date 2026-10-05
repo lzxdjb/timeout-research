@@ -256,8 +256,15 @@ def _resolve_v1_sequence_lengths(batch: KVBatchMeta) -> torch.Tensor:
     return torch.tensor(lengths, dtype=torch.int64)
 
 
-def _v1_train_sample_mask_from_tags(keys: list[str], tags: list[dict]) -> torch.Tensor:
-    """Build the sequence-level mask for cutoff, padding, and explicitly excluded rows."""
+def _v1_train_sample_mask_from_tags(
+    keys: list[str], tags: list[dict], *, exclude_cutoff: bool = True
+) -> torch.Tensor:
+    """Build the sequence-level mask for cutoff, padding, and explicit exclusions.
+
+    Timeout prediction needs to see materialized completion-cutoff rows so its
+    confidence decision can retain or reject them. Callers that do not enable
+    that predictor keep the historical whole-group cutoff exclusion.
+    """
     cutoff_uids = {
         str(key).rsplit("_", 2)[0]
         for key, tag in zip(keys, tags, strict=True)
@@ -268,7 +275,7 @@ def _v1_train_sample_mask_from_tags(keys: list[str], tags: list[dict]) -> torch.
         tag = tag if isinstance(tag, dict) else {}
         uid = str(key).rsplit("_", 2)[0]
         keep.append(
-            uid not in cutoff_uids
+            (not exclude_cutoff or uid not in cutoff_uids)
             and not bool(tag.get("is_padding", False))
             and bool(tag.get("train_sample_mask", True))
         )
@@ -2328,10 +2335,14 @@ class PPOTrainer(ABC):
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
 
-        # Completion-ratio cancellation is a training exclusion independent of
-        # timeout prediction. Keep it sequence-level so every trajectory in a
-        # cancelled group is removed from actor and critic gradients.
-        base_train_sample_mask = _v1_train_sample_mask_from_tags(batch.keys, batch.tags)
+        # A completion-ratio cutoff is normally a whole-group exclusion. When
+        # timeout prediction is enabled, defer that decision to the predictor;
+        # otherwise cutoff rows would be masked before it can score them.
+        base_train_sample_mask = _v1_train_sample_mask_from_tags(
+            batch.keys,
+            batch.tags,
+            exclude_cutoff=not self.timeout_prediction_enabled,
+        )
         cutoff_uids = {
             key.rsplit("_", 2)[0]
             for key, tag in zip(batch.keys, batch.tags, strict=True)

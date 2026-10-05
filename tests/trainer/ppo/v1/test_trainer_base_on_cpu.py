@@ -120,6 +120,51 @@ def test_v1_cutoff_mask_excludes_entire_uid_group_and_padding() -> None:
     ]
 
     assert _v1_train_sample_mask_from_tags(keys, tags).tolist() == [False, False, True, False]
+    assert _v1_train_sample_mask_from_tags(
+        keys, tags, exclude_cutoff=False
+    ).tolist() == [True, True, True, False]
+
+
+def test_timeout_prediction_can_admit_completion_cutoff_rows():
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.timeout_prediction_enabled = True
+    trainer.config = OmegaConf.create({
+        "algorithm": {"adv_estimator": "grpo", "use_kl_in_reward": False, "gamma": 1, "lam": 1},
+        "actor_rollout_ref": {"rollout": {"n": 2}},
+    })
+    keys = ["cutoff_0_0", "cutoff_1_0"]
+    batch = KVBatchMeta(
+        partition_id="train",
+        keys=keys,
+        tags=[{"completion_ratio_cutoff": True}, {"completion_ratio_cutoff": True}],
+    )
+    queue_data = tu.get_tensordict(
+        {
+            "uid": torch.tensor([0, 0]),
+            "response_mask": torch.nested.nested_tensor([torch.tensor([1, 1])] * 2, layout=torch.jagged),
+            "rm_scores": torch.nested.nested_tensor([torch.tensor([0.0, -0.1])] * 2, layout=torch.jagged),
+            "old_log_probs": torch.nested.nested_tensor([torch.tensor([0.0, 0.0])] * 2, layout=torch.jagged),
+            "extra_fields": [{"reward_extra_info": {"observed_infrastructure_failure": 0}}] * 2,
+        },
+    )
+
+    def get(**kwargs):
+        return queue_data
+
+    def admit_cutoff_rows(data, tags, extra_fields, direct_fields=None):
+        rows = len(tags)
+        return data.batch["rm_scores"], torch.ones(rows, dtype=torch.bool), torch.zeros(rows, dtype=torch.bool)
+
+    trainer._apply_v1_timeout_prediction = admit_cutoff_rows
+    trainer._update_v1_timeout_predictor = lambda data, mask: None
+    metrics = {}
+    with (
+        patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get", side_effect=get),
+        patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_put", return_value=batch) as put,
+    ):
+        trainer._compute_advantage(batch, metrics)
+
+    assert put.call_args.kwargs["fields"]["train_sample_mask"].tolist() == [True, True]
 
 
 @pytest.mark.parametrize("persisted", [False, True])
