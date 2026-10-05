@@ -105,6 +105,34 @@ def test_trajectory_debug_success_split_uses_verifier_not_shaped_reward():
     assert metrics["trajectory_debug/failure/response_tokens_mean"] == 10
 
 
+def test_trajectory_debug_exports_mutation_aware_repeat_counters():
+    metrics = compute_v1_trajectory_debug_metrics(
+        batch_keys=["a_0_0"],
+        batch_tags=[{}],
+        extra_fields=[
+            {
+                "trajectory_penalized_repeated_tool_calls": 2,
+                "trajectory_repeats_suppressed_after_mutation": 3,
+                "trajectory_repeats_suppressed_after_error": 4,
+                "trajectory_repeats_suppressed_outside_window": 5,
+                "trajectory_repeats_suppressed_inflight": 6,
+            }
+        ],
+        scores=[1],
+        success_values=[1],
+        response_tokens=[10],
+        train_mask=[True],
+        expected_rollout_count=1,
+        include_grpo_groups=True,
+    )
+
+    assert metrics["trajectory_debug/all/trajectory_penalized_repeated_tool_calls_mean"] == 2
+    assert metrics["trajectory_debug/all/trajectory_repeats_suppressed_after_mutation_mean"] == 3
+    assert metrics["trajectory_debug/all/trajectory_repeats_suppressed_after_error_mean"] == 4
+    assert metrics["trajectory_debug/all/trajectory_repeats_suppressed_outside_window_mean"] == 5
+    assert metrics["trajectory_debug/all/trajectory_repeats_suppressed_inflight_mean"] == 6
+
+
 def test_trajectory_debug_aggregation_sums_counts_and_tokens():
     agg = MetricsAggregator()
     for count, tokens, active_tokens, mean, groups, mixed in (

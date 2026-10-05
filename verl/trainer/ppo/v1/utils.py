@@ -182,6 +182,10 @@ def compute_v1_trajectory_debug_metrics(
             "trajectory_assistant_tokens", "trajectory_observation_tokens", "trajectory_tool_dispatches",
             "trajectory_tool_returns", "trajectory_tool_call_exceptions", "trajectory_tool_error_returns",
             "trajectory_bash_dispatches", "trajectory_repeated_bash_dispatches", "trajectory_repeated_tool_calls",
+            "trajectory_penalized_repeated_tool_calls", "trajectory_repeats_suppressed_after_mutation",
+            "trajectory_repeats_suppressed_after_error", "trajectory_repeats_suppressed_outside_window",
+            "trajectory_repeats_suppressed_inflight", "trajectory_repeated_tool_read_window",
+            "trajectory_repeated_tool_exec_window",
             "trajectory_budget_reached",
             *(f"trajectory_tool_{name}_dispatches" for name in _TRAJECTORY_TOOL_NAMES),
         ):

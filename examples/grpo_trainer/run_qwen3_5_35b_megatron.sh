@@ -211,7 +211,7 @@ esac
 
 ########################### Launch ###########################
 
-python3 -m verl.trainer.main_ppo \
+python3 -m "${VERL_TRAINER_MODULE:-verl.trainer.main_ppo}" \
     "${DATA[@]}" \
     "${ALGORITHM[@]}" \
     "${MODEL[@]}" \
