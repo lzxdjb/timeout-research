@@ -19,6 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+_SWE_REPO_ROOT = Path(__file__).resolve().parents[2] / "stock-rl-reflect"
+if str(_SWE_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SWE_REPO_ROOT))
+from recipe.swe_agent.repeated_tool import replay_tool_calls
+
 
 DEFAULT_RUNS = (
     "fix_tool_bug_small_lr_new_data",
@@ -26,7 +31,10 @@ DEFAULT_RUNS = (
     "fix_tool_super_long",
 )
 
-PATH_POLICY_RE = re.compile(r"repository-relative paths? only", re.IGNORECASE)
+PATH_POLICY_RE = re.compile(
+    r"repository-relative paths?\s+(?:(?:are|as)\s+)?(?:the\s+)?only",
+    re.IGNORECASE,
+)
 PATH_REJECTION_RE = re.compile(
     r"(?:path rejected\s*:|absolute paths?\b[^\n]{0,120}\bnot allowed|"
     r"path escapes workspace)",
@@ -36,9 +44,15 @@ MARKER_RE = re.compile(r"(?m)^(assistant|user)\n")
 TOOL_BLOCK_RE = re.compile(r"<function=([^>\n]+)>(.*?)</function>", re.DOTALL)
 TOOL_RESPONSE_RE = re.compile(r"<tool_response>(.*?)</tool_response>", re.DOTALL)
 PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
-VERIFY_RE = re.compile(r"<parameter=verification>\s*true\s*</parameter>", re.IGNORECASE)
 ABSOLUTE_PATH_PARAM_NAMES = {"file_path", "path", "directory"}
-MUTATING_TOOLS = {"edit", "write", "apply_patch", "write_file"}
+MUTATING_TOOLS = {"edit", "write", "edit_file", "apply_patch", "write_file"}
+TOOL_ERROR_PREFIXES = (
+    "Remote execution error:",
+    "Error executing tool",
+    "Error when executing tool:",
+    "Unknown function '",
+    "Invalid JSON in arguments for '",
+)
 SHELL_MUTATION_RE = re.compile(
     r"(?:\bsed\s+-i\b|\bperl\s+-i\b|\bpython(?:3)?\b.*(?:write|open\(|Path\().*['\"]w|"
     r"\bruby\b.*File\.write|\btee\s+[^|])",
@@ -72,24 +86,34 @@ class Candidate:
     response_tokens: int
     tool_dispatches: int
     repeated_bash_dispatches: int
+    raw_exact_repeat_count: int
+    penalized_repeat_count: int
+    repeats_suppressed_after_mutation: int
+    repeats_suppressed_after_error: int
+    repeats_suppressed_outside_window: int
+    repeats_suppressed_inflight: int
+    repeat_detection_mode: str
+    repeat_detection_source: str
     tool_error_returns: int
     has_verification: bool
     mutation_evidence: bool
+    submission_check: str
     messages: list[dict[str, str]]
     input_text: str
     output_text: str
     transcript_hash: str
 
     @property
-    def quality_key(self) -> tuple[int, int, int, int, int, str, int]:
+    def quality_key(self) -> tuple[int, int, int, int, int, int, str, int]:
         """Lower is better; prefer protocol-complete and concise traces."""
 
         return (
+            self.penalized_repeat_count,
             0 if self.has_verification else 1,
-            self.repeated_bash_dispatches,
             self.tool_error_returns,
             self.tool_dispatches,
             self.response_tokens,
+            self.raw_exact_repeat_count,
             self.source_run,
             self.source_step if self.source_step is not None else sys.maxsize,
         )
@@ -111,6 +135,21 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    return None
 
 
 def _gts_fields(row: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -190,19 +229,144 @@ def _parse_output(output_text: str) -> list[dict[str, str]]:
     return messages
 
 
-def _tool_metrics(output_text: str) -> dict[str, Any]:
-    # Tool responses may contain arbitrary repository text, including strings
-    # that resemble the XML call format.  Count only calls emitted by the
-    # assistant, while keeping response text available to path diagnostics.
-    assistant_text = TOOL_RESPONSE_RE.sub("", output_text)
-    blocks = list(TOOL_BLOCK_RE.finditer(assistant_text))
+def _tool_call(block: re.Match[str]) -> dict[str, Any]:
+    name = block.group(1).strip()
+    parameters = {key: value.strip() for key, value in PARAM_RE.findall(block.group(2))}
+    verification = name == "run_tests" or (
+        name in {"Bash", "run_shell"}
+        and parameters.get("verification", "").strip().lower() == "true"
+    )
+    command = parameters.get("command", "")
+    may_mutate = name.lower() in MUTATING_TOOLS or (
+        name.lower() in {"bash", "run_shell"}
+        and not verification
+        and bool(SHELL_MUTATION_RE.search(command))
+    )
+    canonical_parameters = dict(parameters)
+    if name.lower() in {"bash", "run_shell"} and isinstance(canonical_parameters.get("command"), str):
+        canonical_parameters["command"] = canonical_parameters["command"].strip()
+    canonical = json.dumps(canonical_parameters, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return {
+        "name": name,
+        "parameters": parameters,
+        "fingerprint": hashlib.sha256(f"{name}\0{canonical}".encode()).digest(),
+        "verification": verification,
+        "may_mutate": may_mutate,
+    }
+
+
+def _response_succeeded(response: str) -> bool:
+    return not response.strip().startswith(TOOL_ERROR_PREFIXES)
+
+
+def _reconstructed_repeat_metrics(
+    messages: list[dict[str, str]],
+    *,
+    read_window: int,
+    exec_window: int,
+) -> dict[str, Any]:
+    seen: set[bytes] = set()
+    seen_bash: set[bytes] = set()
+    events: list[dict[str, Any]] = []
+    result = {
+        "raw_exact_repeat_count": 0,
+        "raw_exact_bash_repeat_count": 0,
+        "penalized_repeat_count": 0,
+        "repeats_suppressed_after_mutation": 0,
+        "repeats_suppressed_after_error": 0,
+        "repeats_suppressed_outside_window": 0,
+        "repeats_suppressed_inflight": 0,
+    }
+
+    for message_index, message in enumerate(messages):
+        if message["role"] != "assistant":
+            continue
+        responses: list[str] = []
+        if message_index + 1 < len(messages) and messages[message_index + 1]["role"] == "user":
+            responses = TOOL_RESPONSE_RE.findall(messages[message_index + 1]["content"])
+        emitted_blocks = list(TOOL_BLOCK_RE.finditer(message["content"]))
+        # The rollout executes at most max_parallel_calls from an assistant
+        # turn. Historical rows do not store that per-turn limit, but each
+        # dispatched call has one ordered tool response, so the response count
+        # identifies the dispatched prefix without assuming a fixed limit.
+        calls = [_tool_call(block) for block in emitted_blocks[: len(responses)]]
+        if not calls:
+            continue
+        for call, response in zip(calls, responses):
+            fingerprint = call["fingerprint"]
+            if fingerprint in seen:
+                result["raw_exact_repeat_count"] += 1
+            seen.add(fingerprint)
+            if call["name"].lower() in {"bash", "run_shell"}:
+                command = call["parameters"].get("command", "").strip()
+                command_fingerprint = hashlib.sha256(command.encode()).digest()
+                if command_fingerprint in seen_bash:
+                    result["raw_exact_bash_repeat_count"] += 1
+                seen_bash.add(command_fingerprint)
+
+            events.append({
+                "name": call["name"],
+                "arguments": call["parameters"],
+                "success": _response_succeeded(response),
+                "batch": message_index,
+            })
+    detected = replay_tool_calls(events)
+    result.update(detected)
+    result["repeats_suppressed_after_mutation"] = detected["repeats_suppressed_after_progress"]
+    result["repeats_suppressed_after_error"] = detected["repeats_suppressed_after_error"]
+    result["repeats_suppressed_inflight"] = detected["repeats_suppressed_inflight"]
+    return result
+
+
+def _repeat_metrics(
+    row: dict[str, Any],
+    reconstructed: dict[str, Any],
+    *,
+    detection_mode: str,
+    read_window: int,
+    exec_window: int,
+) -> dict[str, Any]:
+    if detection_mode == "legacy_exact":
+        raw_stored = row.get("trajectory_repeated_tool_calls")
+        raw_count = (
+            _as_int(raw_stored)
+            if raw_stored is not None
+            else reconstructed["raw_exact_repeat_count"]
+        )
+        return {
+            **reconstructed,
+            "raw_exact_repeat_count": raw_count,
+            "penalized_repeat_count": raw_count,
+            "repeat_detection_source": "stored_legacy_exact" if raw_stored is not None else "reconstructed",
+        }
+
+    return {
+        **reconstructed,
+        "raw_exact_repeat_count": reconstructed["raw_exact_repeat_count"],
+        "repeat_detection_source": "reconstructed",
+    }
+
+
+def _tool_metrics(
+    row: dict[str, Any],
+    messages: list[dict[str, str]],
+    *,
+    detection_mode: str,
+    read_window: int,
+    exec_window: int,
+) -> dict[str, Any]:
+    blocks = [
+        block
+        for message in messages
+        if message["role"] == "assistant"
+        for block in TOOL_BLOCK_RE.finditer(message["content"])
+    ]
     absolute_paths: list[str] = []
-    normalized_calls: list[str] = []
     mutating = False
     for block in blocks:
-        tool_name = block.group(1).strip()
-        body = block.group(2)
-        parameters = {name: value.strip() for name, value in PARAM_RE.findall(body)}
+        call = _tool_call(block)
+        tool_name = call["name"]
+        parameters = call["parameters"]
         for name, value in parameters.items():
             if name in ABSOLUTE_PATH_PARAM_NAMES and (
                 value.startswith("/") or ".." in Path(value).parts
@@ -214,17 +378,32 @@ def _tool_metrics(output_text: str) -> dict[str, Any]:
             parameters.get("command", "")
         ):
             mutating = True
-        normalized = re.sub(r"\s+", " ", block.group(0)).strip()
-        normalized_calls.append(normalized)
-
-    counts = collections.Counter(normalized_calls)
-    duplicate_calls = sum(count - 1 for count in counts.values() if count > 1)
+    reconstructed = _reconstructed_repeat_metrics(
+        messages,
+        read_window=read_window,
+        exec_window=exec_window,
+    )
+    reconstructed_tool_errors = sum(
+        not _response_succeeded(response)
+        for message in messages
+        if message["role"] == "user"
+        for response in TOOL_RESPONSE_RE.findall(message["content"])
+    )
+    repeats = _repeat_metrics(
+        row,
+        reconstructed,
+        detection_mode=detection_mode,
+        read_window=read_window,
+        exec_window=exec_window,
+    )
     return {
         "tool_blocks": len(blocks),
         "absolute_paths": absolute_paths,
-        "duplicate_calls": duplicate_calls,
-        "has_verification": bool(VERIFY_RE.search(assistant_text)),
+        "duplicate_calls": repeats["raw_exact_repeat_count"],
+        "has_verification": any(_tool_call(block)["verification"] for block in blocks),
         "mutation_evidence": mutating,
+        "reconstructed_tool_error_returns": reconstructed_tool_errors,
+        **repeats,
     }
 
 
@@ -258,17 +437,18 @@ def _base_rejection(
     require_path_policy: bool,
     max_response_tokens: int,
     max_tool_dispatches: int,
-    max_repeated_bash_dispatches: int,
+    max_penalized_repeated_tool_calls: int,
+    repeated_tool_detection_mode: str,
+    repeated_tool_read_window: int,
+    repeated_tool_exec_window: int,
     require_swe_mutation: bool,
-) -> tuple[dict[str, Any], dict[str, str], list[dict[str, str]]]:
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], list[dict[str, str]]]:
     if row.get("is_padding"):
         raise DataReject("padding")
     raw_score = _as_float(row.get("raw_score", row.get("score")))
-    shaped_score = _as_float(row.get("shaped_score", row.get("score")))
-    if raw_score is None or raw_score < 0.999:
+    shaped_score = _as_float(row.get("shaped_score", row.get("score")), raw_score)
+    if raw_score != 1.0:
         raise DataReject("not_reward_one")
-    if shaped_score is None or shaped_score < 0.999:
-        raise DataReject("shaped_reward_penalty")
     if row.get("train_sample_mask") is not True:
         raise DataReject("train_sample_mask_false_or_missing")
     if row.get("completion_ratio_cutoff"):
@@ -277,8 +457,6 @@ def _base_rejection(
         raise DataReject("timeout")
     if row.get("trajectory_terminal_tool_failure"):
         raise DataReject("terminal_tool_failure")
-    if _as_int(row.get("trajectory_tool_error_returns")) > 0:
-        raise DataReject("tool_error")
     if row.get("trajectory_budget_reached"):
         raise DataReject("budget_reached")
 
@@ -286,24 +464,46 @@ def _base_rejection(
     input_text = str(row.get("input") or "")
     output_text = str(row.get("output") or "")
     system, user = _parse_input(input_text)
+    output_messages = _parse_output(output_text)
+    submission_seen = row.get("submission_signal_seen")
+    if submission_seen is None:
+        submission_seen = row.get("repeated_tool_submission_seen")
+    submission_seen = _as_optional_bool(submission_seen)
+    if submission_seen is False:
+        raise DataReject("missing_submission")
+    submission_check = "explicit" if submission_seen is not None else "inferred_final_assistant"
     if require_path_policy and not _path_policy_ok(input_text):
         raise DataReject("old_or_missing_path_policy")
     if _has_path_rejection(output_text):
         raise DataReject("path_violation")
 
-    metrics = _tool_metrics(output_text)
+    metrics = _tool_metrics(
+        row,
+        output_messages,
+        detection_mode=repeated_tool_detection_mode,
+        read_window=repeated_tool_read_window,
+        exec_window=repeated_tool_exec_window,
+    )
+    tool_error_returns = max(
+        _as_int(row.get("trajectory_tool_error_returns")),
+        int(metrics["reconstructed_tool_error_returns"]),
+    )
+    if tool_error_returns > 0:
+        raise DataReject("tool_error")
     if metrics["absolute_paths"]:
         raise DataReject("absolute_file_tool_path")
     response_tokens = _read_stat(row, "trajectory_response_tokens", "response_tokens")
     tool_dispatches = _read_stat(row, "trajectory_tool_dispatches", "tool_dispatches")
-    repeated = _as_int(row.get("trajectory_repeated_bash_dispatches"))
-    repeated = max(repeated, int(metrics["duplicate_calls"]))
+    repeated_bash = max(
+        _as_int(row.get("trajectory_repeated_bash_dispatches")),
+        int(metrics["raw_exact_bash_repeat_count"]),
+    )
     tool_dispatches = max(tool_dispatches, int(metrics["tool_blocks"]))
     if response_tokens > max_response_tokens:
         raise DataReject("response_too_long")
     if tool_dispatches > max_tool_dispatches:
         raise DataReject("too_many_tool_dispatches")
-    if repeated > max_repeated_bash_dispatches:
+    if metrics["penalized_repeat_count"] > max_penalized_repeated_tool_calls:
         raise DataReject("repeated_tool_call")
     mutation_evidence = bool(metrics["mutation_evidence"])
     if require_swe_mutation and _is_swe_benchmark(benchmark):
@@ -322,12 +522,21 @@ def _base_rejection(
         "shaped_score": float(shaped_score),
         "response_tokens": response_tokens,
         "tool_dispatches": tool_dispatches,
-        "repeated_bash_dispatches": repeated,
-        "tool_error_returns": _as_int(row.get("trajectory_tool_error_returns")),
+        "repeated_bash_dispatches": repeated_bash,
+        "raw_exact_repeat_count": int(metrics["raw_exact_repeat_count"]),
+        "penalized_repeat_count": int(metrics["penalized_repeat_count"]),
+        "repeats_suppressed_after_mutation": int(metrics["repeats_suppressed_after_mutation"]),
+        "repeats_suppressed_after_error": int(metrics["repeats_suppressed_after_error"]),
+        "repeats_suppressed_outside_window": int(metrics["repeats_suppressed_outside_window"]),
+        "repeats_suppressed_inflight": int(metrics["repeats_suppressed_inflight"]),
+        "repeat_detection_mode": repeated_tool_detection_mode,
+        "repeat_detection_source": str(metrics["repeat_detection_source"]),
+        "tool_error_returns": tool_error_returns,
         "has_verification": bool(metrics["has_verification"]),
         "mutation_evidence": mutation_evidence,
+        "submission_check": submission_check,
     }
-    return metadata, {"system": system, "user": user}, metrics
+    return metadata, {"system": system, "user": user}, metrics, output_messages
 
 
 def _candidate(
@@ -339,20 +548,26 @@ def _candidate(
     require_path_policy: bool,
     max_response_tokens: int,
     max_tool_dispatches: int,
-    max_repeated_bash_dispatches: int,
+    max_penalized_repeated_tool_calls: int,
+    repeated_tool_detection_mode: str,
+    repeated_tool_read_window: int,
+    repeated_tool_exec_window: int,
     require_swe_mutation: bool,
 ) -> Candidate:
-    metadata, prompt, metrics = _base_rejection(
+    metadata, prompt, metrics, output_messages = _base_rejection(
         row,
         require_path_policy=require_path_policy,
         max_response_tokens=max_response_tokens,
         max_tool_dispatches=max_tool_dispatches,
-        max_repeated_bash_dispatches=max_repeated_bash_dispatches,
+        max_penalized_repeated_tool_calls=max_penalized_repeated_tool_calls,
+        repeated_tool_detection_mode=repeated_tool_detection_mode,
+        repeated_tool_read_window=repeated_tool_read_window,
+        repeated_tool_exec_window=repeated_tool_exec_window,
         require_swe_mutation=require_swe_mutation,
     )
     output_text = str(row.get("output") or "")
     messages = [{"role": "system", "content": prompt["system"]}, {"role": "user", "content": prompt["user"]}]
-    messages.extend(_parse_output(output_text))
+    messages.extend(output_messages)
     transcript_hash = hashlib.sha256(
         (str(row.get("input") or "") + "\x00" + output_text).encode("utf-8")
     ).hexdigest()
@@ -374,9 +589,18 @@ def _candidate(
         response_tokens=metadata["response_tokens"],
         tool_dispatches=metadata["tool_dispatches"],
         repeated_bash_dispatches=metadata["repeated_bash_dispatches"],
+        raw_exact_repeat_count=metadata["raw_exact_repeat_count"],
+        penalized_repeat_count=metadata["penalized_repeat_count"],
+        repeats_suppressed_after_mutation=metadata["repeats_suppressed_after_mutation"],
+        repeats_suppressed_after_error=metadata["repeats_suppressed_after_error"],
+        repeats_suppressed_outside_window=metadata["repeats_suppressed_outside_window"],
+        repeats_suppressed_inflight=metadata["repeats_suppressed_inflight"],
+        repeat_detection_mode=metadata["repeat_detection_mode"],
+        repeat_detection_source=metadata["repeat_detection_source"],
         tool_error_returns=metadata["tool_error_returns"],
         has_verification=metadata["has_verification"],
         mutation_evidence=metadata["mutation_evidence"],
+        submission_check=metadata["submission_check"],
         messages=messages,
         input_text=str(row.get("input") or ""),
         output_text=output_text,
@@ -387,7 +611,9 @@ def _candidate(
 def _relaxed_candidate(row: dict[str, Any], **kwargs: Any) -> Candidate:
     relaxed = dict(kwargs)
     relaxed["max_tool_dispatches"] = relaxed.pop("relaxed_max_tool_dispatches")
-    relaxed["max_repeated_bash_dispatches"] = relaxed.pop("relaxed_max_repeated_bash_dispatches")
+    relaxed["max_penalized_repeated_tool_calls"] = relaxed.pop(
+        "relaxed_max_penalized_repeated_tool_calls"
+    )
     return _candidate(row, **relaxed)
 
 
@@ -409,9 +635,18 @@ def _candidate_row(candidate: Candidate, tier: str) -> dict[str, Any]:
         "response_tokens": candidate.response_tokens,
         "tool_dispatches": candidate.tool_dispatches,
         "repeated_bash_dispatches": candidate.repeated_bash_dispatches,
+        "raw_exact_repeat_count": candidate.raw_exact_repeat_count,
+        "penalized_repeat_count": candidate.penalized_repeat_count,
+        "repeats_suppressed_after_mutation": candidate.repeats_suppressed_after_mutation,
+        "repeats_suppressed_after_error": candidate.repeats_suppressed_after_error,
+        "repeats_suppressed_outside_window": candidate.repeats_suppressed_outside_window,
+        "repeats_suppressed_inflight": candidate.repeats_suppressed_inflight,
+        "repeat_detection_mode": candidate.repeat_detection_mode,
+        "repeat_detection_source": candidate.repeat_detection_source,
         "tool_error_returns": candidate.tool_error_returns,
         "has_verification": candidate.has_verification,
         "mutation_evidence": candidate.mutation_evidence,
+        "submission_check": candidate.submission_check,
         "quality_tier": tier,
         "transcript_hash": candidate.transcript_hash,
     }
@@ -455,9 +690,18 @@ def _write_parquet(path: Path, candidates: Iterable[Candidate], tier: str) -> in
                 "response_tokens": pa.array([], type=pa.int64()),
                 "tool_dispatches": pa.array([], type=pa.int64()),
                 "repeated_bash_dispatches": pa.array([], type=pa.int64()),
+                "raw_exact_repeat_count": pa.array([], type=pa.int64()),
+                "penalized_repeat_count": pa.array([], type=pa.int64()),
+                "repeats_suppressed_after_mutation": pa.array([], type=pa.int64()),
+                "repeats_suppressed_after_error": pa.array([], type=pa.int64()),
+                "repeats_suppressed_outside_window": pa.array([], type=pa.int64()),
+                "repeats_suppressed_inflight": pa.array([], type=pa.int64()),
+                "repeat_detection_mode": pa.array([], type=pa.string()),
+                "repeat_detection_source": pa.array([], type=pa.string()),
                 "tool_error_returns": pa.array([], type=pa.int64()),
                 "has_verification": pa.array([], type=pa.bool_()),
                 "mutation_evidence": pa.array([], type=pa.bool_()),
+                "submission_check": pa.array([], type=pa.string()),
                 "quality_tier": pa.array([], type=pa.string()),
                 "transcript_hash": pa.array([], type=pa.string()),
             }
@@ -481,9 +725,12 @@ def _candidate_sets(
     require_path_policy: bool,
     max_response_tokens: int,
     max_tool_dispatches: int,
-    max_repeated_bash_dispatches: int,
+    max_penalized_repeated_tool_calls: int,
     relaxed_max_tool_dispatches: int,
-    relaxed_max_repeated_bash_dispatches: int,
+    relaxed_max_penalized_repeated_tool_calls: int,
+    repeated_tool_detection_mode: str,
+    repeated_tool_read_window: int,
+    repeated_tool_exec_window: int,
     require_swe_mutation: bool,
 ) -> tuple[dict[str, Candidate], dict[str, Candidate], list[dict[str, Any]], collections.Counter[str]]:
     core: dict[str, Candidate] = {}
@@ -513,7 +760,15 @@ def _candidate_sets(
                             raise DataReject("malformed_json", "row is not an object")
                     except json.JSONDecodeError as exc:
                         reason, detail = "malformed_json", str(exc)
-                        rejected.append({"source_run": run_name, "source_file": str(source_file), "source_line": source_line, "reason": reason, "detail": detail})
+                        rejected.append(
+                            {
+                                "source_run": run_name,
+                                "source_file": str(source_file),
+                                "source_line": source_line,
+                                "reason": reason,
+                                "detail": detail,
+                            }
+                        )
                         stats[reason] += 1
                         continue
 
@@ -529,7 +784,10 @@ def _candidate_sets(
                             require_path_policy=require_path_policy,
                             max_response_tokens=max_response_tokens,
                             max_tool_dispatches=max_tool_dispatches,
-                            max_repeated_bash_dispatches=max_repeated_bash_dispatches,
+                            max_penalized_repeated_tool_calls=max_penalized_repeated_tool_calls,
+                            repeated_tool_detection_mode=repeated_tool_detection_mode,
+                            repeated_tool_read_window=repeated_tool_read_window,
+                            repeated_tool_exec_window=repeated_tool_exec_window,
                             require_swe_mutation=require_swe_mutation,
                         )
                         if strict.transcript_hash not in seen_core_hashes:
@@ -563,7 +821,12 @@ def _candidate_sets(
                                 require_path_policy=require_path_policy,
                                 max_response_tokens=max_response_tokens,
                                 relaxed_max_tool_dispatches=relaxed_max_tool_dispatches,
-                                relaxed_max_repeated_bash_dispatches=relaxed_max_repeated_bash_dispatches,
+                                relaxed_max_penalized_repeated_tool_calls=(
+                                    relaxed_max_penalized_repeated_tool_calls
+                                ),
+                                repeated_tool_detection_mode=repeated_tool_detection_mode,
+                                repeated_tool_read_window=repeated_tool_read_window,
+                                repeated_tool_exec_window=repeated_tool_exec_window,
                                 require_swe_mutation=require_swe_mutation,
                             )
                         except DataReject as relaxed_error:
@@ -590,7 +853,12 @@ def _candidate_sets(
     return core, relaxed_candidates, rejected, stats
 
 
-def _write_dataset_splits(output_dir: Path, candidates: dict[str, Candidate], tier: str, val_fraction: float) -> dict[str, int]:
+def _write_dataset_splits(
+    output_dir: Path,
+    candidates: dict[str, Candidate],
+    tier: str,
+    val_fraction: float,
+) -> dict[str, int]:
     train = []
     validation = []
     for candidate in sorted(candidates.values(), key=lambda item: item.task_key):
@@ -610,9 +878,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-response-tokens", type=int, default=65536)
     parser.add_argument("--max-tool-dispatches", type=int, default=80)
-    parser.add_argument("--max-repeated-bash-dispatches", type=int, default=0)
-    parser.add_argument("--relaxed-max-tool-dispatches", type=int, default=100)
-    parser.add_argument("--relaxed-max-repeated-bash-dispatches", type=int, default=2)
+    parser.add_argument(
+        "--max-penalized-repeated-tool-calls",
+        "--max-repeated-bash-dispatches",
+        dest="max_penalized_repeated_tool_calls",
+        type=int,
+        default=0,
+        help="Maximum reward-relevant repeated calls; the old flag name remains an alias.",
+    )
+    parser.add_argument("--relaxed-max-tool-dispatches", type=int, default=120)
+    parser.add_argument(
+        "--relaxed-max-penalized-repeated-tool-calls",
+        "--relaxed-max-repeated-bash-dispatches",
+        dest="relaxed_max_penalized_repeated_tool_calls",
+        type=int,
+        default=2,
+        help="Relaxed-tier reward-relevant repeat limit; the old flag name remains an alias.",
+    )
+    parser.add_argument(
+        "--repeated-tool-detection-mode",
+        choices=("mutation_aware", "legacy_exact"),
+        default="mutation_aware",
+    )
+    parser.add_argument("--repeated-tool-read-window", type=int, default=8)
+    parser.add_argument("--repeated-tool-exec-window", type=int, default=16)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument(
         "--require-swe-mutation",
@@ -633,6 +922,24 @@ def main() -> int:
     args = build_parser().parse_args()
     if not 0.0 <= args.val_fraction < 1.0:
         raise SystemExit("--val-fraction must be in [0, 1)")
+    for name in (
+        "max_response_tokens",
+        "max_tool_dispatches",
+        "max_penalized_repeated_tool_calls",
+        "relaxed_max_tool_dispatches",
+        "relaxed_max_penalized_repeated_tool_calls",
+        "repeated_tool_read_window",
+        "repeated_tool_exec_window",
+    ):
+        if getattr(args, name) < 0:
+            raise SystemExit(f"--{name.replace('_', '-')} must be non-negative")
+    if args.relaxed_max_tool_dispatches < args.max_tool_dispatches:
+        raise SystemExit("--relaxed-max-tool-dispatches must be at least --max-tool-dispatches")
+    if args.relaxed_max_penalized_repeated_tool_calls < args.max_penalized_repeated_tool_calls:
+        raise SystemExit(
+            "--relaxed-max-penalized-repeated-tool-calls must be at least "
+            "--max-penalized-repeated-tool-calls"
+        )
     runs = args.runs or list(DEFAULT_RUNS)
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -643,9 +950,12 @@ def main() -> int:
         require_path_policy=args.require_path_policy,
         max_response_tokens=args.max_response_tokens,
         max_tool_dispatches=args.max_tool_dispatches,
-        max_repeated_bash_dispatches=args.max_repeated_bash_dispatches,
+        max_penalized_repeated_tool_calls=args.max_penalized_repeated_tool_calls,
         relaxed_max_tool_dispatches=args.relaxed_max_tool_dispatches,
-        relaxed_max_repeated_bash_dispatches=args.relaxed_max_repeated_bash_dispatches,
+        relaxed_max_penalized_repeated_tool_calls=args.relaxed_max_penalized_repeated_tool_calls,
+        repeated_tool_detection_mode=args.repeated_tool_detection_mode,
+        repeated_tool_read_window=args.repeated_tool_read_window,
+        repeated_tool_exec_window=args.repeated_tool_exec_window,
         require_swe_mutation=args.require_swe_mutation,
     )
 
@@ -674,8 +984,17 @@ def main() -> int:
                 "response_tokens": candidate.response_tokens,
                 "tool_dispatches": candidate.tool_dispatches,
                 "repeated_bash_dispatches": candidate.repeated_bash_dispatches,
+                "raw_exact_repeat_count": candidate.raw_exact_repeat_count,
+                "penalized_repeat_count": candidate.penalized_repeat_count,
+                "repeats_suppressed_after_mutation": candidate.repeats_suppressed_after_mutation,
+                "repeats_suppressed_after_error": candidate.repeats_suppressed_after_error,
+                "repeats_suppressed_outside_window": candidate.repeats_suppressed_outside_window,
+                "repeats_suppressed_inflight": candidate.repeats_suppressed_inflight,
+                "repeat_detection_mode": candidate.repeat_detection_mode,
+                "repeat_detection_source": candidate.repeat_detection_source,
                 "has_verification": candidate.has_verification,
                 "mutation_evidence": candidate.mutation_evidence,
+                "submission_check": candidate.submission_check,
                 "transcript_hash": candidate.transcript_hash,
             })
     _write_jsonl(output_dir / "manifest.jsonl", selected)
@@ -686,9 +1005,14 @@ def main() -> int:
         "filters": {
             "max_response_tokens": args.max_response_tokens,
             "max_tool_dispatches": args.max_tool_dispatches,
-            "max_repeated_bash_dispatches": args.max_repeated_bash_dispatches,
+            "max_penalized_repeated_tool_calls": args.max_penalized_repeated_tool_calls,
             "relaxed_max_tool_dispatches": args.relaxed_max_tool_dispatches,
-            "relaxed_max_repeated_bash_dispatches": args.relaxed_max_repeated_bash_dispatches,
+            "relaxed_max_penalized_repeated_tool_calls": (
+                args.relaxed_max_penalized_repeated_tool_calls
+            ),
+            "repeated_tool_detection_mode": args.repeated_tool_detection_mode,
+            "repeated_tool_read_window": args.repeated_tool_read_window,
+            "repeated_tool_exec_window": args.repeated_tool_exec_window,
             "require_path_policy": args.require_path_policy,
             "require_swe_mutation": args.require_swe_mutation,
             "val_fraction": args.val_fraction,
