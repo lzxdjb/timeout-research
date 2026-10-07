@@ -22,7 +22,7 @@ from typing import Any, Iterable
 _SWE_REPO_ROOT = Path(__file__).resolve().parents[2] / "stock-rl-reflect"
 if str(_SWE_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_SWE_REPO_ROOT))
-from recipe.swe_agent.repeated_tool import replay_tool_calls
+from recipe.swe_agent.repeated_tool import classify_tool_outcome, is_verification_tool, replay_tool_calls
 
 
 DEFAULT_RUNS = (
@@ -232,10 +232,7 @@ def _parse_output(output_text: str) -> list[dict[str, str]]:
 def _tool_call(block: re.Match[str]) -> dict[str, Any]:
     name = block.group(1).strip()
     parameters = {key: value.strip() for key, value in PARAM_RE.findall(block.group(2))}
-    verification = name == "run_tests" or (
-        name in {"Bash", "run_shell"}
-        and parameters.get("verification", "").strip().lower() == "true"
-    )
+    verification = is_verification_tool(name, parameters)
     command = parameters.get("command", "")
     may_mutate = name.lower() in MUTATING_TOOLS or (
         name.lower() in {"bash", "run_shell"}
@@ -253,10 +250,6 @@ def _tool_call(block: re.Match[str]) -> dict[str, Any]:
         "verification": verification,
         "may_mutate": may_mutate,
     }
-
-
-def _response_succeeded(response: str) -> bool:
-    return not response.strip().startswith(TOOL_ERROR_PREFIXES)
 
 
 def _reconstructed_repeat_metrics(
@@ -307,7 +300,7 @@ def _reconstructed_repeat_metrics(
             events.append({
                 "name": call["name"],
                 "arguments": call["parameters"],
-                "success": _response_succeeded(response),
+                "response": response,
                 "batch": message_index,
             })
     detected = replay_tool_calls(events)
@@ -384,7 +377,9 @@ def _tool_metrics(
         exec_window=exec_window,
     )
     reconstructed_tool_errors = sum(
-        not _response_succeeded(response)
+        classify_tool_outcome(
+            "unknown", {}, response
+        ) == "transport_error"
         for message in messages
         if message["role"] == "user"
         for response in TOOL_RESPONSE_RE.findall(message["content"])
