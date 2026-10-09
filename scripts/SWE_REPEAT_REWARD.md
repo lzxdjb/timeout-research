@@ -82,27 +82,26 @@ structured JSON output. The offline environment has vLLM 0.24.0 and Transformers
 
 ```bash
 cd /cpfs01/thscc/sharestorage/iwc/HithinkOmni/user_workspace/leizhengxing/leizhengxing/swe/verl
-export SWE_REPEAT_JUDGE_CHECKPOINT=/cpfs01/thscc/sharestorage/iwc/HithinkGPT/models/Qwen3.5-122
-export SWE_REPEAT_JUDGE_GPUS=0,1,2,3
-export SWE_REPEAT_JUDGE_TP=4
-export SWE_REPEAT_JUDGE_HOST=0.0.0.0
-export SWE_REPEAT_JUDGE_PORT=18090
-# Set this to the judge pod IP or a routable Service DNS name.
-export SWE_REPEAT_JUDGE_ADVERTISE_HOST=JUDGE_POD_IP_OR_SERVICE_DNS
-export SWE_REPEAT_JUDGE_ADVERTISE_URL=http://JUDGE_POD_IP_OR_SERVICE_DNS:18090
-export SWE_AGENT_REPEAT_JUDGE_MAX_CONTEXT=131072
-export SWE_REPEAT_JUDGE_MAX_SEQS=4
-export SWE_REPEAT_JUDGE_MEMORY_FRACTION=0.90
 bash scripts/serve_swe_repeat_judge.sh --dry-run
 bash scripts/serve_swe_repeat_judge.sh
 ```
 
-The launcher binds vLLM on `0.0.0.0` and separately prints the client endpoint.
-`0.0.0.0` is a listen address, never a client destination. The pod platform
-must publish TCP port 18090 and allow traffic from the trainer pods: use Docker
-host networking or `-p 18090:18090`, or a Kubernetes Service and NetworkPolicy
-that route to the judge pod. A missing route, port publication, or firewall
-rule cannot be repaired by the Python client or by changing the prompt.
+The launcher automatically selects the pod's client IPv4 address: a valid
+`POD_IP` or `MY_POD_IP`, then the route-selected source address, then a usable
+address from `hostname -I`/`hostname -i`. It does not require the `ip` command.
+If detection fails, startup stops with an error rather than printing a placeholder.
+After vLLM's local `/health` endpoint returns HTTP 200, the launcher prints
+`Judge ready. Client endpoint: ...` and an `export SWE_AGENT_REPEAT_JUDGE_URL=...`
+command to copy into the client pod. vLLM may still log `0.0.0.0` as its bind address.
+The readiness watcher exits when the foreground server exits; signals and the
+server's exit status are preserved. `--dry-run` prints the detected endpoint
+immediately without starting vLLM or waiting for readiness.
+
+No advertise variables are required. Optional `SWE_REPEAT_JUDGE_ADVERTISE_HOST`
+and `SWE_REPEAT_JUDGE_ADVERTISE_URL` overrides support service DNS names and
+proxy URLs; the URL takes precedence. Invalid URLs and wildcard, loopback,
+link-local or multicast client IPs are rejected. Use a plain URL such as
+`http://10.248.100.152:18090`, without Markdown link syntax.
 
 Defaults:
 
@@ -111,10 +110,8 @@ Defaults:
 - Served model `swe-repeat-judge`, port 18090, 131072 context, max 4 active sequences,
   GPU memory utilization 0.90, text-only, thinking disabled.
 - Override with `SWE_REPEAT_JUDGE_CHECKPOINT`, `SWE_REPEAT_JUDGE_GPUS`,
-  `SWE_REPEAT_JUDGE_TP`, `SWE_REPEAT_JUDGE_HOST`, `SWE_REPEAT_JUDGE_PORT`,
-  `SWE_REPEAT_JUDGE_ADVERTISE_HOST`, `SWE_REPEAT_JUDGE_ADVERTISE_URL`,
-  `SWE_REPEAT_JUDGE_MAX_SEQS`, `SWE_REPEAT_JUDGE_MEMORY_FRACTION` as needed.
-  GPU count must equal TP.
+  `SWE_REPEAT_JUDGE_TP`, `SWE_REPEAT_JUDGE_HOST`, `SWE_REPEAT_JUDGE_PORT`, `SWE_REPEAT_JUDGE_MAX_SEQS`,
+  `SWE_REPEAT_JUDGE_MEMORY_FRACTION` as needed. GPU count must equal TP.
 
 Checkpoint configuration was inspected offline: Qwen3_5Moe architecture,
 BF16, 262144 advertised context, no quantization configuration. Actual GPU
@@ -122,7 +119,10 @@ loading, long-context memory use and throughput still require online validation.
 
 ## Run the existing benchmark against the launched judge
 
-On the trainer/diagnosis host (substitute the judge host IP):
+On the trainer/diagnosis host, use the export command printed after `Judge ready`
+(substitute that detected endpoint for the placeholder below). Run `judge-preflight`
+there to verify connectivity from the client pod; local readiness does not verify
+cross-pod routing:
 
 ```bash
 cd /cpfs01/thscc/sharestorage/iwc/HithinkOmni/user_workspace/leizhengxing/leizhengxing/swe/verl
@@ -136,9 +136,8 @@ python3 scripts/swe_repeat_regression.py two-level-evaluate \
   --online
 ```
 
-For a judge on the same host, use `http://127.0.0.1:18090`. For another pod,
-set `SWE_AGENT_REPEAT_JUDGE_URL` to the printed pod IP or Service DNS endpoint,
-never to `http://0.0.0.0:18090`.
+For a judge on the same host, use `http://127.0.0.1:18090`. `0.0.0.0` is the
+server's listen address; use the host's reachable IP from another machine.
 The launcher occupies its terminal, so run the benchmark in a separate terminal.
 To preserve a previous run, choose another report name, e.g. `online_v2.json`.
 

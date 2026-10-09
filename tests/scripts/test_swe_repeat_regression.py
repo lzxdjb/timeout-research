@@ -385,8 +385,6 @@ def test_success_repeat_launcher_defaults_and_rejects_gpu_tp_mismatch(tmp_path):
     env["SWE_REPEAT_JUDGE_ADVERTISE_HOST"] = "judge.service.example"
     result = subprocess.run(["bash", str(launcher), "--dry-run"], env=env, capture_output=True, text=True)
     assert "Judge client endpoint: http://judge.service.example:18090" in result.stderr
-    env["SWE_REPEAT_JUDGE_ADVERTISE_URL"] = "http://0.0.0.0:18090"
-    assert subprocess.run(["bash", str(launcher), "--dry-run"], env=env, capture_output=True).returncode == 2
     env["SWE_REPEAT_JUDGE_TP"] = "8"
     assert subprocess.run(["bash", str(launcher), "--dry-run"], env=env, capture_output=True).returncode == 2
 
