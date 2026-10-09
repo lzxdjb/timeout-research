@@ -355,6 +355,12 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.extra_fields["termination_reason"] = reason
         return AgentState.TERMINATED
 
+    def _tool_observation_budget_exhausted(
+        self, agent_data: AgentData, messages: list[dict], attempted_tokens: int
+    ) -> AgentState:
+        """Allow domain loops to retain execution evidence outside model context."""
+        return AgentState.TERMINATED
+
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
         add_messages: list[dict[str, Any]] = []
@@ -436,7 +442,7 @@ class ToolAgentLoop(AgentLoopBase):
                 tools=schemas,
             )
             if len(response_mask) >= self.response_length:
-                return AgentState.TERMINATED
+                return self._tool_observation_budget_exhausted(agent_data, add_messages, len(response_mask))
             agent_data.prompt_ids = merge_result.token_ids
             agent_data.response_mask = response_mask
             if agent_data.response_logprobs:
@@ -482,7 +488,9 @@ class ToolAgentLoop(AgentLoopBase):
             response_ids = self.turn_separator + response_ids
 
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
-            return AgentState.TERMINATED
+            return self._tool_observation_budget_exhausted(
+                agent_data, add_messages, len(agent_data.response_mask) + len(response_ids)
+            )
         # Update prompt_ids and response_mask
 
         if new_images_this_turn:
