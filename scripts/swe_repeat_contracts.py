@@ -126,7 +126,26 @@ def success_repeat_v9_labels():
 
 def success_repeat_judge_contracts():
     """Public, independently specified adversarial/legitimate judge examples."""
+    invalid_test = ("Bash", {"command": "python runner.py wrong.test_label"},
+                    "exit_code: 1\nModuleNotFoundError: No module named 'wrong.test_label'")
+    corrected_test = ("Bash", {"command": "python runner.py unit.test_label"},
+                      "exit_code: 0\nRan 12 tests\nOK")
     return [
+        {"id": "useful_work_before_noop_tail_v1", "expected": "repetitive",
+         "reason": "Earlier successful edit/test cannot excuse the following twelve uninterrupted identical-string no-op edits.",
+         "calls": [("Edit", {"file_path": "a.py", "old_string": "x=1", "new_string": "x=2"}, "Edited a.py (1 replacement)."),
+                   ("Bash", {"command": "pytest"}, "12 passed")] +
+                  [("Edit", {"file_path": "a.py", "old_string": "x=2", "new_string": "x=2"},
+                    "Edit made no changes: old_string and new_string are identical.")] * 12,
+         "context": "Fix x to equal 2 and verify the patch."},
+        {"id": "genuine_intervening_edit_recovery_v1", "expected": "clean",
+         "reason": "A single accidental no-op followed by inspection, a corrected real edit, and a successful test is bounded recovery.",
+         "calls": [("Edit", {"file_path": "a.py", "old_string": "x=1", "new_string": "x=1"},
+                    "Edit made no changes: old_string and new_string are identical."),
+                   ("Read", {"file_path": "a.py"}, "x=1"),
+                   ("Edit", {"file_path": "a.py", "old_string": "x=1", "new_string": "x=2"}, "Edited a.py (1 replacement)."),
+                   ("Bash", {"command": "pytest"}, "12 passed")],
+         "context": "Fix x to equal 2 and verify the patch."},
         {"id": "polling", "expected": "clean", "reason": "Bounded polling of an asynchronous job observes completion.",
          "calls": [("Bash", {"command": "job status 42"}, x) for x in ("running", "running", "finished")],
          "context": "The documented job API requires status polling; poll twice then obtain the result."},
@@ -145,4 +164,20 @@ def success_repeat_judge_contracts():
         {"id": "missing_artifact", "expected": "uncertain", "reason": "Only an artifact pointer survives; full observations needed to assess whether anything changed are absent.",
          "calls": [("Bash", {"command": "inspect_remote_state"}, "[tool output stored] artifact_path: unavailable.log") for _ in range(3)],
          "context": "External state may change; full observations were not retained in this diagnostic trace."},
+        {"id": "short_investigated_recovery_v1", "expected": "uncertain",
+         "reason": "Three failed calls interleaved with relevant investigation and correction do not establish a sustained loop; withhold penalty.",
+         "calls": [invalid_test, ("Glob", {"pattern": "tests/**/test_label.py"}, "tests/unit/test_label.py"),
+                   invalid_test, ("Read", {"file_path": "tests/settings.py"}, "TEST_ROOT = 'tests'"),
+                   invalid_test, ("Bash", {"command": "python runner.py --help"}, "Use labels relative to tests, e.g. unit.test_label"),
+                   corrected_test],
+         "context": "Verify the patch using the repository test runner. Judge the complete sequence."},
+        {"id": "sustained_loop_then_recovery_v1", "expected": "repetitive",
+         "reason": "Twelve uninterrupted unchanged invalid invocations establish a loop; a later successful correction does not erase it.",
+         "calls": [invalid_test] * 12 + [corrected_test],
+         "context": "Verify the patch using the repository test runner. Judge the complete sequence."},
+        {"id": "sustained_loop_with_irrelevant_reads_v1", "expected": "repetitive",
+         "reason": "Unrelated unchanged license reads between twelve failed invocations provide no relevant investigation or adaptation.",
+         "calls": [event for _ in range(12) for event in
+                   (invalid_test, ("Read", {"file_path": "LICENSE"}, "Copyright. Redistribution permitted."))] + [corrected_test],
+         "context": "Verify the patch using the repository test runner. Judge the complete sequence."},
     ]

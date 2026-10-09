@@ -1,6 +1,7 @@
 import copy
 import gzip
 import json
+from pathlib import Path
 
 import pytest
 
@@ -275,7 +276,8 @@ def test_success_repeat_mock_judge_no_truncation_and_error_preserves_reward(monk
         if path == "/tokenize":
             assert payload["messages"][1]["content"].find("public_transcript") >= 0
             return {"count": config.max_context if failure == "overflow" else 100}
-        assert payload["temperature"] == 0 and payload["chat_template_kwargs"] == {"enable_thinking": False}
+        assert payload["temperature"] == config.temperature and payload["chat_template_kwargs"] == {"enable_thinking": False}
+        assert payload["seed"] == 0
         answer = {"verdict": "repetitive", "category": "unchanged_read_search", "event_ids": [1, 999] if failure == "invalid_event" else [1, 2], "reason": "same query without progress"}
         return {"choices": [{"finish_reason": "length" if failure == "length" else "stop",
             "message": {"content": "not-json" if failure == "malformed" else json.dumps(answer)}}], "usage": {"completion_tokens": 50}}
@@ -310,6 +312,53 @@ def test_success_repeat_judge_cancellation_propagates(monkeypatch):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("results,expected,rep_votes,error_count", [
+    (["repetitive", "clean", "uncertain"], "uncertain", 1, 0),
+    (["repetitive", "repetitive", "error"], "repetitive", 2, 1),
+    (["clean", "clean", "repetitive"], "clean", 1, 0),
+])
+def test_success_repeat_quorum_is_majority_and_errors_do_not_vote(monkeypatch, results, expected, rep_votes, error_count):
+    import asyncio
+    config = repeat_policy.RepeatConfig(vote_count=3, vote_quorum=2)
+    client = repeat_policy.JudgeClient(config)
+    seeds = []
+    answers = iter(results)
+    async def judge(transcript, events, *, seed=0):
+        seeds.append(seed)
+        answer = next(answers)
+        if answer == "error":
+            return {**repeat_policy.uncertain("judge_error:TimeoutError"), "error": 1,
+                    "failure_stage": "completion", "latency_seconds": 0.5,
+                    "prompt_tokens": 10, "completion_tokens": 0}
+        return {"verdict": answer,
+                "category": "ineffective_action_loop" if answer == "repetitive" else "none" if answer == "clean" else "insufficient_evidence",
+                "event_ids": [1, 2] if answer == "repetitive" else [], "reason": answer,
+                "error": 0, "guard_blocked": 0, "latency_seconds": 1.0,
+                "prompt_tokens": 10, "completion_tokens": 5}
+    monkeypatch.setattr(client, "judge", judge)
+    verdict = asyncio.run(client.judge_consensus("same transcript", repeat_evidence_events()))
+    assert verdict["verdict"] == expected
+    assert verdict["repetitive_votes"] == rep_votes
+    assert verdict["error_count"] == error_count
+    assert verdict["vote_count"] == 3 and verdict["vote_quorum"] == 2
+    assert len(set(seeds)) == 3
+    assert verdict["prompt_tokens"] == 30
+    assert verdict["completion_tokens"] == (10 if error_count else 15)
+    assert verdict["latency_seconds"] == (2.5 if error_count else 3.0)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("SWE_AGENT_REPEAT_JUDGE_VOTE_COUNT", "4"),
+    ("SWE_AGENT_REPEAT_JUDGE_VOTE_QUORUM", "1"),
+    ("SWE_AGENT_REPEAT_JUDGE_TEMPERATURE", "0"),
+])
+def test_success_repeat_rejects_invalid_voting_configuration(monkeypatch, key, value):
+    monkeypatch.setenv("SWE_AGENT_REPEAT_REWARD_MODE", "shadow")
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError):
+        repeat_policy.RepeatConfig.from_env()
+
+
 @pytest.mark.parametrize("key,value", [("SWE_AGENT_REPEAT_REWARD_MODE", "typo"),
     ("SWE_AGENT_REPEAT_REWARD_MULTIPLIER", "nan"), ("SWE_AGENT_REPEAT_JUDGE_TIMEOUT", "inf"),
     ("SWE_AGENT_REPEAT_JUDGE_CONCURRENCY", "0"), ("SWE_AGENT_TRAINING_REPEATED_TOOL_REWARD_SHAPING", "1"),
@@ -325,10 +374,14 @@ def test_success_repeat_settings_forwarded_to_ray_without_secret_contents(monkey
     from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
     monkeypatch.setenv("SWE_AGENT_REPEAT_REWARD_MODE", "shadow")
     monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_API_KEY_FILE", "/shared/judge.key")
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_VOTE_COUNT", "3")
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_VOTE_QUORUM", "2")
     monkeypatch.setenv("SWE_AGENT_TRAINING_PROTOCOL_SUBMISSION_ONLY", "1")
     env = get_ppo_ray_runtime_env()["env_vars"]
     assert env["SWE_AGENT_REPEAT_REWARD_MODE"] == "shadow"
     assert env["SWE_AGENT_REPEAT_JUDGE_API_KEY_FILE"] == "/shared/judge.key"
+    assert env["SWE_AGENT_REPEAT_JUDGE_VOTE_COUNT"] == "3"
+    assert env["SWE_AGENT_REPEAT_JUDGE_VOTE_QUORUM"] == "2"
     assert env["SWE_AGENT_TRAINING_PROTOCOL_SUBMISSION_ONLY"] == "1"
 
 
@@ -345,7 +398,7 @@ def test_success_repeat_benchmark_online_mock_and_public_projection(tmp_path, mo
     labels.write_text(json.dumps({"policy_version": repeat_policy.POLICY_VERSION, "cases": [{"id": "one", "expected": "repetitive", "reason": "Five no-op edits"}]}))
     async def ready(self):
         pass
-    async def judge(self, transcript, events):
+    async def judge(self, transcript, events, *, seed=0):
         assert "SECRET" not in transcript and "raw_score" not in json.dumps(events)
         return {"verdict": "repetitive", "category": "ineffective_action_loop", "event_ids": [1, 2], "reason": "Repeated no-op"}
     monkeypatch.setattr(repeat_policy.JudgeClient, "preflight", ready)
@@ -354,6 +407,9 @@ def test_success_repeat_benchmark_online_mock_and_public_projection(tmp_path, mo
     assert result["regression_pass"] is True and result["production_ready"] is False
     assert result["combined"]["tp"] == 1 and result["raw_success_subset"]["tp"] == 1
     assert result["level1"]["deferred"] == 1
+    assert result["judge_voting"] == {"vote_count": 3, "vote_quorum": 2, "temperature": 0.2}
+    assert result["judge_repetitive_votes"] == 3
+    assert result["rows"][0]["vote_count"] == 3
     (tmp_path / "manifest.json").write_text(json.dumps({
         "policy_version": repeat_policy.POLICY_VERSION,
         "fixtures_sha256": "tampered", "labels_sha256": "tampered",
@@ -488,14 +544,15 @@ def test_success_repeat_benchmark_uses_live_observation_status(tmp_path, monkeyp
     seen = []
     async def preflight(self):
         pass
-    async def judge(self, transcript, events):
+    async def judge(self, transcript, events, *, seed=0):
         seen.append([(e["completed"], e["observation_status"]) for e in events])
         return repeat_policy.uncertain("projection only")
     monkeypatch.setattr(repeat_policy.JudgeClient, "preflight", preflight)
     monkeypatch.setattr(repeat_policy.JudgeClient, "judge", judge)
     asyncio.run(regression.evaluate_two_level(fixture, labels, tmp_path / "report.json", online=True))
-    assert seen == [[(True, "artifact_incomplete")] * 3,
-                    [(False, "transport_error"), (True, "observed")], [(True, "observed")] * 6]
+    assert seen == ([[ (True, "artifact_incomplete")] * 3] * 3
+                    + [[(False, "transport_error"), (True, "observed")]] * 3
+                    + [[(True, "observed")] * 6] * 3)
 
 
 @pytest.mark.parametrize("verdict,category,ids,reason,valid", [
@@ -534,3 +591,303 @@ def test_success_repeat_schema_cannot_cite_unexecuted_or_unavailable_events():
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(value, schema)
     jsonschema.validate({"verdict": "uncertain", "category": "insufficient_evidence", "event_ids": [], "reason": "missing outputs"}, schema)
+
+
+@pytest.mark.parametrize('ids,accepted', [
+    ([13, 15, 149, 15], True),  # Captured failures from the M=8/N=7 online run.
+    ([13, 13], False), ([13, 150, 149, 150], False),
+    ([13, True, 149, True], False), ([13, '15', 149, '15'], False),
+    ([13, 15, 149, 15, 13], False),
+])
+def test_repeat_duplicate_citations_preserve_all_other_validation(ids, accepted):
+    events = repeat_evidence_events(149)
+    original = {'verdict': 'repetitive', 'category': 'ineffective_action_loop',
+                'event_ids': ids, 'reason': 'Same invalid command without adaptation.'}
+    if not accepted:
+        with pytest.raises(ValueError):
+            repeat_policy.validate_verdict(original, events)
+        return
+    result = repeat_policy.validate_verdict(original, events)
+    assert result['event_ids'] == [13, 15, 149]
+    assert original['event_ids'] == [13, 15, 149, 15]  # Input is not mutated.
+    assert result['original_verdict'] == original and result['citation_normalized'] == 1
+    events[14]['observation_status'] = 'artifact_incomplete'
+    assert repeat_policy.evidence_guard(result, events)['verdict'] == 'uncertain'
+
+
+@pytest.mark.parametrize('verdict,category', [
+    ('uncertain', 'insufficient_evidence'), ('clean', 'none'), ('repetitive', 'none'),
+])
+def test_repeat_duplicate_normalization_never_repairs_semantics(verdict, category):
+    with pytest.raises(ValueError):
+        repeat_policy.validate_verdict({'verdict': verdict, 'category': category,
+            'event_ids': [1, 2, 2], 'reason': 'Do not repair this.'}, repeat_evidence_events())
+
+
+def test_repeat_eight_vote_normalization_and_audit_round_trip(monkeypatch):
+    import asyncio
+    client = repeat_policy.JudgeClient(repeat_policy.RepeatConfig(mode='apply', vote_count=8, vote_quorum=7))
+    requests = []
+    async def request(method, path, payload=None):
+        if path == '/v1/models':
+            return {'data': [{'id': client.config.model, 'max_model_len': client.config.max_context, 'root': '/model'}]}
+        if path == '/tokenize':
+            return {'count': 200}
+        requests.append(payload)
+        ids = [13, 15, 149, 15] if len(requests) in (6, 7) else [16, 149]
+        answer = {'reason': 'Repeated identical command without investigation.', 'verdict': 'repetitive',
+                  'category': 'ineffective_action_loop', 'event_ids': ids}
+        return {'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(answer)}}],
+                'usage': {'completion_tokens': 50}}
+    monkeypatch.setattr(client, '_request', request)
+    result = asyncio.run(client.judge_consensus('PUBLIC', repeat_evidence_events(149)))
+    assert result['verdict'] == 'repetitive' and result['repetitive_votes'] == 8
+    assert result['error_count'] == 0 and result['citation_normalized'] == 2
+    assert len({v['seed'] for v in result['votes']}) == 8
+    assert [v['vote_index'] for v in result['votes']] == list(range(1, 9))
+    assert [v['seed'] for v in result['votes']] == [req['seed'] for req in requests]
+    assert all(v['temperature'] == 0.2 for v in result['votes'])
+    for index in (5, 6):
+        vote = result['votes'][index]
+        assert json.loads(vote['original_response'])['event_ids'] == [13, 15, 149, 15]
+        assert vote['event_ids'] == [13, 15, 149]
+    assert result['input_sha256'] == result['votes'][0]['input_sha256']
+    assert result['served_root'] == '/model'
+    assert repeat_policy.compose_reward(client.config, raw=1, existing=1, valid=True,
+                                       validation=False, verdict=result['verdict']) == 0.1
+
+
+def test_repeat_benchmark_reports_nested_errors_and_consensus_identity(tmp_path, monkeypatch):
+    import asyncio
+    case = {'id': 'one', 'task_key': 'one', 'partition': 'development',
+            'events': [], 'raw': {'input': 'public', 'output': 'complete'}}
+    fixture = tmp_path / 'fixtures.jsonl.gz'
+    with gzip.open(fixture, 'wt') as stream:
+        stream.write(json.dumps(case) + '\n')
+    labels = tmp_path / 'labels.json'
+    labels.write_text(json.dumps({'policy_version': repeat_policy.POLICY_VERSION,
+        'cases': [{'id': 'one', 'expected': 'uncertain', 'reason': 'test abstention'}]}))
+    async def preflight(self):
+        pass
+    calls = []
+    async def judge(self, transcript, events, *, seed=0):
+        calls.append(seed)
+        return {**repeat_policy.uncertain('invalid citation'), 'error': 1,
+                'failure_stage': 'verdict_validation'}
+    monkeypatch.setattr(repeat_policy.JudgeClient, 'preflight', preflight)
+    monkeypatch.setattr(repeat_policy.JudgeClient, 'judge', judge)
+    report = asyncio.run(regression.evaluate_two_level(fixture, labels, tmp_path / 'out.json', online=True))
+    assert report['judge_errors'] == 1 and report['judge_vote_errors'] == 3
+    assert report['judge_error_stages'] == {'verdict_validation': 3}
+    row = report['rows'][0]
+    assert row['input_sha256'] and row['consensus_input_sha256']
+    assert row['failure_stage'] == 'verdict_validation'
+    assert not report['regression_pass']
+
+
+def test_repeat_public_alignment_preserves_full_context_and_excludes_private_data():
+    events = repeat_evidence_events(2)
+    response = 'START of public observation\n' + 'x' * 2000 + '\nEND of public observation'
+    events[0]['observation_view'] = repeat_policy.public_observation_view(response)
+    events[0]['metadata'] = {'hidden_test': 'PRIVATE_SECRET'}
+    transcript = 'FULL CONTEXT ' + response
+    body = json.loads(repeat_policy.judge_messages(transcript, events)[1]['content'])
+    assert body['public_transcript'] == transcript
+    first = body['events'][0]
+    assert first['id'] == 1 and first['arguments_view']['text'] == json.dumps(events[0]['arguments'], sort_keys=True)
+    view = first['observation_view']
+    assert view['omitted'] and view['source_chars'] == len(response)
+    assert view['text'].startswith('START') and view['text'].endswith('END of public observation')
+    assert len(view['text']) < 600 and 'PRIVATE_SECRET' not in json.dumps(body)
+    assert events[0]['completed']  # Display shortening does not fabricate missing evidence.
+
+
+def test_repeat_current_contract_extensions_preserve_frozen_cases(tmp_path):
+    import asyncio
+    from scripts.swe_repeat_contracts import success_repeat_judge_contracts
+    fixture = tmp_path / 'fixtures.jsonl.gz'
+    # Deliberately different label proves a current contract cannot overwrite frozen review.
+    case = {'id': 'synthetic:polling', 'task_key': 'synthetic:polling', 'partition': 'development',
+            'events': [], 'raw': {'input': '', 'output': ''}}
+    with gzip.open(fixture, 'wt') as stream:
+        stream.write(json.dumps(case) + '\n')
+    labels = tmp_path / 'labels.json'
+    labels.write_text(json.dumps({'policy_version': repeat_policy.POLICY_VERSION,
+        'cases': [{'id': case['id'], 'expected': 'uncertain', 'reason': 'frozen review'}]}))
+    before = (fixture.read_bytes(), labels.read_bytes())
+    report = asyncio.run(regression.evaluate_two_level(fixture, labels, tmp_path / 'out.json', include_current_contracts=True))
+    assert report['rows'][0]['expected'] == 'uncertain'
+    assert (fixture.read_bytes(), labels.read_bytes()) == before
+    assert len(report['contract_extensions']) == len(success_repeat_judge_contracts()) - 1
+    by_id = {r['id']: r for r in report['rows']}
+    assert by_id['synthetic:short_investigated_recovery_v1']['expected'] == 'uncertain'
+    for name in ('sustained_loop_then_recovery_v1', 'sustained_loop_with_irrelevant_reads_v1'):
+        assert by_id['synthetic:' + name]['expected'] == 'repetitive'
+
+
+@pytest.mark.parametrize('repetitive,expected', [(5, 'uncertain'), (6, 'uncertain'), (7, 'repetitive')])
+def test_repeat_eight_vote_fixed_denominator_with_invalid_replies(monkeypatch, repetitive, expected):
+    import asyncio
+    client = repeat_policy.JudgeClient(repeat_policy.RepeatConfig(vote_count=8, vote_quorum=7))
+    call_count = 0
+    async def judge(transcript, events, *, seed=0):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= repetitive:
+            return {'verdict': 'repetitive', 'category': 'ineffective_action_loop',
+                    'event_ids': [1, 2], 'reason': 'long observed loop'}
+        return {**repeat_policy.uncertain('invalid references'), 'error': 1, 'failure_stage': 'verdict_validation'}
+    monkeypatch.setattr(client, 'judge', judge)
+    result = asyncio.run(client.judge_consensus('public', repeat_evidence_events()))
+    assert call_count == result['vote_count'] == 8
+    assert result['verdict'] == expected and result['error_count'] == 8 - repetitive
+
+
+def test_repeat_consensus_cancellation_stops_remaining_votes(monkeypatch):
+    import asyncio
+    client = repeat_policy.JudgeClient(repeat_policy.RepeatConfig(vote_count=8, vote_quorum=7))
+    calls = []
+    async def judge(transcript, events, *, seed=0):
+        calls.append(seed)
+        raise asyncio.CancelledError
+    monkeypatch.setattr(client, 'judge', judge)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(client.judge_consensus('public', []))
+    assert len(calls) == 1
+
+
+def noop_events(count=5):
+    args = {'file_path': 'a.py', 'old_string': 'x=1', 'new_string': 'x=1'}
+    return [{'id': i + 1, 'name': 'Edit', 'arguments': dict(args), 'serial': True,
+             **repeat_policy.observation_fields(repeat_policy.NOOP_EDIT_RESULT),
+             **repeat_policy.noop_edit_evidence('Edit', args, repeat_policy.NOOP_EDIT_RESULT)} for i in range(count)]
+
+
+def test_repeat_noop_threshold_and_full_argument_identity():
+    assert repeat_policy.conservative_detect(noop_events(4))['verdict'] == 'uncertain'
+    result = repeat_policy.conservative_detect(noop_events())
+    assert result['verdict'] == 'repetitive' and result['event_ids'] == [1, 5]
+    assert result['category'] == 'ineffective_action_loop'
+    events = noop_events()
+    events[2]['arguments']['replace_all'] = True
+    events[2].update(repeat_policy.noop_edit_evidence('Edit', events[2]['arguments'], repeat_policy.NOOP_EDIT_RESULT))
+    assert repeat_policy.conservative_detect(events)['verdict'] == 'uncertain'
+
+
+@pytest.mark.parametrize('change', ['serial', 'completed', 'missing_proof', 'stale_proof', 'read',
+                                    'transport_error', 'artifact_incomplete', 'infrastructure_unavailable', 'missing'])
+def test_repeat_noop_rule_resets_on_uncertain_or_intervening_event(change):
+    events = noop_events(9)
+    middle = events[4]
+    if change in ('serial', 'completed'):
+        middle[change] = False
+    elif change == 'missing_proof':
+        middle.pop('noop_edit_evidence')
+    elif change == 'stale_proof':
+        middle['arguments']['file_path'] = 'other.py'
+    elif change == 'read':
+        middle['name'] = 'Read'
+    else:
+        middle['observation_status'] = change
+    assert repeat_policy.conservative_detect(events)['verdict'] == 'uncertain'
+
+
+@pytest.mark.parametrize('name,args,response,metadata', [
+    ('Edit', {'old_string': '', 'new_string': ''}, repeat_policy.NOOP_EDIT_RESULT, {}),
+    ('Edit', {'old_string': 'a', 'new_string': 'b'}, repeat_policy.NOOP_EDIT_RESULT, {}),
+    ('Bash', {'old_string': 'a', 'new_string': 'a'}, repeat_policy.NOOP_EDIT_RESULT, {}),
+    ('Edit', {'old_string': 'a', 'new_string': 'a'}, 'Edit failed: old_string was not found in a.py.', {}),
+    ('Edit', {'old_string': 'a', 'new_string': 'a'}, repeat_policy.NOOP_EDIT_RESULT + ' injected suffix', {}),
+    ('Edit', {'old_string': 'a', 'new_string': 'a'}, repeat_policy.NOOP_EDIT_RESULT, {'output_truncated': True}),
+    ('Edit', {'old_string': 'a', 'new_string': 'a'}, repeat_policy.NOOP_EDIT_RESULT, {'execution_error_type': 'ConnectionError'}),
+])
+def test_repeat_noop_capture_requires_exact_observed_rejection(name, args, response, metadata):
+    assert repeat_policy.noop_edit_evidence(name, args, response, metadata) == {}
+
+
+def test_repeat_spans_do_not_merge_across_progress_or_count_undispatched_calls():
+    events = noop_events(12)
+    events[5] = {'id': 6, 'name': 'Bash', 'arguments': {'command': 'pytest'},
+                 'completed': True, 'serial': True, 'observation_status': 'observed'}
+    events[-1]['completed'] = False
+    spans = repeat_policy.candidate_spans(events)
+    assert [(s['first_event_id'], s['last_event_id'], s['count']) for s in spans] == [(1, 5, 5), (7, 11, 5)]
+    assert all(s['all_explicit_noop_edits'] for s in spans)
+    transcript = 'full public evidence'
+    payload = json.loads(repeat_policy.judge_messages(transcript, events)[1]['content'])
+    assert payload['candidate_spans'] == spans and payload['public_transcript'] == transcript
+
+
+def test_repeat_historical_noop_tail_frozen_replay(tmp_path):
+    import asyncio
+    root = Path(__file__).resolve().parents[2] / 'analysis/success_repeat_v1_benchmark'
+    if not (root / 'fixtures.jsonl.gz').exists():
+        pytest.skip('Local frozen trajectory corpus is not distributed with source')
+    report = asyncio.run(regression.evaluate_two_level(root / 'fixtures.jsonl.gz', root / 'labels.json', tmp_path / 'replay.json'))
+    row = next(r for r in report['rows'] if r['id'] == '8af1ff21a143dbc78312')
+    assert row['level1'] == row['verdict'] == row['expected'] == 'repetitive'
+    assert any(s['first_event_id'] == 71 and s['last_event_id'] == 117 and s['count'] == 47
+               and s['all_explicit_noop_edits'] for s in row['candidate_spans'])
+    assert not any(r['level1'] == 'repetitive' for r in report['rows'] if r['expected'] != 'repetitive')
+
+
+def test_repeat_l2_audit_does_not_hide_miss_behind_l1(tmp_path, monkeypatch):
+    import asyncio
+    events = [{'index': i, 'batch': i, 'name': 'Edit', 'arguments': e['arguments'],
+               'response': repeat_policy.NOOP_EDIT_RESULT} for i, e in enumerate(noop_events())]
+    fixture = tmp_path / 'fixtures.jsonl.gz'
+    with gzip.open(fixture, 'wt') as stream:
+        stream.write(json.dumps({'id': 'case', 'task_key': 'case', 'partition': 'holdout',
+                    'events': events, 'raw': {'input': 'public', 'output': 'public', 'raw_score': 1}}) + '\n')
+    labels = tmp_path / 'labels.json'
+    labels.write_text(json.dumps({'policy_version': repeat_policy.POLICY_VERSION,
+                                 'cases': [{'id': 'case', 'expected': 'repetitive', 'reason': 'Explicit no-op loop'}]}))
+    async def preflight(self):
+        pass
+    calls = []
+    async def judge(self, transcript, events, *, seed=0):
+        calls.append(seed)
+        return {'verdict': 'clean', 'category': 'none', 'event_ids': [], 'reason': 'Wrong earlier-work justification'}
+    monkeypatch.setattr(repeat_policy.JudgeClient, 'preflight', preflight)
+    monkeypatch.setattr(repeat_policy.JudgeClient, 'judge', judge)
+    report = asyncio.run(regression.evaluate_two_level(fixture, labels, tmp_path / 'normal.json', online=True))
+    assert not calls and report['combined']['tp'] == 1
+    report = asyncio.run(regression.evaluate_two_level(fixture, labels, tmp_path / 'audit.json', online=True, audit_level2=True))
+    assert len(calls) == 3 and report['combined']['tp'] == 1
+    assert report['level2_independent']['fn'] == 1
+    assert not report['regression_pass'] and not report['level2_regression_pass']
+    assert report['penalty_safety_pass'] and report['model_format_pass']
+
+
+def test_repeat_preflight_records_actual_server_context_without_clamping(monkeypatch):
+    import asyncio
+    client = repeat_policy.JudgeClient(repeat_policy.RepeatConfig(max_context=262144,
+        url='http://user:secret@host:18090/path?token=secret'))
+    async def request(*args):
+        return {'data': [{'id': client.config.model, 'root': '/actual/root', 'max_model_len': 253952}]}
+    monkeypatch.setattr(client, '_request', request)
+    with pytest.raises(ValueError, match='context'):
+        asyncio.run(client.preflight())
+    provenance = client.provenance()
+    assert provenance['configured_max_context'] == 262144 and provenance['server_max_context'] == 253952
+    assert provenance['served_root'] == '/actual/root' and provenance['max_output'] == 1024
+    assert provenance['endpoint'] == 'http://host:18090/path' and 'secret' not in json.dumps(provenance)
+    assert not client.ready and provenance['policy_source_sha256']
+
+
+def test_repeat_exact_infrastructure_contradiction_remains_an_abstention(monkeypatch):
+    import asyncio
+    client = repeat_policy.JudgeClient(repeat_policy.RepeatConfig(vote_count=8, vote_quorum=7))
+    async def request(method, path, payload=None):
+        if path == '/v1/models':
+            return {'data': [{'id': client.config.model, 'max_model_len': client.config.max_context}]}
+        if path == '/tokenize':
+            return {'count': 100}
+        value = {'reason': 'Missing rg is an infrastructure failure and cannot support a penalty.',
+                 'verdict': 'repetitive', 'category': 'unchanged_read_search', 'event_ids': [1, 1, 1, 1]}
+        return {'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(value)}}]}
+    monkeypatch.setattr(client, '_request', request)
+    result = asyncio.run(client.judge_consensus('Search unavailable: rg is not installed.', repeat_evidence_events(2)))
+    assert result['vote_count'] == result['error_count'] == 8 and result['repetitive_votes'] == 0
+    assert result['verdict'] == 'uncertain' and result['failure_stage'] == 'verdict_validation'
+    assert all(json.loads(v['rejected_response_preview'])['event_ids'] == [1, 1, 1, 1] for v in result['votes'])

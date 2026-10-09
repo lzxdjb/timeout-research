@@ -1,6 +1,7 @@
 # SWE success-only repetition reward v1
 
-The current judge prompt is `repeat-judge-v5`; reward composition and the frozen
+The current judge prompt is `repeat-judge-v7`; Level 2 now uses the
+`repeat-quorum-v2` voting/audit policy. Reward composition and the frozen
 `success-repeat-v1` fixture/label identities are unchanged.
 
 The new policy is independent of `repeated_tool.py` and existing SFT filtering.
@@ -28,7 +29,7 @@ not create actor or infrastructure penalties.
 
 - `stock-rl-reflect/recipe/swe_agent/repetition_reward.py`: independent policy,
   strict configuration/verdict validation, public prompt, async vLLM client,
-  bounded state snapshots.
+  seeded Level 2 voting/quorum aggregation, bounded state snapshots.
 - `stock-rl-reflect/recipe/swe_agent/agent_loop.py`: dispatch evidence and reward
   composition after hidden evaluation. Releases execution session before judging.
 - `stock-rl-reflect/recipe/swe_agent/remote_execution_service.py`: optional full
@@ -151,7 +152,12 @@ training split because this implementation performs prompted inference only.
 
 Reports include separate Level 1, residual Level 2, combined and raw-success
 metrics; precision, recall, false-positive/negative rates, deferrals, uncertainty,
-errors, latency and token usage. False-negative rate on explicit clean verdicts
+errors, latency and token usage. With online evaluation, each Level 2 case gets
+three sequential judgments with distinct stable seeds at temperature 0.2; a
+2/3 repetitive quorum is required for a penalty. A clean quorum reports clean;
+split votes, uncertainty, invalid responses and service errors without a
+repetitive quorum defer and preserve reward. Level 1 remains deterministic and
+unchanged. Reports retain each vote and include aggregate vote counts. False-negative rate on explicit clean verdicts
 and missed positives including deferrals are reported separately. Old raw-success
 loops may fail today's submission gate: the raw-success subset is not an estimate
 of how many current training trajectories will actually be penalized.
@@ -187,9 +193,9 @@ event IDs. If fewer than two such events exist, the repetitive branch is removed
 This prevents the judge from citing an unexecuted terminal call or unavailable
 observation; runtime validation and the evidence guard remain independent checks.
 
-### Latest online check (2026-10-09)
+### Latest online checks (2026-10-09)
 
-`analysis/success_repeat_v1_benchmark/online_v5.json` records the current prompt's
+`analysis/success_repeat_v1_benchmark/online_v5.json` records the prior single-vote prompt's
 25-case run: 9/9 repetitive labels detected, 7/7 clean labels preserved, zero
 judge errors, and 5/5 repetitive historical raw-success cases detected. The
 infrastructure-unavailable and missing-artifact controls are no longer penalized.
@@ -197,6 +203,16 @@ The overall gate **still fails**: `728813e61a077490a88f`, labelled uncertain,
 is flagged for three invalid test commands interleaved with investigation and
 eventual recovery. Keep apply disabled pending adjudication and a conservative
 resolution of this recovery boundary. Do not relabel it merely to pass the gate.
+
+The quorum run at
+`analysis/success_repeat_v1_benchmark/online_quorum_20261009.json` passed
+preflight and completed all 25 cases (75 judgments, 132 seconds total judge
+latency), with zero judge errors. It classified all 9 repetitive and all 7
+clean cases correctly, but the same uncertain recovery case received a 2/3
+repetitive vote (the third vote said clean). The gate therefore still fails and
+the policy is not production-ready. This shows that voting reduces some
+sampling noise but does not resolve the underlying ambiguity; votes from one
+model remain correlated.
 
 Reports `online_v2.json` through `online_v5.json` preserve the diagnostic
 iterations. They exposed contradictory verdict/category pairs, empty reasons,
@@ -246,7 +262,12 @@ normal environment configuration. Set it to `off` to disable the new mode.
 `SWE_AGENT_REPEAT_JUDGE_TIMEOUT` defaults to 120 seconds (includes queue wait),
 `SWE_AGENT_REPEAT_JUDGE_CONCURRENCY` to 2 **per Ray worker/event loop**,
 `SWE_AGENT_REPEAT_JUDGE_MAX_OUTPUT` to 1024 and
-`SWE_AGENT_REPEAT_JUDGE_MAX_CONTEXT` to 131072. Server-side max-num-seqs bounds
+`SWE_AGENT_REPEAT_JUDGE_MAX_CONTEXT` to 131072. Level 2 voting defaults to
+`SWE_AGENT_REPEAT_JUDGE_VOTE_COUNT=3`,
+`SWE_AGENT_REPEAT_JUDGE_VOTE_QUORUM=2`, and
+`SWE_AGENT_REPEAT_JUDGE_TEMPERATURE=0.2`. The quorum must be a strict majority;
+each vote has its own timeout, so a slow trajectory can take up to M times the
+per-vote timeout. Server-side max-num-seqs bounds
 active inference; many workers can still create queue pressure. Start small and
 inspect latency, errors and judge coverage. Completion-ratio cutoffs can cancel
 slow whole rollouts, so avoid aggressive cutoffs during initial shadow checks.
@@ -264,8 +285,9 @@ If authenticating the service, use vLLM's `VLLM_API_KEY` on the service host and
 shared file containing the key. Only its path is forwarded in Ray configuration.
 
 Rollout reward metadata includes `repeat_reward_eligible`, `repeat_reward_applied`,
-`repeat_reward_would_apply`, `repeat_reward_l1_flagged`, `repeat_reward_judge_called`,
-`repeat_reward_uncertain`, errors, latency, tokens, original/final scores,
+`repeat_reward_would_apply`, `repeat_reward_l1_flagged`, the boolean
+`repeat_reward_judge_called`, separate `repeat_reward_judge_vote_count`, quorum/vote counts, uncertainty, errors,
+latency, tokens, original/final scores,
 `repeat_reward_verdict_json`, and `repeat_public_events_json`. Judge audit records
 contain prompt/policy versions, configured/served model identity and input hash.
 
@@ -286,3 +308,129 @@ These tests exercise reward truth tables, protocol composition, validation
 bypass, release ordering, no-op and concurrent tool evidence, actual local
 service read snapshots, mocked judge errors/overflow/schema/cancellation, public
 projection and existing tool contracts. They do not load or assess Qwen weights.
+
+
+## Recovery, citations and event alignment (prompt v6)
+
+The recovery exception takes precedence over identical invalid command arguments:
+short retries interleaved with relevant investigation and eventual correction
+are uncertain when their usefulness is ambiguous. The judge must consider
+intervening and subsequent events in its reason. Unrelated filler and eventual
+success cannot excuse an independently established sustained loop. This is a
+prompt policy, not a new deterministic claim about every investigation event.
+
+Each numbered event carries bounded public argument/observation views (512
+source characters plus an omission marker). These align IDs with commands and
+results; the complete original public transcript remains available and unchanged.
+Views explicitly report omitted content and are not independent full-output
+proof. Missing-artifact/transport guards remain unchanged. Both replay and live
+rollout use the same observation-view builder. The larger prompt is counted
+before inference; over-context cases still abstain rather than truncate silently.
+
+Replies with only redundant citation IDs can now be normalized. Raw list length,
+ID types/existence, verdict/category consistency and reason constraints are
+checked before acceptance; at least two distinct completed events are required.
+Unavailable evidence still blocks penalties. No unknown ID is dropped or coerced,
+and no uncertain verdict is upgraded. The original response and original verdict
+are retained alongside the normalization flag. Runtime validation remains strict
+because decoder support for JSON Schema uniqueItems varies.
+
+Each vote records index, seed and temperature. Consensus records M/N, input
+hashes, model identity, counts and failure stages even on abstention. Benchmark
+error-stage counts use individual votes, not an absent aggregate field.
+
+To evaluate the conservative 8/7 configuration in shadow mode, use:
+
+```bash
+export SWE_AGENT_REPEAT_JUDGE_URL=http://10.248.100.152:18090
+export SWE_AGENT_REPEAT_JUDGE_VOTE_COUNT=8
+export SWE_AGENT_REPEAT_JUDGE_VOTE_QUORUM=7
+export SWE_AGENT_REPEAT_JUDGE_TEMPERATURE=0.2
+export SWE_AGENT_REPEAT_REWARD_MODE=shadow
+python3 scripts/swe_repeat_regression.py two-level-evaluate \
+  --fixtures analysis/success_repeat_v1_benchmark/fixtures.jsonl.gz \
+  --labels analysis/success_repeat_v1_benchmark/labels.json \
+  --report analysis/success_repeat_v1_benchmark/online_v6_m8_n7.json \
+  --include-current-contracts --online
+```
+
+The optional contract flag appends new synthetic cases with IDs and content
+hashes recorded in the report. Existing frozen IDs/labels take precedence.
+The current additions pair short investigated recovery with long loops followed
+by recovery or padded with irrelevant reads. They extend the existing benchmark;
+no standalone test suite or replacement frozen labels are created. The client
+still defaults to 3/2 and reward mode off; the 8/7 settings above are explicit.
+Restart training workers to load the updated client; no judge restart is needed.
+
+
+### Single v6 online evaluation result
+
+Offline checks passed (750 tests). `online_v6_m8_n7.json` records one online
+run with 28 cases (25 frozen plus three contract extensions), M=8/N=7.
+The disputed recovery case received eight clean votes, the prior malformed
+citation case eight valid repetitive votes, and all three new controls met
+their expected penalty behavior. No duplicate normalization was needed online;
+the captured-response offline test verifies that behavior.
+
+The overall gate failed: redundant event views pushed four raw-success long
+trajectories over context (131,775–154,244 prompt tokens); all 32 corresponding
+vote attempts abstained before generation. Only 1/5 historical repetitive
+raw-success cases was detected. A separate infrastructure-control vote proposed
+an invalid penalty with [1,1,1,1] and was correctly rejected.
+Keep apply disabled. The next proposed fix is tokenizer-budgeted alignment
+views preserving the full transcript, shared prompt preparation, and real
+long-fixture budget tests. These next changes are not implemented. Full analysis:
+`analysis/success_repeat_v1_benchmark/diagnosis_v6_m8_n7.md`.
+
+## Conservative no-op rule and independent judge audit (v7)
+
+`repeat-conservative-v2` also flags five consecutive serial completed `Edit`
+calls with identical full arguments, nonempty equal old/new strings, and the
+exact public result `Edit made no changes: old_string and new_string are identical.`
+The dispatch wrapper and replay share evidence extraction. A different operation,
+changed arguments, concurrent call, transport error or incomplete result resets
+the run. Failed searches, missing old strings and arbitrary shell failures are
+not covered by this new rule. It requires no filesystem snapshot. Generic
+read/search rules still require the unchanged-scope evidence described above.
+
+The v7 prompt includes maximal consecutive candidate spans with exact first/last
+IDs, count and identical-string rejection facts. These are alignment aids, not
+judge verdicts. Full public evidence remains present. The judge must distinguish
+progress before, within and after a candidate span.
+
+Extend an existing frozen benchmark with `--include-current-contracts` and use
+`--audit-level2` to judge L1-positive cases independently as well. The independent
+result is stored in `level2_audit`; it never overrides the pipeline's L1 verdict.
+`level2_independent`, `penalty_safety_pass` and `model_format_pass` separate model
+accuracy from penalty safety and response validity. The strict `regression_pass`
+also fails on an independent judge miss or error; production readiness still
+requires human review and broader calibration. Judge latency/token/error totals
+include these extra audit calls. No frozen fixtures or labels are rewritten.
+
+Preflight/report provenance records the sanitized endpoint, actual served model
+root, configured and advertised contexts, output reserve, voting settings and
+source hashes. Set the CLIENT context explicitly to a value at or below the
+server-advertised limit; a server export does not propagate into other terminals.
+An incompatible limit fails preflight; it is never silently clamped.
+
+Example for the currently advertised 253952-token server (verify preflight):
+
+```bash
+export SWE_AGENT_REPEAT_JUDGE_URL=http://10.248.102.198:18090
+export SWE_AGENT_REPEAT_JUDGE_MAX_CONTEXT=253952
+export SWE_AGENT_REPEAT_JUDGE_VOTE_COUNT=8
+export SWE_AGENT_REPEAT_JUDGE_VOTE_QUORUM=7
+export SWE_AGENT_REPEAT_REWARD_MODE=shadow
+export SWE_AGENT_TRAINING_REPEATED_TOOL_REWARD_SHAPING=0
+python3 scripts/swe_repeat_regression.py judge-preflight
+python3 scripts/swe_repeat_regression.py two-level-evaluate \
+  --fixtures analysis/success_repeat_v1_benchmark/fixtures.jsonl.gz \
+  --labels analysis/success_repeat_v1_benchmark/labels.json \
+  --report analysis/success_repeat_v1_benchmark/online_v7_m8_n7.json \
+  --include-current-contracts --audit-level2 --online
+```
+
+M8/N7 is explicit for this evaluation; application defaults remain M3/N2 and
+reward mode remains off. Validation bypass and success-only reward composition
+are unchanged. This is client/policy code; serving vLLM needs no restart for the
+prompt update. New training workers must load the updated agent code.
