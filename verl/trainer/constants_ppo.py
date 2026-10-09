@@ -129,4 +129,11 @@ def get_ppo_ray_runtime_env(config=None):
         val = os.environ.get(key)
         if val is not None:
             runtime_env["env_vars"][key] = val
+    # SWE judge settings must also reach already-running remote Ray workers.
+    for key, value in os.environ.items():
+        if key.startswith("SWE_AGENT_REPEAT_") or (
+            os.environ.get("SWE_AGENT_REPEAT_REWARD_MODE", "off") != "off"
+            and key.startswith("SWE_AGENT_TRAINING_")
+        ):
+            runtime_env["env_vars"][key] = value
     return runtime_env

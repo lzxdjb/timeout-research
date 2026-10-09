@@ -533,6 +533,158 @@ def build(output: Path, count: int, max_step: int) -> dict:
     return manifest
 
 
+
+
+def build_two_level(existing: Path, v9: Path, output: Path) -> dict:
+    from recipe.swe_agent.repetition_reward import POLICY_VERSION
+    module = importlib.import_module(f"{__package__}.swe_repeat_contracts" if __package__ else "swe_repeat_contracts")
+    reviews = module.success_repeat_review_labels()
+    with gzip.open(existing, "rt") as stream:
+        cases = [json.loads(line) for line in stream]
+    cases = [c for c in cases if c["id"] in reviews]
+    if {c["id"] for c in cases} != set(reviews):
+        raise ValueError("Missing reviewed historical fixtures")
+    labels = [{"id": c["id"], "expected": reviews[c["id"]][0], "reason": reviews[c["id"]][1]} for c in cases]
+    v9_labels = module.success_repeat_v9_labels()
+    rows = [json.loads(line) for line in v9.read_text().splitlines()]
+    if len(rows) != 12:
+        raise ValueError("The reviewed v9 source must contain exactly 12 trajectories")
+    # Freeze source identity; never assign these review labels to a different run.
+    if v9.parent.name != "val_only_tool_contract_v9_20261009T031709Z" or v9.name != "0.jsonl":
+        raise ValueError("Review labels target the specific 20261009 v9 baseline")
+    if file_digest(v9) != "5a17a757393b9cc6f029d2f0a072435b9b895e361529c6cb25f9ea843062db2f":
+        raise ValueError("Reviewed v9 source content changed; labels require a new review")
+    for index, raw in enumerate(rows, 1):
+        case = make_case(raw, {"run": "v9", "split": "validation_data", "step": 0, "line": index, "path": str(v9)})
+        cases.append(case)
+        labels.append({"id": case["id"], "expected": v9_labels[index][0], "reason": v9_labels[index][1]})
+    for contract in module.success_repeat_judge_contracts():
+        task_key = "synthetic:" + contract["id"]
+        events = [{"index": i, "batch": i, "name": name, "arguments": args, "response": response}
+                  for i, (name, args, response) in enumerate(contract["calls"])]
+        case = {"id": task_key, "task_key": task_key, "partition": partition(task_key), "events": events,
+                "source": {"kind": "handwritten_contract", "policy_version": POLICY_VERSION},
+                "raw": {"input": contract["context"], "output": json.dumps(events), "raw_score": 1, "score": 1}}
+        cases.append(case)
+        labels.append({"id": task_key, "expected": contract["expected"], "reason": contract["reason"]})
+    if output.exists():
+        raise ValueError("Frozen output already exists; choose a new version directory")
+    output.mkdir(parents=True)
+    with (output / "fixtures.jsonl.gz").open("wb") as binary:
+        with gzip.GzipFile(fileobj=binary, mode="wb", mtime=0, filename="") as stream:
+            for case in cases:
+                # Retain only public text plus reward eligibility for offline reporting.
+                case["raw"] = {k: case["raw"].get(k) for k in ("input", "output", "raw_score", "score")}
+                stream.write((json.dumps(case, ensure_ascii=False) + "\n").encode())
+    write_json(output / "labels.json", {"policy_version": POLICY_VERSION,
+        "reviewer": "code-agent evidence review; human adjudication pending", "cases": labels})
+    manifest = {"policy_version": POLICY_VERSION, "cases": len(cases),
+        "fixtures_sha256": file_digest(output / "fixtures.jsonl.gz"),
+        "labels_sha256": file_digest(output / "labels.json"),
+        "sources": {str(existing): file_digest(existing), str(v9): file_digest(v9)},
+        "partition_policy": "Existing task-disjoint development/holdout hash split; no RM training split because this is inference-only calibration.",
+        "production_ready": False}
+    write_json(output / "manifest.json", manifest)
+    return manifest
+
+def two_level_metrics(rows: list[dict], key: str = "verdict") -> dict:
+    counts = collections.Counter()
+    for row in rows:
+        expected, actual = row["expected"], row[key]
+        counts["total"] += 1
+        if expected not in {"clean", "repetitive"}:
+            counts["unknown_label"] += 1
+            continue
+        counts["labelled"] += 1
+        counts["positive" if expected == "repetitive" else "negative"] += 1
+        if actual == "uncertain":
+            counts["deferred"] += 1
+            counts["deferred_positive" if expected == "repetitive" else "deferred_negative"] += 1
+        elif actual == "repetitive":
+            counts["tp" if expected == "repetitive" else "fp"] += 1
+        else:
+            counts["fn" if expected == "repetitive" else "tn"] += 1
+    ratio = lambda a, b: a / b if b else None
+    return {**counts, "precision": ratio(counts["tp"], counts["tp"] + counts["fp"]),
+            "recall": ratio(counts["tp"], counts["positive"]),
+            "false_positive_rate": ratio(counts["fp"], counts["negative"]),
+            "false_negative_rate": ratio(counts["fn"], counts["positive"]),
+            "missed_positive_rate_including_deferral": ratio(counts["fn"] + counts["deferred_positive"], counts["positive"])}
+
+
+async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *, online: bool = False) -> dict:
+    from recipe.swe_agent import repetition_reward as policy
+    manifest_path = fixtures.parent / "manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        if (manifest.get("policy_version") != policy.POLICY_VERSION
+                or manifest.get("fixtures_sha256") != file_digest(fixtures)
+                or manifest.get("labels_sha256") != file_digest(labels)):
+            raise ValueError("Frozen two-level benchmark integrity check failed")
+    labels_data = json.loads(labels.read_text())
+    if labels_data.get("policy_version") != policy.POLICY_VERSION:
+        raise ValueError("Labels must explicitly target success-repeat-v1, never reuse legacy repeat labels")
+    indexed_labels = {c["id"]: c for c in labels_data["cases"]}
+    config = policy.RepeatConfig.from_env()
+    client = policy.JudgeClient(config)
+    if online:
+        await client.preflight()
+    rows = []
+    with gzip.open(fixtures, "rt") as stream:
+        for line in stream:
+            case = json.loads(line)
+            if case["id"] not in indexed_labels:
+                continue
+            label = indexed_labels.pop(case["id"])
+            if label["expected"] not in {"clean", "repetitive", "uncertain"} or not label.get("reason"):
+                raise ValueError("Invalid independent label")
+            events = [{"id": e["index"] + 1, "name": e["name"], "arguments": e["arguments"],
+                       **policy.observation_fields(e.get("response")), "serial": e.get("batch") is not None and
+                       sum(x.get("batch") == e.get("batch") for x in case["events"]) == 1,
+                       "evidence": e.get("repeat_read_evidence", {})} for e in case["events"]]
+            verdict = policy.conservative_detect(events)
+            l1 = verdict["verdict"]
+            if online and l1 != "repetitive":
+                # Only persisted public input/output, never gts/private metadata.
+                verdict = await client.judge(case["raw"]["input"] + case["raw"]["output"], events)
+            rows.append({"id": case["id"], "task_key": case["task_key"], "partition": case["partition"],
+                         "expected": label["expected"], "label_reason": label["reason"],
+                         "source_kind": "synthetic" if case["id"].startswith("synthetic:") else "historical",
+                         "raw_success": case["raw"].get("raw_score") == 1,
+                         "level1": l1, **verdict})
+    if indexed_labels:
+        raise ValueError("Label IDs missing from frozen fixtures: " + str(sorted(indexed_labels)))
+    # Same task is partitioned once, irrespective of checkpoint, outcome or run.
+    partitions = collections.defaultdict(set)
+    for row in rows:
+        partitions[row["task_key"]].add(row["partition"])
+    if any(len(value) > 1 for value in partitions.values()):
+        raise ValueError("Task leakage between partitions")
+    report = {"policy_version": policy.POLICY_VERSION, "prompt_version": policy.PROMPT_VERSION,
+              "fixtures_sha256": file_digest(fixtures), "labels_sha256": file_digest(labels),
+              "online": online, "model": config.model, "cases": len(rows),
+              "level1": two_level_metrics(rows, "level1"), "combined": two_level_metrics(rows),
+              "residual_level2": two_level_metrics([r for r in rows if r["level1"] != "repetitive"]),
+              "raw_success_subset": two_level_metrics([r for r in rows if r["raw_success"] and r["source_kind"] == "historical"]),
+              "by_source_kind": {kind: two_level_metrics([r for r in rows if r["source_kind"] == kind]) for kind in ("historical", "synthetic")},
+              "by_partition": {p: two_level_metrics([r for r in rows if r["partition"] == p]) for p in sorted({r["partition"] for r in rows})},
+              "judge_errors": sum(r.get("error", 0) for r in rows),
+              "judge_error_stages": dict(collections.Counter(r.get("failure_stage", "unknown") for r in rows if r.get("error"))),
+              "guard_blocked": sum(r.get("guard_blocked", 0) for r in rows),
+              "unsafe_control_flags": sum(r["expected"] == "uncertain" and r["verdict"] == "repetitive" for r in rows),
+              "uncertain": sum(r["verdict"] == "uncertain" for r in rows),
+              "latency_seconds": sum(r.get("latency_seconds", 0) for r in rows),
+              "prompt_tokens": sum(r.get("prompt_tokens", 0) for r in rows),
+              "completion_tokens": sum(r.get("completion_tokens", 0) for r in rows),
+              "regression_pass": bool(online) and all(
+                  (r["verdict"] == r["expected"] if r["expected"] != "uncertain" else r["verdict"] != "repetitive")
+                  and not r.get("error") for r in rows) and bool(rows),
+              "production_ready": False,
+              "limitation": "Reviewed by code agent; requires human label review and online calibration. Offline replay does not measure judge accuracy. Historical scope evidence is never fabricated.",
+              "rows": rows}
+    write_json(report_path, report)
+    return report
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -543,7 +695,32 @@ def main() -> int:
     check = commands.add_parser("evaluate")
     check.add_argument("--fixtures", type=Path, required=True)
     check.add_argument("--report", type=Path, required=True)
+    freeze = commands.add_parser("two-level-build")
+    freeze.add_argument("--existing-fixtures", type=Path, required=True)
+    freeze.add_argument("--v9-trajectories", type=Path, required=True)
+    freeze.add_argument("--output-dir", type=Path, required=True)
+    commands.add_parser("judge-preflight")
+    two = commands.add_parser("two-level-evaluate")
+    two.add_argument("--fixtures", type=Path, required=True)
+    two.add_argument("--labels", type=Path, required=True)
+    two.add_argument("--report", type=Path, required=True)
+    two.add_argument("--online", action="store_true", help="Call the launched judge; omit for conservative offline replay")
     args = parser.parse_args()
+    if args.command == "two-level-build":
+        print(json.dumps(build_two_level(args.existing_fixtures, args.v9_trajectories, args.output_dir)))
+        return 0
+    if args.command == "judge-preflight":
+        import asyncio
+        from recipe.swe_agent.repetition_reward import JudgeClient, RepeatConfig
+        asyncio.run(JudgeClient(RepeatConfig.from_env()).preflight())
+        print("Repeat judge model/context preflight passed")
+        return 0
+    if args.command == "two-level-evaluate":
+        import asyncio
+        result = asyncio.run(evaluate_two_level(args.fixtures, args.labels, args.report, online=args.online))
+        print(json.dumps({k: result[k] for k in ("cases", "online", "level1", "combined", "raw_success_subset",
+            "judge_errors", "judge_error_stages", "guard_blocked", "unsafe_control_flags", "regression_pass", "production_ready")}))
+        return (0 if result["regression_pass"] else 1) if args.online else 0
     if args.command == "build":
         if args.count < len(ANCHORS):
             parser.error("--count must accommodate the mandatory known-failure anchors")
