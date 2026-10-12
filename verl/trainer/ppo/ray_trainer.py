@@ -283,6 +283,7 @@ def compute_advantage(
             config=config,
             diagnostics=grpo_metrics,
             expected_group_size=num_repeat if num_repeat > 1 else None,
+            valid_sample_mask=data.batch.get("grpo_valid_sample_mask"),
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns

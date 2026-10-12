@@ -86,11 +86,14 @@ from verl.trainer.ppo.utils import (
     need_teacher_policy,
 )
 from verl.trainer.ppo.v1.replay_buffer import (
+    trajectory_is_unverified,
+    unverified_trajectory_ratio_threshold,
     DAPO_FILTERED_REWARD_COUNTS_KEY,
     ReplayBuffer,
     ReplayBufferAsync,
     golden_replay_enabled,
     infrastructure_failure_ratio_threshold,
+    rollout_diagnostics,
 )
 from verl.trainer.ppo.v1.utils import (
     MetricsAggregator,
@@ -270,16 +273,43 @@ def _v1_train_sample_mask_from_tags(
         for key, tag in zip(keys, tags, strict=True)
         if isinstance(tag, dict) and bool(tag.get("completion_ratio_cutoff", False))
     }
+    threshold = unverified_trajectory_ratio_threshold("train")
+    finals = {}
+    for key, tag in zip(keys, tags, strict=True):
+        parts = str(key).rsplit("_", 2)
+        session = tuple(parts[:2]) if len(parts) == 3 else (str(key), "0")
+        output_index = int(parts[2]) if len(parts) == 3 else 0
+        if session not in finals or output_index > finals[session][0]:
+            finals[session] = (output_index, tag if isinstance(tag, dict) else {})
+    bad_sessions = {session for session, (_, tag) in finals.items() if trajectory_is_unverified(tag)}
+    evaluator_excluded_uids = {session[0] for session in bad_sessions} if threshold is None else set()
     keep = []
     for key, tag in zip(keys, tags, strict=True):
         tag = tag if isinstance(tag, dict) else {}
         uid = str(key).rsplit("_", 2)[0]
         keep.append(
             (not exclude_cutoff or uid not in cutoff_uids)
+            and uid not in evaluator_excluded_uids
+            and tuple(str(key).rsplit("_", 2)[:2]) not in bad_sessions
             and not bool(tag.get("is_padding", False))
             and bool(tag.get("train_sample_mask", True))
         )
     return torch.tensor(keep, dtype=torch.bool)
+
+
+def _v1_unverified_sample_mask_from_tags(keys: list[str], tags: list[dict]) -> torch.Tensor:
+    """Mask only evaluator-uncertain final sessions for GRPO normalization."""
+    finals = {}
+    for key, tag in zip(keys, tags, strict=True):
+        parts = str(key).rsplit("_", 2)
+        session = tuple(parts[:2]) if len(parts) == 3 else (str(key), "0")
+        output_index = int(parts[2]) if len(parts) == 3 else 0
+        if session not in finals or output_index > finals[session][0]:
+            finals[session] = (output_index, tag if isinstance(tag, dict) else {})
+    bad = {session for session, (_, tag) in finals.items() if trajectory_is_unverified(tag)}
+    return torch.tensor(
+        [tuple(str(key).rsplit("_", 2)[:2]) not in bad for key in keys], dtype=torch.bool
+    )
 
 
 def _tq_supports_checkpoint() -> bool:
@@ -1460,6 +1490,7 @@ class PPOTrainer(ABC):
                 batch_tags=success_metric_tags,
                 success_values=success_values,
                 prefix="validation",
+                unverified_threshold=unverified_trajectory_ratio_threshold("val"),
                 infrastructure_failure_ratio_threshold=infrastructure_failure_ratio_threshold("val"),
                 expected_rollout_count=int(self.config.actor_rollout_ref.rollout.val_kwargs.n),
                 metric_sources=data_sources,
@@ -1682,6 +1713,7 @@ class PPOTrainer(ABC):
                         (4, "tag_mask"),
                         (8, "timeout_prediction"),
                         (16, "infrastructure_filter"),
+                        (32, "evaluator_uncertainty"),
                     )
                     if int(exclusion_codes[i]) & bit
                 ) or ("other_filter" if not train_mask[i] else "none")
@@ -1690,15 +1722,7 @@ class PPOTrainer(ABC):
             if extra_fields is not None:
                 reward_infos = []
                 for extra in extra_fields.tolist():
-                    extra = getattr(extra, "data", extra)
-                    info = extra.get("reward_extra_info", {}) if isinstance(extra, dict) else {}
-                    info = info if isinstance(info, dict) else {}
-                    if isinstance(extra, dict):
-                        info = {
-                            **info,
-                            **{key: value for key, value in extra.items() if key.startswith("trajectory_")},
-                        }
-                    reward_infos.append(info)
+                    reward_infos.append(rollout_diagnostics(extra))
                 diagnostic_keys = {"raw_score", "shaped_score", "acc"}
                 diagnostic_keys.update(
                     key for info in reward_infos for key in info if key.startswith("partial_hidden_reward_")
@@ -1706,6 +1730,7 @@ class PPOTrainer(ABC):
                 diagnostic_keys.update(
                     key for info in reward_infos for key in info if key.startswith("trajectory_")
                 )
+                diagnostic_keys.update(key for info in reward_infos for key in info)
                 for key in sorted(diagnostic_keys):
                     reward_extra_infos_dict[key] = [reward_infos[i].get(key) for i in sorted_indices]
 
@@ -1721,7 +1746,10 @@ class PPOTrainer(ABC):
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         core_sources, core_uids, core_infos, coverage = usable_validation_metrics(
-            data_sources, sample_uids, reward_extra_infos_dict
+            data_sources, sample_uids, reward_extra_infos_dict,
+            unverified_threshold=unverified_trajectory_ratio_threshold("val"),
+            expected_rollout_count=(int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
+                                    if self is not None else None),
         )
         core_metrics = process_validation_metrics(core_sources, core_uids, core_infos) if core_sources else {}
         metric_dict = {}
@@ -1917,7 +1945,16 @@ class PPOTrainer(ABC):
             template = self._validation_prompt_templates.pop(uid, None)
             if template is None:
                 raise RuntimeError(f"Missing validation prompt template for discarded group {uid}")
+            previous_retry = template.get("__validation_retry_count__", 0)
+            retry = int(getattr(previous_retry, "data", previous_retry)) + 1
+            retry_limit = int(os.environ.get("SWE_AGENT_ROLLOUT_VALIDATION_MAX_GROUP_RETRIES", "2"))
+            if retry_limit < 0:
+                raise ValueError("SWE_AGENT_ROLLOUT_VALIDATION_MAX_GROUP_RETRIES must be nonnegative")
+            if retry > retry_limit:
+                raise RuntimeError(f"Validation evaluation unresolved after {retry_limit} group retries: {uid}; "
+                                   "no complete validation score is reported")
             replacement = template.clone()
+            replacement["__validation_retry_count__"] = NonTensorData(retry)
             new_uid = str(uuid.uuid4())
             replacement["uid"] = NonTensorStack.from_list([NonTensorData(new_uid)])
             replacements.append(replacement)
@@ -2283,6 +2320,13 @@ class PPOTrainer(ABC):
             return
 
         failure_values, code_values = self._extract_v1_infrastructure_metadata(extra_fields, direct_fields)
+        evaluator_mask = data.batch.get("grpo_valid_sample_mask")
+        if evaluator_mask is not None:
+            # The evaluator ratio is gated separately by ReplayBuffer. Legacy
+            # reward metadata also marks uncertainty as infrastructure failure;
+            # do not count it again in the independent infrastructure gate.
+            failure_values = failure_values.copy()
+            failure_values[~evaluator_mask.detach().cpu().numpy().astype(bool)] = 0
         data.non_tensor_batch["infrastructure_failure"] = failure_values
         data.non_tensor_batch["infrastructure_failure_code"] = code_values
         per_sample = self.config.algorithm.adv_estimator == AdvantageEstimator.GAE and int(
@@ -2378,6 +2422,11 @@ class PPOTrainer(ABC):
             exclusion_codes |= (~train_sample_mask.to(exclusion_codes.device).bool()).long() * 8
             data.batch["rm_scores"] = reward_tensor
             self._update_v1_timeout_predictor(data, prediction_targets)
+
+        evaluator_mask = _v1_unverified_sample_mask_from_tags(batch.keys, batch.tags)
+        if unverified_trajectory_ratio_threshold("train") is not None or not bool(evaluator_mask.all()):
+            data.batch["grpo_valid_sample_mask"] = evaluator_mask
+        exclusion_codes |= (~evaluator_mask.to(exclusion_codes.device)).long() * 32
 
         self._apply_v1_task_filter(data, extra_fields, metrics, direct_fields)
         task_excluded = data.non_tensor_batch.get("task_filter_excluded")
@@ -2767,6 +2816,7 @@ class PPOTrainer(ABC):
                 batch_tags=rollout_batch.tags,
                 success_values=success_values,
                 prefix="training",
+                unverified_threshold=unverified_trajectory_ratio_threshold("train"),
                 infrastructure_failure_ratio_threshold=infrastructure_failure_ratio_threshold("train"),
                 expected_rollout_count=int(self.config.actor_rollout_ref.rollout.n),
                 metric_sources=metric_sources,

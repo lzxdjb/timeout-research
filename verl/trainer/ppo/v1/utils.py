@@ -20,7 +20,11 @@ import torch
 from verl.protocol import DataProto
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import compute_advantage
-from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
+from verl.trainer.ppo.v1.replay_buffer import (
+    DAPO_FILTERED_REWARD_COUNTS_KEY,
+    trajectory_is_unverified,
+    unverified_group_decision,
+)
 
 
 _SUCCESS_RATIO_VARIANTS = (
@@ -224,6 +228,7 @@ def compute_v1_success_ratio_metrics(
     infrastructure_failure_ratio_threshold: float | None,
     expected_rollout_count: int,
     metric_sources: list[Any] | None = None,
+    unverified_threshold: float | None = None,
 ) -> dict[str, float]:
     """Compute trajectory success ratios after excluding whole V1 prompt groups.
 
@@ -266,16 +271,29 @@ def compute_v1_success_ratio_metrics(
 
     final_rows: list[tuple[str, float | None, bool, Any]] = []
     failures_by_group: Counter[str] = Counter()
+    final_tags_by_group: dict[str, list[dict]] = defaultdict(list)
     for (uid, _session_id), (_output_index, row_index) in final_by_session.items():
         success = _optional_finite_float(success_values[row_index])
         tag = batch_tags[row_index]
+        uncertain = trajectory_is_unverified(tag)
+        final_tags_by_group[uid].append(tag)
+        if uncertain:
+            success = None
         try:
             infrastructure_failure = int(tag.get("infrastructure_failure", False)) == 1
         except (TypeError, ValueError, OverflowError):
             infrastructure_failure = False
-        failures_by_group[uid] += int(infrastructure_failure)
+        failures_by_group[uid] += int(infrastructure_failure and not uncertain)
         source = metric_sources[row_index] if metric_sources is not None else None
         final_rows.append((uid, success, group_cutoff[uid], source))
+
+    unverified_groups = {
+        uid for uid, tags in final_tags_by_group.items()
+        if not group_cutoff[uid]
+        and (unverified_threshold is not None or any(trajectory_is_unverified(t) for t in tags))
+        and unverified_group_decision(tags, expected_rollout_count, unverified_threshold,
+                                     minimum_valid=2 if expected_rollout_count > 1 else 1)[0]
+    }
 
     infrastructure_groups: set[str] = set()
     if infrastructure_failure_ratio_threshold is not None:
@@ -285,7 +303,8 @@ def compute_v1_success_ratio_metrics(
             if failure_count / expected_rollout_count > infrastructure_failure_ratio_threshold
         }
 
-    cutoff_rows = [(uid, success) for uid, success, cutoff, _source in final_rows if not cutoff and success is not None]
+    cutoff_rows = [(uid, success) for uid, success, cutoff, _source in final_rows
+                   if not cutoff and uid not in unverified_groups and success is not None]
     valid_rows = [
         (uid, success) for uid, success in cutoff_rows if uid not in infrastructure_groups and success is not None
     ]
@@ -329,7 +348,8 @@ def compute_v1_success_ratio_metrics(
             if (str(row_source) if row_source not in (None, "") else "unknown") == source
             and success is not None
         ]
-        source_cutoff_rows = [(uid, success) for uid, success, cutoff in source_rows if not cutoff]
+        source_cutoff_rows = [(uid, success) for uid, success, cutoff in source_rows
+                              if not cutoff and uid not in unverified_groups]
         source_valid_rows = [
             (uid, success) for uid, success in source_cutoff_rows if uid not in infrastructure_groups
         ]
@@ -588,6 +608,10 @@ def compute_advantage_for_multi_trajectories(
     # scatter final scores to all rows in batch data
     scores = final_scores[row_to_local_index]
     scores = scores.unsqueeze(-1) * data.batch["response_mask"]
+    if "grpo_valid_sample_mask" in final_data.batch:
+        # A final session's validity applies to every output from that session.
+        keep = final_data.batch["grpo_valid_sample_mask"][row_to_local_index].bool()
+        scores = scores.masked_fill(~keep.unsqueeze(-1), 0)
 
     data.batch["advantages"] = scores
     data.batch["returns"] = scores

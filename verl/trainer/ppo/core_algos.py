@@ -276,6 +276,7 @@ def compute_grpo_outcome_advantage(
     config: Optional[AlgoConfig] = None,
     diagnostics: Optional[dict[str, float]] = None,
     expected_group_size: Optional[int] = None,
+    valid_sample_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -335,6 +336,13 @@ def compute_grpo_outcome_advantage(
     for position, uid in enumerate(index):
         group_positions[uid].append(position)
 
+    if valid_sample_mask is not None:
+        if valid_sample_mask.shape != scores.shape or not (
+            (valid_sample_mask == 0) | (valid_sample_mask == 1)
+        ).all():
+            raise ValueError("GRPO valid_sample_mask must be a binary vector with one value per response")
+        valid_sample_mask = valid_sample_mask.to(device=scores.device, dtype=torch.bool)
+
     stats = {
         "grpo/constant_groups": 0.0,
         "grpo/mixed_groups": 0.0,
@@ -357,7 +365,8 @@ def compute_grpo_outcome_advantage(
         return normalized, mean, std
 
     def invalid_reason(values: torch.Tensor, normalized: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> str:
-        if invariant_check and expected_group_size is not None and values.numel() != expected_group_size:
+        if (invariant_check and valid_sample_mask is None and expected_group_size is not None
+                and values.numel() != expected_group_size):
             return f"group size {values.numel()} does not match expected size {expected_group_size}"
         if not torch.isfinite(values).all():
             return "non-finite reward"
@@ -377,6 +386,11 @@ def compute_grpo_outcome_advantage(
         scalar_advantages = torch.zeros_like(scores)
         score_version = token_level_rewards._version
         for uid, positions in group_positions.items():
+            if valid_sample_mask is not None:
+                positions = [pos for pos in positions if valid_sample_mask[pos].item()]
+            if len(positions) < 2 and valid_sample_mask is not None:
+                stats["grpo/zeroed_groups"] += 1.0
+                continue
             position_tensor = torch.as_tensor(positions, device=scores.device, dtype=torch.long)
             values = scores.index_select(0, position_tensor)
             normalized, mean, std = normalize_group(values)

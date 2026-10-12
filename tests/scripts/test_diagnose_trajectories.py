@@ -5,6 +5,39 @@ import pytest
 from scripts import diagnose_trajectories as diagnosis
 
 
+def test_reference_audit_summary_preserves_unknown_coverage(tmp_path):
+    report = {"version": "swe-reference-audit-v1", "signature": "frozen", "source_match": False, "regression_pass": False,
+              "results": [{"task_id": "case", "status": "review:runner_launch_unverified", "arms": {
+                  "gold": {"classification": "runner_launch_unverified"}}}]}
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report))
+    summary = diagnosis.summarize_reference_audit(path)
+    assert summary["cases"] == 1 and summary["source_match"] is False
+    assert summary["arm_classifications"] == {"runner_launch_unverified": 1}
+
+
+def test_reference_audit_diagnosis_reuses_verified_private_log_collection(tmp_path):
+    import hashlib
+    private = tmp_path / "private"
+    private.mkdir()
+    data = json.dumps({"task_id": "case", "service_id": "service", "failure_phase": "test_execution",
+                       "phases": {"test_execution": {"output": "fixture 'httpbin' not found\nsecret output", "truncated": False}}}).encode()
+    digest = hashlib.sha256(data).hexdigest()
+    (private / (digest + ".json")).write_bytes(data)
+    report = {"version": "swe-reference-audit-v1", "signature": "frozen", "source_match": False, "regression_pass": False,
+              "results": [{"task_id": "case", "status": "review:runner_launch_unverified", "arms": {
+                  "gold": {"classification": "runner_launch_unverified", "reward": {"score": 0, "metadata": {
+                      "private_evaluator_artifact_path": "/service/" + digest + ".json",
+                      "private_evaluator_artifact_sha256": digest, "private_evaluator_service_id": "service"}}}}}]}
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report))
+    result = diagnosis.diagnose([], tmp_path / "out", reference_audits=[path], evaluator_roots=["/service=" + str(private)])
+    arm = result["reference_audits"][0]["arms"][0]
+    assert arm["private_evaluator"]["status"] == "verified"
+    assert arm["private_evaluator"]["review_signals"] == ["missing_test_fixture"]
+    assert "secret output" not in json.dumps(result)
+
+
 def call(name="Read", **parameters):
     body = "".join(
         f"<parameter={key}>\n{value}\n</parameter>" for key, value in parameters.items()
@@ -546,3 +579,70 @@ def test_environment_zero_tests_and_literal_escape_candidates(tmp_path):
     assert metrics['zero_test_execution_count'] == 1
     assert metrics['literal_regex_escape_candidate_count'] == 1
     assert metrics['generated_without_dispatch_count'] == 1
+
+
+def test_no_markdown_keeps_machine_readable_evidence(tmp_path):
+    source = tmp_path / '1.jsonl'
+    write_jsonl(source, [row()])
+    target = tmp_path / 'out'
+    assert diagnosis.main(['--input', str(source), '--label', 'one', '--output-dir', str(target), '--no-markdown']) == 0
+    assert not (target / 'report.md').exists()
+    assert (target / 'report.json').exists()
+    assert len((target / 'all_trajectories.jsonl').read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize('name,args,response,expected', [
+    ('Read', {'offset': '100.0'}, 'Read error: offset must be an integer >= 0.', ['read_argument_rejected', 'read_integral_decimal_rejected']),
+    ('Read', {'offset': '-1'}, 'Read error: offset must be an integer >= 0.', ['read_argument_rejected']),
+    ('Read', {}, 'file content mentions Read error: offset must be an integer >= 0.', []),
+    ('Glob', {}, 'Search error: unsupported fallback glob syntax; use *, ?, and ** wildcards or install rg for Grep. Results are incomplete.', ['glob_capability_rejected']),
+    ('Grep', {}, 'Search error: rg: regex parse error: unclosed group', ['regex_pattern_rejected']),
+    ('Bash', {}, 'Error: execute operation exceeded its hard timeout of 600s.', ['execute_hard_timeout']),
+    ('Bash', {}, 'Error: Command produced no output for 600s and was terminated.', ['execute_silent_timeout']),
+    ('Bash', {}, 'exit_code: 0\nok  example/pkg  1.316s\n[test outcome] not_run', ['go_package_success_evidence', 'go_package_success_reported_not_run']),
+    ('Read', {}, 'ok  example/pkg  1.316s\n[test outcome] not_run', []),
+    ('Bash', {}, 'exit_code: 0\n--- PASS: TestExample (0.00s)\nFAIL\n[test outcome] passed', ['terminal_failure_with_passed_feedback']),
+    ('Bash', {}, 'exit_code: 0\nFAIL spec/frisby.spec.js\nTest Suites: 1 failed, 8 passed, 9 total\nTests: 83 passed, 83 total\n[test outcome] passed', ['terminal_failure_with_passed_feedback']),
+    ('Bash', {}, 'exit_code: 0\n--- PASS: TestExample (0.00s)\nPASS\n[test outcome] passed', []),
+])
+def test_contract_review_distinguishes_tools_models_and_execution(name, args, response, expected):
+    assert diagnosis._contract_review_signals(name, args, response) == expected
+
+
+def test_missing_infrastructure_metadata_remains_unknown(tmp_path):
+    source = tmp_path / '1.jsonl'
+    write_jsonl(source, [row(train_sample_mask=True, trajectory_terminal_tool_failure=1)])
+    result = diagnosis.diagnose([diagnosis.InputSpec(source, 'train')], tmp_path / 'out', write_markdown=False)
+    metrics = result['groups'][0]['metrics']
+    assert metrics['metadata_coverage'] == {'infrastructure_failure': 0, 'reward_eligible': 0, 'train_sample_mask': 1}
+    assert metrics['terminal_tool_failure_count'] == 1
+
+
+@pytest.mark.parametrize('text,expected', [
+    ("get_requires_for_build_editable\nModuleNotFoundError: No module named 'setuptools.dep_util'", ['setuptools_dep_util_missing', 'editable_build_failure_without_pytest_session_evidence']),
+    ("test session starts\nModuleNotFoundError: No module named 'setuptools.dep_util'", ['setuptools_dep_util_missing']),
+    ("recursive dependency involving fixture 'httpbin' detected", ['httpbin_fixture_dependency_error']),
+    ('1 failed, 85 passed, 81 errors', []),
+])
+def test_private_evaluator_review_does_not_infer_infrastructure_from_test_failure(text, expected):
+    assert diagnosis._private_evaluator_review_signals(text) == expected
+def test_private_diagnostic_read_reopens_stale_handles_and_keeps_checksum_gate(tmp_path, monkeypatch):
+    import errno
+    import hashlib
+    from pathlib import Path
+    from scripts.diagnose_trajectories import _read_diagnostic_bytes
+    path = tmp_path / "blob"
+    path.write_bytes(b"evidence")
+    expected = hashlib.sha256(b"evidence").hexdigest()
+    original = Path.open
+    calls = []
+    def stale_once(self, *args, **kwargs):
+        calls.append(self)
+        if len(calls) == 1:
+            raise OSError(errno.ESTALE, "stale")
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", stale_once)
+    assert _read_diagnostic_bytes(path, 100, expected) == b"evidence"
+    assert len(calls) == 2
+    assert _read_diagnostic_bytes(path, 100, "0" * 64) == b"evidence"
+    assert len(calls) == 5  # The collector must reject these bytes after bounded retries.

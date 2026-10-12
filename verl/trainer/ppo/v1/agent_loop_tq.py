@@ -342,6 +342,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 ):
                     infrastructure_metadata_count += 1
             infrastructure_failure = _infrastructure_failure_from_extra_fields(extra_fields)
+            reward_info = extra_fields.get("reward_extra_info", {}) if isinstance(extra_fields, dict) else {}
+            evaluator_group_excluded = bool(
+                isinstance(reward_info, dict) and reward_info.get("evaluator_group_excluded", False)
+            )
             infrastructure_failure_count += int(infrastructure_failure)
             tags.append(
                 {
@@ -360,6 +364,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     # ReplayBuffer needs this before sampling so invalid groups
                     # do not contribute to completion-ratio accounting.
                     "infrastructure_failure": infrastructure_failure,
+                    "evaluator_group_excluded": evaluator_group_excluded,
+                    "unverified_trajectory": evaluator_group_excluded,
                 }
             )
 

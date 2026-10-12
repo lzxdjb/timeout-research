@@ -1102,46 +1102,47 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
-def usable_validation_metrics(data_sources, sample_uids, infos_dict):
-    """Return metrics inputs containing only complete, infrastructure-clean UID groups."""
-    from collections import Counter
+def usable_validation_metrics(data_sources, sample_uids, infos_dict, *,
+                              unverified_threshold=None, expected_rollout_count=None):
+    """Retain confirmed validation siblings only within the configured ratio."""
+    from collections import Counter, defaultdict
+    from verl.trainer.ppo.v1.replay_buffer import trajectory_is_unverified, unverified_group_decision
 
-    group_sizes = Counter(zip(data_sources, sample_uids))
-    expected = {}
-    for (source, _), count in group_sizes.items():
-        expected[source] = max(expected.get(source, 0), count)
-    failed = set()
-    failures = infos_dict.get("observed_infrastructure_failure", [])
+    grouped = defaultdict(list)
+    tags = []
     for index, key in enumerate(zip(data_sources, sample_uids)):
-        try:
-            if index < len(failures) and float(failures[index]) == 1.0:
-                failed.add(key)
-        except (TypeError, ValueError, OverflowError):
-            pass
-    eligible = {
-        key for key, count in group_sizes.items()
-        if key not in failed and (not failed or count == expected[key[0]])
-    }
-    indices = [index for index, key in enumerate(zip(data_sources, sample_uids)) if key in eligible]
+        tag = {name: values[index] for name, values in infos_dict.items() if index < len(values)}
+        tags.append(tag)
+        grouped[key].append(index)
+    expected_by_source = {}
+    for (source, _), rows in grouped.items():
+        expected_by_source[source] = max(expected_by_source.get(source, 0), len(rows))
+    eligible, infra, uncertain = set(), Counter(), Counter()
+    for key, rows in grouped.items():
+        group_tags = [tags[i] for i in rows]
+        expected = expected_rollout_count or expected_by_source[key[0]]
+        drop, _, _ = unverified_group_decision(group_tags, expected, unverified_threshold,
+                                               minimum_valid=2 if expected > 1 else 1)
+        ordinary_infra = any(tag.get("observed_infrastructure_failure") == 1
+                             and not trajectory_is_unverified(tag) for tag in group_tags)
+        if ordinary_infra:
+            infra[key[0]] += 1
+        if drop:
+            uncertain[key[0]] += 1
+        if not drop and not ordinary_infra:
+            eligible.add(key)
+    indices = [i for i, key in enumerate(zip(data_sources, sample_uids))
+               if key in eligible and not trajectory_is_unverified(tags[i])]
     counts = Counter(data_sources)
-    valid = Counter(data_sources[index] for index in indices)
-    infra = Counter(source for source, _ in failed)
-    coverage = {
-        source: {
-            "total_count": total,
-            "valid_count": valid[source],
-            "excluded_count": total - valid[source],
-            "infrastructure_failed_groups": infra[source],
-            "coverage": valid[source] / total,
-        }
-        for source, total in counts.items()
-    }
-    return (
-        [data_sources[index] for index in indices],
-        [sample_uids[index] for index in indices],
-        {name: [values[index] for index in indices] for name, values in infos_dict.items()},
-        coverage,
-    )
+    valid = Counter(data_sources[i] for i in indices)
+    coverage = {source: {"total_count": total, "valid_count": valid[source],
+                         "excluded_count": total - valid[source],
+                         "infrastructure_failed_groups": infra[source],
+                         "unverified_excluded_groups": uncertain[source],
+                         "coverage": valid[source] / total}
+                for source, total in counts.items()}
+    return ([data_sources[i] for i in indices], [sample_uids[i] for i in indices],
+            {name: [values[i] for i in indices] for name, values in infos_dict.items()}, coverage)
 
 
 def process_validation_metrics(

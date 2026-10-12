@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +17,1219 @@ from recipe.swe_agent import remote_execution_service as service
 from recipe.swe_agent import tool_contract_info as info
 from recipe.swe_agent import tools
 from recipe.swe_agent import rg_backend
+
+
+@pytest.fixture(autouse=True)
+def deterministic_audit_concurrency(monkeypatch):
+    # Existing quarantine tests intentionally admit only one case at a time.
+    # Dedicated scheduler tests below exercise multiple workers per endpoint.
+    monkeypatch.setenv("SWE_AGENT_REFERENCE_AUDIT_WORKERS_PER_ENDPOINT", "1")
+
+
+def audit_dataset(tmp_path, count=2):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    gold = tmp_path / "gold.patch"
+    gold.write_text("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-bad\n+good\n")
+    hidden = tmp_path / "hidden.patch"
+    hidden.write_text("hidden test patch")
+    rows = []
+    for index in range(count):
+        task = {"task_id": f"case-{index}", "repo": "fixture/repo", "base_sha": "abc", "docker_image": "cached",
+                "test_commands": ["set -eo pipefail\nsource /opt/miniconda3/bin/activate\nconda activate testbed\npytest tests/a.py"],
+                "hidden_test_patch_path": str(hidden), "artifact_paths": {"gold_patch": str(gold)}}
+        rows.append({"extra_info": {"tools_kwargs": {"__swe_task_json__": json.dumps(task)}}})
+    path = tmp_path / "dataset.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    return path
+
+
+class AuditClient:
+    def __init__(self):
+        self.calls, self.patched, self.active, self.max_active = [], set(), set(), 0
+        self.lock = threading.Lock()
+
+    def get(self, url, path, **kwargs):
+        if "?" in path:
+            return {"session_state": {"sessions": False}, "cleanup_state": {"complete": True}}
+        return {"ok": True, "source_fingerprint": info.source_fingerprint()}
+
+    def post(self, url, path, payload, deadline):
+        with self.lock:
+            self.calls.append((url, path, payload))
+            request = payload["request_id"]
+            if path == "/claim":
+                assert request not in self.active
+                self.active.add(request)
+                self.max_active = max(self.max_active, len(self.active))
+            if path == "/release":
+                self.active.remove(request)
+                return {"ok": True, "released": True, "container_removed": True}
+            if path == "/execute":
+                assert not payload["task"].get("evaluator_test_commands")
+                assert not payload["task"].get("artifact_paths")
+                if "git apply --check" in payload["parameters"]["command"]:
+                    self.patched.add(request)
+            if path == "/reward":
+                assert payload["task"].get("hidden_test_patch")
+                return {"ok": True, "score": float(request in self.patched), "metadata": {
+                    "hidden_runner_provenance": "launch_marker_v1", "hidden_tests_started": True,
+                    "hidden_test_counts_complete": True, "hidden_tests_total_count": 1, "hidden_failure_phase": "none"}}
+        time.sleep(.01)
+        return {"ok": True, "text": "exit_code: 0\n", "metadata": {"workspace": "/tmp/a", "container_name": "fixture"}}
+
+
+def rebench_dataset(tmp_path, count=4):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    path = audit_dataset(tmp_path, count)
+    rows = pq.read_table(path).to_pylist()
+    for i, row in enumerate(rows):
+        task = json.loads(row["extra_info"]["tools_kwargs"]["__swe_task_json__"])
+        task["repo"] = f"fixture/repo-{i}"
+        task["test_commands"] = ["pytest -rA tests/a.py"]
+        raw = tmp_path / f"raw-{i}.json"
+        raw.write_text(json.dumps({"instance_id": task["task_id"], "language": "python",
+                                   "install_config": {"log_parser": "parse_log_pytest"}}))
+        task["artifact_paths"]["raw_example"] = str(raw)
+        row["extra_info"]["tools_kwargs"]["__swe_task_json__"] = json.dumps(task)
+        row["reward_model"] = {"style": "rule", "ground_truth": json.dumps({"benchmark": "swe_rebench_v2",
+            "expected": "all_official_tests_pass", "fail_to_pass": ["tests/a.py::test_bug"],
+            "pass_to_pass": ["tests/a.py::test_old"]})}
+        row["index"] = 100 + i
+    table = pa.Table.from_pylist(rows).replace_schema_metadata({b"fixture": b"preserve-me"})
+    pq.write_table(table, path)
+    return path
+
+
+class RebenchClient(AuditClient):
+    def __init__(self, tmp_path, *, fault=None):
+        super().__init__()
+        self.root, self.fault = tmp_path / "private", fault
+        self.root.mkdir(exist_ok=True)
+
+    def post(self, url, path, payload, deadline):
+        if path != "/reward":
+            return super().post(url, path, payload, deadline)
+        import hashlib
+        request = payload["request_id"]
+        self.calls.append((url, path, payload))
+        gold = request in self.patched
+        marker = "SWE_RUNNER_LAUNCHED_" + "a" * 32
+        if self.fault == "summary_only":
+            records = ""
+        elif self.fault == "baseline_setup" and not gold:
+            records = "ERROR tests/a.py::test_bug\nPASSED tests/a.py::test_old\n"
+        else:
+            records = ("PASSED" if gold else "FAILED") + " tests/a.py::test_bug\nPASSED tests/a.py::test_old\n"
+        summary = "2 passed" if gold else "1 passed, 1 error" if self.fault == "baseline_setup" else "1 failed, 1 passed"
+        text = f"exit_code: {0 if gold else 1}\ncommand: ignored\n{marker}\n{records}================ {summary} in 0.01s ================\n"
+        artifact = {"task_id": payload["task"]["task_id"], "phases": {"test_commands": {
+            "output": text, "truncated": False, "sha256": hashlib.sha256(text.encode()).hexdigest()}}}
+        data = json.dumps(artifact).encode()
+        sha = hashlib.sha256(data).hexdigest()
+        location = self.root / (sha + ".json")
+        location.write_bytes(data)
+        return {"ok": True, "score": float(gold), "metadata": {
+            "hidden_runner_provenance": "launch_marker_v1", "hidden_tests_started": True,
+            "private_evaluator_artifact_path": str(location), "private_evaluator_artifact_sha256": sha,
+            "private_evaluator_artifact_status": "available", "hidden_failure_phase": "none"}}
+
+
+def rebench_options(client):
+    return {"profile": "rebench", "evaluator_roots": [str(client.root) + "=" + str(client.root)], "client": client}
+
+
+class GuardedRebenchClient(RebenchClient):
+    """Use the real service runner and private evidence protocol locally."""
+    def post(self, url, path, payload, deadline):
+        if path != "/reward":
+            return super().post(url, path, payload, deadline)
+        import hashlib
+        import re
+        from recipe.swe_agent.test_results import score_official_tests
+        task, request = payload["task"], payload["request_id"]
+        gold = request in self.patched
+        session = service.ExecutionSession("key", task, request, self.root, False)
+        phases = session._active_evaluator_phases = {}
+        index = 0
+        def run(command, **kwargs):
+            nonlocal index
+            marker = re.findall(r"SWE_RUNNER_LAUNCHED_[a-f0-9]+", command)[0]
+            failed = not gold and index == 0
+            if task["official_test_contract"]["log_parser"] == "parse_java_mvn":
+                text = "[INFO] Running tests.model.PagesTest\nTests run: 1, Failures: 0, Errors: 0, Skipped: 0\nBUILD SUCCESS\n"
+                failed = False
+            elif len(task["test_commands"]) > 1:
+                node = "test_bug" if index == 0 else "test_old"
+                text = f"{'FAILED' if failed else 'PASSED'} tests/a.py::{node}\n1 {'failed' if failed else 'passed'} in 0.1s\n"
+            else:
+                text = "FAILED tests/a.py::test_bug\nPASSED tests/a.py::test_old\n1 failed, 1 passed in 0.1s\n"
+                if not failed:
+                    text = "PASSED tests/a.py::test_bug\nPASSED tests/a.py::test_old\n2 passed in 0.1s\n"
+            index += 1
+            return int(failed), marker + "\n" + text
+        session.run = run
+        text, _, results = session._run_selected_commands({}, key="test_commands", return_results=True)
+        score = score_official_tests(task["official_test_contract"],
+                                     [r["_private_test_evidence"] for r in results], len(task["test_commands"]),
+                                     execution_exit_codes=[r["exit_code"] for r in results])
+        private = score.pop("_private_official_results")
+        private["score"] = dict(score)
+        phases["official_tests"] = json.dumps(private)
+        if self.fault == "input":
+            retained = json.loads(phases["runner_evidence_0"])
+            retained["provenance"]["parser_input_sha256"] = "wrong"
+            phases["runner_evidence_0"] = json.dumps(retained)
+        elif self.fault == "contract":
+            retained = json.loads(phases["runner_evidence_0"])
+            retained["provenance"]["contract_sha256"] = "wrong"
+            phases["runner_evidence_0"] = json.dumps(retained)
+        elif self.fault == "missing_proof":
+            phases.pop("runner_evidence_0")
+        elif self.fault == "score":
+            private["score"]["official_tests_passed"] = -1
+            phases["official_tests"] = json.dumps(private)
+        elif self.fault == "metadata":
+            score["official_tests_passed"] = -1
+        artifact = {"task_id": task["task_id"], "phases": {
+            k: {"output": v, "truncated": False, "sha256": hashlib.sha256(v.encode()).hexdigest()}
+            for k, v in phases.items()}}
+        data = json.dumps(artifact).encode()
+        sha = hashlib.sha256(data).hexdigest()
+        location = self.root / (sha + ".json")
+        location.write_bytes(data)
+        return {"ok": True, "score": float(score["official_tests_success"]), "metadata": {
+            **score, "hidden_runner_provenance": "launch_marker_v1", "hidden_tests_started": True,
+            "private_evaluator_artifact_path": str(location), "private_evaluator_artifact_sha256": sha,
+            "private_evaluator_artifact_status": "available", "hidden_failure_phase": "none"}}
+
+
+@pytest.mark.parametrize("fault", [None, "input", "contract", "missing_proof", "score", "metadata"])
+@pytest.mark.parametrize("multi_command", [False, True])
+def test_native_guarded_requires_identical_service_and_audit_scoring(tmp_path, fault, multi_command):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    path = rebench_dataset(tmp_path, 1)
+    if multi_command:
+        rows = pq.read_table(path).to_pylist()
+        task = json.loads(rows[0]["extra_info"]["tools_kwargs"]["__swe_task_json__"])
+        task["test_commands"] = ["pytest -rA tests/a.py -k test_bug", "pytest -rA tests/a.py -k test_old"]
+        rows[0]["extra_info"]["tools_kwargs"]["__swe_task_json__"] = json.dumps(task)
+        pq.write_table(pa.Table.from_pylist(rows), path)
+    client = GuardedRebenchClient(tmp_path, fault=fault)
+    report = online.reference_audit([path], ["http://one"], tmp_path / "audit", parser_policy="native-guarded",
+                                    **rebench_options(client))
+    result = report["results"][0]
+    assert result["status"] == ("review:audit_service_scoring_mismatch" if fault else "reference_verified")
+    for arm in result["arms"].values():
+        assert arm["reference_evidence"]["service_consistency"]["matched"] is (fault is None)
+    if fault is None:
+        receipt = online.audit_export_results(path, tmp_path / "audit/results.jsonl", tmp_path / "filtered.parquet")
+        assert receipt["rows"] == 1
+
+
+def test_maven_selector_in_command_header_cannot_be_certified_as_test(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    path = rebench_dataset(tmp_path, 1)
+    rows = pq.read_table(path).to_pylist()
+    task = json.loads(rows[0]["extra_info"]["tools_kwargs"]["__swe_task_json__"])
+    task["test_commands"] = ['mvn test -B -Dtest="tests.**.*Test" -DfailIfNoTests=false']
+    raw_path = Path(task["artifact_paths"]["raw_example"])
+    raw = json.loads(raw_path.read_text())
+    raw["install_config"]["log_parser"] = "parse_java_mvn"
+    raw_path.write_text(json.dumps(raw))
+    truth = json.loads(rows[0]["reward_model"]["ground_truth"])
+    truth.update(fail_to_pass=['"tests.**.*Test"'], pass_to_pass=["tests.model.PagesTest"])
+    rows[0]["reward_model"]["ground_truth"] = json.dumps(truth)
+    rows[0]["extra_info"]["tools_kwargs"]["__swe_task_json__"] = json.dumps(task)
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    report = online.reference_audit([path], ["http://one"], tmp_path / "audit", parser_policy="native-guarded",
+                                    **rebench_options(GuardedRebenchClient(tmp_path)))
+    arm = report["results"][0]["arms"]["gold"]
+    assert arm["reference_evidence"]["service_consistency"]["matched"]
+    assert not arm["reference_evidence"]["all_required_passed"]
+    assert arm["reference_evidence"]["missing"] == 1
+
+
+@pytest.mark.parametrize("failure", [None, "registry_authentication", "registry_not_found", "registry_network", "preparation_timeout", "storage_failure"])
+def test_rebench_explicit_provisioning_cache_miss_and_resume(tmp_path, failure):
+    class ProvisionClient(RebenchClient):
+        cache_present = False
+        def get(self, url, path, **kwargs):
+            result = super().get(url, path, **kwargs)
+            if "?" not in path:
+                result.update(image_inventory_complete=True, cached_images=[{"tag": "docker.io/library/cached:latest", "id": "sha256:image"}] if self.cache_present else [])
+            return result
+        def post(self, url, path, payload, deadline):
+            if path == "/audit_prepare_image":
+                self.calls.append((url, path, payload))
+                assert payload == {"image": "cached", "timeout_seconds": 3}
+                self.cache_present = failure is None
+                return {"ok": failure is None, "id": "sha256:image" if failure is None else None, "failure_kind": failure}
+            return super().post(url, path, payload, deadline)
+    path = rebench_dataset(tmp_path, 1)
+    client = ProvisionClient(tmp_path)
+    output = tmp_path / "audit"
+    options = {**rebench_options(client), "image_policy": "archive-or-pull", "image_prepare_seconds": 3}
+    report = online.reference_audit([path], ["http://one"], output, **options)
+    assert report["results"][0]["status"] == ("reference_verified" if failure is None else "review:image:" + failure)
+    assert bool([c for c in client.calls if c[1] == "/claim"]) is (failure is None)
+    count = len(client.calls)
+    resumed = online.reference_audit([path], ["http://one"], output, resume=True, **options)
+    assert resumed["signature"] == report["signature"] and len(client.calls) == count
+    ledger = json.loads((output / "results.jsonl").read_text())
+    assert ledger["image_preparation"]["ok"] is (failure is None)
+
+
+def test_rebench_incomplete_image_inventory_dispatches_without_full_probe_sweep(tmp_path):
+    class IncompleteClient(RebenchClient):
+        def get(self, url, path, **kwargs):
+            assert not path.startswith("/tool_contract_info?image="), "unexpected startup image sweep"
+            result = super().get(url, path, **kwargs)
+            if "?" not in path:
+                result.update(image_inventory_complete=False, cached_images=[])
+            return result
+    source = rebench_dataset(tmp_path, 4)
+    client = IncompleteClient(tmp_path)
+    report = online.reference_audit([source], ["http://one", "http://two"], tmp_path / "audit",
+                                    **rebench_options(client))
+    assert report["counts"] == {"reference_verified": 4}
+    assert len([call for call in client.calls if call[1] == "/claim"]) == 8
+
+
+def test_rebench_versioned_dataset_opt_in_preserves_source_and_validation(tmp_path):
+    import pyarrow.parquet as pq
+    from recipe.swe_agent.task_payload import with_official_test_contract, reward_task_payload, rollout_task_payload
+    path = rebench_dataset(tmp_path, 1)
+    original = path.read_bytes()
+    row = pq.read_table(path).to_pylist()[0]
+    task = json.loads(row["extra_info"]["tools_kwargs"]["__swe_task_json__"])
+    assert "official_test_contract" not in with_official_test_contract(task, row["reward_model"])
+    output = tmp_path / "versioned.parquet"
+    receipt = online.dataset_version(path, output, [], rebench_contract=True)
+    assert receipt["rows"] == 1 and path.read_bytes() == original
+    upgraded = pq.read_table(output).to_pylist()[0]
+    new_task = with_official_test_contract(json.loads(upgraded["extra_info"]["tools_kwargs"]["__swe_task_json__"]), upgraded["reward_model"])
+    payload = reward_task_payload(new_task)
+    assert payload["official_test_contract"]["rebench_scoring_version"] == 1
+    assert payload["evaluator_test_commands"][0]["source_command"] == task["test_commands"][0]
+    assert "official_test_contract" not in rollout_task_payload(payload)
+    assert pq.read_table(output).schema.metadata == pq.read_table(path).schema.metadata
+
+
+def test_rebench_replay_reuses_retained_pilot_evidence(tmp_path):
+    path = rebench_dataset(tmp_path, 1)
+    client = RebenchClient(tmp_path)
+    output = tmp_path / "audit"
+    online.reference_audit([path], ["http://one"], output, **rebench_options(client))
+    report = online.reference_replay([path], output / "report.json", tmp_path / "replay.json")
+    assert len(report["cases"]) == 2
+    assert report["reasons"] == {"complete": 2}
+    assert all(c["replayed_status"] == "reference_verified" for c in report["cases"])
+    fixtures = online.reference_replay_scenarios([path], output / "report.json", tmp_path / "replay.json")
+    assert len(fixtures) == 2
+    assert all(not case["steps"] for case in fixtures)
+    assert all(not online.check_parser_replay(case)["failures"] for case in fixtures)
+    frozen = tmp_path / "benchmark"
+    manifest = online.build(frozen, reference_datasets=[path], reference_audit_report=output / "report.json",
+                            reference_replay_report=tmp_path / "replay.json")
+    _, cases = online.load(frozen)
+    assert manifest["scenario_count"] == len(cases)
+    assert sum(case["id"].startswith("reference_") for case in cases) == 2
+    reviewed = json.loads((tmp_path / "replay.json").read_text())
+    reviewed["audit_sha256"] = "changed"
+    (tmp_path / "replay.json").write_text(json.dumps(reviewed))
+    with pytest.raises(ValueError, match="source audit"):
+        online.reference_replay_scenarios([path], output / "report.json", tmp_path / "replay.json")
+
+
+def test_reference_benchmark_requires_all_source_inputs(tmp_path):
+    with pytest.raises(ValueError, match="require datasets"):
+        online.build(tmp_path / "benchmark", reference_audit_report=tmp_path / "audit.json")
+
+
+def test_image_reference_normalization_and_failure_categories():
+    from recipe.swe_agent.image_archives import canonical_image_reference, image_failure_kind
+    assert canonical_image_reference("org/image:v2") == canonical_image_reference("docker.io/org/image:v2")
+    assert canonical_image_reference("ubuntu") == "docker.io/library/ubuntu:latest"
+    assert canonical_image_reference("ubuntu:v2") == "docker.io/library/ubuntu:v2"
+    assert canonical_image_reference("ubuntu@sha256:abc") == "docker.io/library/ubuntu@sha256:abc"
+    assert canonical_image_reference("ghcr.io/org/image:v2") == "ghcr.io/org/image:v2"
+    assert canonical_image_reference("localhost:5000/x@sha256:abc") == "localhost:5000/x@sha256:abc"
+    for text, expected in [("manifest unknown", "registry_not_found"), ("pull access denied", "registry_authentication"),
+                           ("no space left", "storage_failure"), ("connection reset", "registry_network"), ("deadline exceeded", "preparation_timeout")]:
+        assert image_failure_kind(text) == expected
+
+
+def test_rebench_audit_portable_filter_and_changed_concurrency_resume(tmp_path):
+    import pyarrow.parquet as pq
+    path = rebench_dataset(tmp_path)
+    original = path.read_bytes()
+    client = RebenchClient(tmp_path)
+    output = tmp_path / "audit"
+    report = online.reference_audit([path], ["http://one"], output, workers_per_endpoint=2, **rebench_options(client))
+    assert report["counts"] == {"reference_verified": 4} and report["complete"]
+    previous = len(client.calls)
+    resumed = online.reference_audit([path], ["http://one"], output, workers_per_endpoint=3, resume=True, **rebench_options(client))
+    assert len(client.calls) == previous and resumed["signature"] == report["signature"]
+    progress = json.loads((output / "progress.json").read_text())
+    assert progress["completed"] == 4 and progress["remaining"] == progress["running"] == progress["failed"] == 0
+    receipt = online.audit_export_results(path, output / "results.jsonl", tmp_path / "filtered.parquet")
+    assert receipt["rows"] == 4 and receipt["not_audited_rows"] == 0
+    assert pq.read_table(path).equals(pq.read_table(tmp_path / "filtered.parquet"), check_metadata=True)
+    assert path.read_bytes() == original
+    with pytest.raises(ValueError, match="overwrite"):
+        online.audit_export_results(path, output / "results.jsonl", path)
+    with pytest.raises(ValueError, match="signature"):
+        online.reference_audit([path], ["http://one"], output, seconds=200, resume=True, **rebench_options(client))
+
+
+@pytest.mark.parametrize("fault", ["summary_only", "baseline_setup"])
+def test_rebench_never_certifies_summary_only_or_baseline_setup_error(tmp_path, fault):
+    client = RebenchClient(tmp_path, fault=fault)
+    report = online.reference_audit([rebench_dataset(tmp_path, 1)], ["http://one"], tmp_path / "audit", **rebench_options(client))
+    assert not report["regression_pass"]
+    assert report["results"][0]["status"].startswith("review:")
+    rejected = report["results"][0]["arms"]["baseline"]["reference_evidence"]
+    assert rejected["parser_policy"] == "strict"
+    assert rejected["native_parser"]["candidate"]["authority"] == "native_observed_only"
+
+
+def test_rebench_native_shadow_preserves_strict_authority_and_signature(tmp_path):
+    path = rebench_dataset(tmp_path, 1)
+    client = RebenchClient(tmp_path)
+    output = tmp_path / "audit"
+    report = online.reference_audit(
+        [path], ["http://one"], output, parser_policy="native-first-shadow", **rebench_options(client)
+    )
+    result = report["results"][0]
+    assert result["status"] == "reference_verified"
+    assert result["native_reference_candidate"] == {
+        "authority": "audit_only_native_observed",
+        "eligible": True,
+        "reason": "native_reference_transition_observed",
+        "parser": "parse_log_pytest",
+    }
+    assert report["native_parser_summary"]["authority"] == "audit_only_native_observed"
+    assert report["native_parser_summary"]["candidate_count"] == 1
+    for arm in result["arms"].values():
+        evidence = arm["reference_evidence"]
+        assert evidence["parser_policy"] == "native-first-shadow"
+        assert evidence["native_parser"]["candidate"]["authority"] == "native_observed_only"
+        assert evidence["native_parser"]["all_command_observations_available"] is True
+    with pytest.raises(ValueError, match="signature"):
+        online.reference_audit([path], ["http://one"], output, resume=True, **rebench_options(client))
+    with pytest.raises(ValueError, match="unsupported ReBench parser policy"):
+        online.reference_audit([path], ["http://one"], tmp_path / "invalid", parser_policy="native", **rebench_options(client))
+
+
+@pytest.mark.parametrize("fault", ["summary_only", "baseline_setup"])
+def test_rebench_native_candidate_requires_complete_baseline_observations(tmp_path, fault):
+    client = RebenchClient(tmp_path, fault=fault)
+    report = online.reference_audit(
+        [rebench_dataset(tmp_path, 1)], ["http://one"], tmp_path / "audit", parser_policy="native-first-shadow",
+        **rebench_options(client),
+    )
+    candidate = report["results"][0]["native_reference_candidate"]
+    assert candidate["eligible"] is False
+    assert candidate["authority"] == "audit_only_native_observed"
+    assert report["native_parser_summary"]["candidate_count"] == 0
+
+
+def test_rebench_workspace_identity_accepts_untracked_but_rejects_tracked_changes(tmp_path):
+    import subprocess
+    client = RebenchClient(tmp_path)
+    online.reference_audit([rebench_dataset(tmp_path, 1)], ["http://one"], tmp_path / "audit", **rebench_options(client))
+    base_commands = [payload["parameters"]["command"] for _, path, payload in client.calls
+                     if path == "/execute" and "SWE_BASE_UNTRACKED" in payload["parameters"]["command"]]
+    assert len(base_commands) == 2
+    command = base_commands[0]
+    assert 'test -z "$tracked" || exit 1' in command
+    assert 'test -z "$tracked$untracked"' not in command
+    assert "untracked=$(git ls-files --others --exclude-standard" in command
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=repo, check=True, text=True, capture_output=True).stdout.strip()
+    git("init", "-q")
+    git("config", "user.name", "Fixture")
+    git("config", "user.email", "fixture@example.com")
+    (repo / "tracked.txt").write_text("base")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "base")
+    head = git("rev-parse", "HEAD")
+    probe = command.replace("expected=abc", "expected=" + head)
+    (repo / "generated.txt").write_text("untracked build artifact")
+    assert subprocess.run(["bash", "-c", probe], cwd=repo, capture_output=True).returncode == 0
+    (repo / "tracked.txt").write_text("changed")
+    assert subprocess.run(["bash", "-c", probe], cwd=repo, capture_output=True).returncode != 0
+    assert subprocess.run(["bash", "-c", probe.replace("expected=" + head, "expected=deadbeef")],
+                          cwd=repo, capture_output=True).returncode != 0
+
+
+def test_legacy_evaluator_fixture_validity_is_unknown_not_invalid():
+    response = {"ok": True, "score": 1.0, "metadata": {
+        "hidden_tests_started": True, "evaluation_valid": None, "hidden_failure_phase": "none",
+        "private_evaluator_artifact_status": "available", "private_evaluator_logs_complete": True,
+    }}
+    assert not online.check_evaluator_fixture(response)
+    response["metadata"]["evaluation_valid"] = False
+    assert online.check_evaluator_fixture(response) == ["evaluator fixture: valid"]
+
+
+def test_rebench_deterministic_diverse_pilot_and_explicit_partial_export(tmp_path):
+    path = rebench_dataset(tmp_path, 8)
+    manifest, cases = online.audit_inventory([path], profile="rebench")
+    assert manifest["counts"]["eligible"] == 8
+    for i, case in enumerate(cases):
+        case["inventory"].update(language="go" if i % 2 else "python", log_parser="go" if i % 2 else "pytest")
+    selected, selection = online.audit_pilot_selection(cases, 4, 42)
+    again, other = online.audit_pilot_selection(list(reversed(cases)), 4, 42)
+    assert selection == other and [c["inventory"]["id"] for c in selected] == [c["inventory"]["id"] for c in again]
+    assert len(selection["pilot"]) == 2 and sum(selection["pilot"].values()) == 4
+    with pytest.raises(ValueError, match="stratum"):
+        online.audit_pilot_selection(cases, 1, 42)
+    client = RebenchClient(tmp_path)
+    output = tmp_path / "pilot"
+    online.reference_audit([path], ["http://one"], output, pilot_size=3, seed=42, **rebench_options(client))
+    with pytest.raises(ValueError, match="every dataset row"):
+        online.audit_export_results(path, output / "results.jsonl", tmp_path / "full.parquet")
+    receipt = online.audit_export_results(path, output / "results.jsonl", tmp_path / "pilot.parquet", pilot_only=True)
+    assert receipt["rows"] == 3 and receipt["not_audited_rows"] == 5
+
+
+def test_rebench_recovers_uncertain_session_before_new_claim_and_repairs_ledger(tmp_path):
+    path = rebench_dataset(tmp_path, 1)
+    client = RebenchClient(tmp_path)
+    output = tmp_path / "audit"
+    report = online.reference_audit([path], ["http://one"], output, **rebench_options(client))
+    directory = output / "cases" / report["results"][0]["id"]
+    checkpoint = directory / "gold" / "0.json"
+    arm = json.loads(checkpoint.read_text())
+    arm.update(phase="reward", cleanup={"verified": False})
+    online.audit_write_json(checkpoint, arm)
+    (directory / "result.json").unlink()
+    (output / "results.jsonl").write_text('{"truncated":')
+    client.active.add(arm["request_id"])
+    previous = len(client.calls)
+    report = online.reference_audit([path], ["http://one"], output, resume=True, **rebench_options(client))
+    assert report["counts"] == {"reference_verified": 1}
+    calls = client.calls[previous:]
+    assert calls[0][1] == "/release" and calls[0][2]["request_id"] == arm["request_id"]
+    assert sum(path == "/claim" for _, path, _ in calls) == 1
+    assert (directory / "gold" / "1.json").exists() and not client.active
+    assert len((output / "results.jsonl").read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("fault", ["duplicate", "wrong_row", "wrong_source", "incomplete", "fake_verified"])
+def test_rebench_filter_rejects_invalid_portable_results(tmp_path, fault):
+    path = rebench_dataset(tmp_path, 1)
+    client = RebenchClient(tmp_path)
+    output = tmp_path / "audit"
+    online.reference_audit([path], ["http://one"], output, **rebench_options(client))
+    ledger = output / "results.jsonl"
+    record = json.loads(ledger.read_text())
+    if fault == "wrong_row":
+        record["row"] = 2
+    elif fault == "wrong_source":
+        record["dataset_sha256"] = "bad"
+    elif fault == "incomplete":
+        record["complete"] = False
+    elif fault == "fake_verified":
+        record["arms"]["baseline"]["reference_evidence"]["fail_to_pass_failed"] = 0
+    ledger.write_text(json.dumps(record) + "\n" + (json.dumps(record) + "\n" if fault == "duplicate" else ""))
+    with pytest.raises(ValueError):
+        online.audit_export_results(path, ledger, tmp_path / "filtered.parquet")
+    assert not (tmp_path / "filtered.parquet").exists()
+
+
+@pytest.mark.parametrize("command,text,code,complete", [
+    ("pytest -rA", "PASSED a.py::test_a\nFAILED a.py::test_b - assert False\n1 failed, 1 passed in 0.01s\n", 1, True),
+    ("pytest -rA", "1 failed, 1 passed in 0.01s\n", 1, False),
+    ("pytest -rA", "ERROR a.py::test_a\n1 error in 0.01s\n", 1, False),
+    ("pytest -rA", "PASSED a.py::test_a\nPASSED a.py::test_a\n2 passed in 0.01s\n", 0, False),
+    ("pytest -rA", "PASSED a.py::test_a\n1 passed in 0.01s\n", 1, False),
+    ("go test -v .", "=== RUN   TestA\n--- PASS: TestA (0.00s)\nPASS\nok\tmodule/pkg\t0.001s\n", 0, True),
+    ("go test -v .", "=== RUN   TestA\n--- FAIL: TestA (0.00s)\nFAIL\nFAIL\tmodule/pkg\t0.001s\n", 1, True),
+    ("cargo test", "running 1 test\ntest test_a ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n", 0, True),
+    ("cargo test", "error: compilation failed\n", 101, False),
+    ("npm test", "Tests: 1 passed, 1 total\nTest Suites: 1 passed, 1 total\n", 0, False),
+])
+def test_rebench_exact_identity_evidence(command, text, code, complete):
+    assert online.audit_rebench_outcomes(command, text, code)["complete"] is complete
+
+
+def test_rebench_wrapper_preserves_original_shell_and_private_contract(tmp_path):
+    import subprocess
+    _, cases = online.audit_inventory([rebench_dataset(tmp_path, 1)], profile="rebench")
+    original = cases[0]["task"]
+    original["test_commands"] = ["false; printf 'reached\\n'"]
+    payload = online.audit_rebench_task(original, 300)
+    assert subprocess.run(["bash", "-c", payload["test_commands"][0]], capture_output=True, text=True).stdout == "reached\n"
+    assert payload["official_test_contract"]["rebench_scoring_version"] == 1
+    from recipe.swe_agent.task_payload import rollout_task_payload
+    assert "official_test_contract" not in rollout_task_payload(payload)
+    assert original["test_commands"] == ["false; printf 'reached\\n'"]
+
+
+def test_rebench_completed_failures_are_not_retried_on_resume(tmp_path):
+    path = rebench_dataset(tmp_path, 2)
+    client = RebenchClient(tmp_path, fault="summary_only")
+    output = tmp_path / "audit"
+    first = online.reference_audit([path], ["http://one"], output, **rebench_options(client))
+    previous = len(client.calls)
+    second = online.reference_audit([path], ["http://one"], output, resume=True, **rebench_options(client))
+    assert second["counts"] == first["counts"] and second["complete"]
+    assert len(client.calls) == previous
+    progress = json.loads((output / "progress.json").read_text())
+    assert progress["failed"] == progress["review"] == 2
+
+
+def test_rebench_unrecoverable_cleanup_blocks_work_without_marking_it_completed(tmp_path, monkeypatch):
+    path = rebench_dataset(tmp_path, 2)
+    client = RebenchClient(tmp_path)
+    output = tmp_path / "audit"
+    report = online.reference_audit([path], ["http://one"], output, **rebench_options(client))
+    for result in report["results"]:
+        directory = output / "cases" / result["id"]
+        (directory / "result.json").unlink()
+    checkpoint = output / "cases" / report["results"][0]["id"] / "baseline" / "0.json"
+    arm = json.loads(checkpoint.read_text())
+    arm.update(phase="claim", cleanup={"verified": False})
+    online.audit_write_json(checkpoint, arm)
+    monkeypatch.setattr(online, "audit_recover_arm", lambda *args: args[-1])
+    previous = len(client.calls)
+    resumed = online.reference_audit([path], ["http://one"], output, resume=True, **rebench_options(client))
+    assert not resumed["complete"] and resumed["quarantined_endpoints"] == ["http://one"]
+    assert len(client.calls) == previous
+    assert all(result["complete"] is False for result in resumed["results"])
+    with pytest.raises(ValueError, match="incomplete"):
+        online.audit_export_results(path, output / "results.jsonl", tmp_path / "filtered.parquet")
+
+
+def test_rebench_filter_retains_only_verified_rows_in_original_order(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    path = rebench_dataset(tmp_path, 4)
+    client = RebenchClient(tmp_path)
+    output = tmp_path / "audit"
+    online.reference_audit([path], ["http://one"], output, workers_per_endpoint=2, **rebench_options(client))
+    ledger = output / "results.jsonl"
+    records = [json.loads(line) for line in ledger.read_text().splitlines()]
+    for record in records:
+        if record["row"] % 2:
+            record["status"] = "review:unsupported_identity_parser"
+    ledger.write_text("".join(json.dumps(record) + "\n" for record in reversed(records)))
+    receipt = online.audit_export_results(path, ledger, tmp_path / "filtered.parquet")
+    assert receipt["retained_row_indices"] == [0, 2]
+    assert pq.read_table(tmp_path / "filtered.parquet").equals(pq.read_table(path).take(pa.array([0, 2])), check_metadata=True)
+
+
+def repeat_audits(tmp_path, directories=("first", "repeat")):
+    class CachedGuardedClient(GuardedRebenchClient):
+        def get(self, url, route, **kwargs):
+            result = super().get(url, route, **kwargs)
+            if route == "/tool_contract_info":
+                result["cached_images"] = [{"tag": "cached", "id": "sha256:fixture-image"}]
+            return result
+    path = rebench_dataset(tmp_path, 2)
+    client = CachedGuardedClient(tmp_path)
+    for directory in directories:
+        online.reference_audit([path], ["http://one"], tmp_path / directory,
+                               parser_policy="native-guarded", **rebench_options(client))
+    return path, tmp_path / "first/results.jsonl", tmp_path / "repeat/results.jsonl"
+
+
+def test_repeat_qualified_export_preserves_rows_and_metadata(tmp_path):
+    from scripts.swe_reference_reliability import qualify_repeats
+    import pyarrow.parquet as pq
+    path, first, repeat = repeat_audits(tmp_path)
+    result = qualify_repeats(first, [repeat], tmp_path / "qualified")
+    assert result["repeat_qualified"] == 2
+    receipt = online.audit_export_results(path, tmp_path / "qualified/qualified_results.jsonl",
+                                          tmp_path / "filtered.parquet", require_repeat=True)
+    assert receipt["rows"] == 2
+    assert receipt["repeat_required"]
+    assert pq.read_table(path).equals(pq.read_table(tmp_path / "filtered.parquet"), check_metadata=True)
+    with pytest.raises(ValueError, match="two independent"):
+        online.audit_export_results(path, first, tmp_path / "unqualified.parquet", require_repeat=True)
+
+
+@pytest.mark.parametrize("fault", ["transport", "transport_with_test_failure", "uncertainty"])
+def test_repeat_retry_recovers_only_transient_failures(tmp_path, fault):
+    from scripts.swe_reference_reliability import qualify_repeats, validate_repeat_qualification
+    _, first, repeat = repeat_audits(tmp_path, ("first", "repeat", "retry"))
+    rows = [json.loads(line) for line in repeat.read_text().splitlines()]
+    row = rows[0]
+    row["status"] = "review:baseline:transport_failure"
+    row["arms"]["baseline"]["classification"] = "transport_failure"
+    row["arms"]["baseline"]["reference_evidence"] = {}
+    if fault == "transport_with_test_failure":
+        row["arms"]["gold"]["score"] = 0
+        row["arms"]["gold"]["reference_evidence"]["all_required_passed"] = False
+    elif fault == "uncertainty":
+        row["status"] = "review:gold:parser_ambiguity"
+        row["arms"]["baseline"]["classification"] = "parser_ambiguity"
+    repeat.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    initial = qualify_repeats(first, [repeat], tmp_path / "initial")
+    assert initial["repeat_qualified"] == 1
+    assert initial["retry_candidates"] == int(fault == "transport")
+    result = qualify_repeats(first, [repeat, tmp_path / "retry/results.jsonl"], tmp_path / "qualified")
+    assert result["repeat_qualified"] == (2 if fault == "transport" else 1)
+    if fault == "transport":
+        record = next(r for r in map(json.loads, (tmp_path / "qualified/qualified_results.jsonl").read_text().splitlines())
+                      if r["row"] == row["row"])
+        validate_repeat_qualification(record)
+        record["repeat_qualification"]["attempts"][1]["verification_context"]["evaluator_sha256"] = "changed"
+        with pytest.raises(ValueError, match="identity changed"):
+            validate_repeat_qualification(record)
+
+
+@pytest.mark.parametrize("fault", ["uncertain", "contract", "request", "copied", "image"])
+def test_repeat_rejects_uncertainty_and_changed_or_reused_evidence(tmp_path, fault):
+    from scripts.swe_reference_reliability import qualify_repeats
+    _, first, repeat = repeat_audits(tmp_path)
+    rows = [json.loads(line) for line in repeat.read_text().splitlines()]
+    if fault == "copied":
+        repeat.write_bytes(first.read_bytes())
+    else:
+        if fault == "uncertain":
+            rows[0]["status"] = "review:gold:required_tests_missing_skipped_or_ambiguous"
+        elif fault == "contract":
+            rows[0]["verification_context"]["reference_contract_sha256"] = "changed"
+        elif fault == "image":
+            rows[0]["verification_context"]["image_id"] = "changed"
+        else:
+            original = {r["row"]: r for r in map(json.loads, first.read_text().splitlines())}
+            rows[0]["arms"]["gold"]["request_id"] = original[rows[0]["row"]]["arms"]["gold"]["request_id"]
+        repeat.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    if fault == "uncertain":
+        report = qualify_repeats(first, [repeat], tmp_path / "qualified")
+        assert report["repeat_qualified"] == 1
+        assert report["retry_candidates"] == 0
+    else:
+        with pytest.raises(ValueError):
+            qualify_repeats(first, [repeat], tmp_path / "qualified")
+
+
+def test_rebench_source_mismatch_and_invalid_roots_fail_before_claims(tmp_path):
+    path = rebench_dataset(tmp_path, 1)
+    client = RebenchClient(tmp_path)
+    original_get = client.get
+    def get(url, route):
+        value = original_get(url, route)
+        if route == "/tool_contract_info":
+            value["source_fingerprint"] = {"sha256": "mismatch"}
+        return value
+    client.get = get
+    with pytest.raises(ValueError, match="matching deployed sources"):
+        online.reference_audit([path], ["http://one"], tmp_path / "audit", **rebench_options(client))
+    assert not client.calls
+    with pytest.raises(ValueError, match="ABSOLUTE"):
+        online.reference_audit([path], ["http://one"], tmp_path / "invalid", profile="rebench", evaluator_roots=["relative=/tmp"], client=client)
+
+
+def test_reference_audit_parallel_isolation_resume_and_explicit_export(tmp_path):
+    import pyarrow.parquet as pq
+    path = audit_dataset(tmp_path, 4)
+    before = path.read_bytes()
+    client = AuditClient()
+    directory = tmp_path / "audit"
+    report = online.reference_audit([path], ["http://one", "http://two"], directory, client=client)
+    assert report["counts"] == {"reference_verified": 4} and report["regression_pass"]
+    assert client.max_active == 2 and not client.active
+    claims = [call[2]["request_id"] for call in client.calls if call[1] == "/claim"]
+    assert len(set(claims)) == 8
+    previous = len(client.calls)
+    assert online.reference_audit([path], ["http://one", "http://two"], directory, resume=True, client=client) == report
+    assert len(client.calls) == previous
+    with pytest.raises(ValueError, match="signature"):
+        online.reference_audit([path], ["http://one", "http://two"], directory, seconds=100, resume=True, client=client)
+    receipt = online.audit_export(directory / "report.json", tmp_path / "filtered.parquet")
+    assert receipt["rows"] == 4 and pq.read_table(tmp_path / "filtered.parquet").num_rows == 4
+    assert path.read_bytes() == before
+    with pytest.raises(ValueError, match="overwrite"):
+        online.audit_export(directory / "report.json", path)
+
+
+@pytest.mark.parametrize("workers", [2, 3])
+def test_reference_audit_configurable_same_endpoint_parallelism(tmp_path, workers, monkeypatch):
+    monkeypatch.setenv("SWE_AGENT_REFERENCE_AUDIT_WORKERS_PER_ENDPOINT", str(workers))
+    barrier = threading.Barrier(workers)
+    class ParallelClient(AuditClient):
+        def post(self, url, path, payload, deadline):
+            result = super().post(url, path, payload, deadline)
+            if path == "/claim":
+                barrier.wait(timeout=10)
+            return result
+    client = ParallelClient()
+    report = online.reference_audit([audit_dataset(tmp_path, workers)], ["http://one"], tmp_path / "audit", client=client)
+    assert report["workers_per_endpoint"] == workers
+    assert client.max_active == workers and not client.active
+    assert report["counts"] == {"reference_verified": workers}
+    requests = [p["request_id"] for _, route, p in client.calls if route == "/claim"]
+    assert len(requests) == len(set(requests)) == workers * 2
+
+
+def test_reference_audit_default_parallelism_and_cli_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWE_AGENT_REFERENCE_AUDIT_WORKERS_PER_ENDPOINT")
+    report = online.reference_audit([audit_dataset(tmp_path, 1)], ["http://one"], tmp_path / "default", client=AuditClient())
+    assert report["workers_per_endpoint"] == 2
+    monkeypatch.setenv("SWE_AGENT_REFERENCE_AUDIT_WORKERS_PER_ENDPOINT", "8")
+    report = online.reference_audit([tmp_path / "dataset.parquet"], ["http://one"], tmp_path / "override", client=AuditClient(), workers_per_endpoint=1)
+    assert report["workers_per_endpoint"] == 1
+    with pytest.raises(ValueError, match="signature"):
+        online.reference_audit([tmp_path / "dataset.parquet"], ["http://one"], tmp_path / "override", client=AuditClient(), workers_per_endpoint=2, resume=True)
+
+
+@pytest.mark.parametrize("workers", [0, -1, True, 1.5])
+def test_reference_audit_rejects_invalid_parallelism_before_service_calls(tmp_path, workers):
+    client = AuditClient()
+    with pytest.raises(ValueError, match="positive integer"):
+        online.reference_audit([], ["http://one"], tmp_path / "audit", client=client, workers_per_endpoint=workers)
+    assert not client.calls
+
+
+def test_reference_audit_quarantine_is_shared_between_concurrent_workers(tmp_path):
+    barrier = threading.Barrier(2)
+    cleanup_seen = threading.Event()
+    release_other = threading.Event()
+    class UncleanClient(AuditClient):
+        unsafe_request = None
+        def post(self, url, path, payload, deadline):
+            result = super().post(url, path, payload, deadline)
+            if path == "/claim":
+                barrier.wait(timeout=10)
+            if path == "/reward":
+                with self.lock:
+                    first = self.unsafe_request is None
+                    if first:
+                        self.unsafe_request = payload["request_id"]
+                if not first:
+                    assert cleanup_seen.wait(10)
+                    assert release_other.wait(10)
+            return result
+        def get(self, url, path, **kwargs):
+            result = super().get(url, path, **kwargs)
+            if "key=" in path and self.unsafe_request in path:
+                result["cleanup_state"]["complete"] = False
+                cleanup_seen.set()
+            return result
+    client = UncleanClient()
+    # Let the unsafe worker finish its bounded cleanup and quarantine the URL
+    # before the other already-running arm returns. No gold/new claims allowed.
+    original_write = online.audit_write_json
+    def write(path, result):
+        original_write(path, result)
+        if path.name == "result.json" and result.get("status") == "cleanup_unverified":
+            release_other.set()
+    from unittest.mock import patch
+    original_get = client.get
+    def quick_probe(url, path, **kwargs):
+        result = original_get(url, path, **kwargs)
+        if "key=" in path and client.unsafe_request in path:
+            # First probe fails by raising; audit_arm classifies cleanup unsafe.
+            raise ConnectionError("cleanup verification unavailable")
+        return result
+    client.get = quick_probe
+    with patch.object(online, "audit_write_json", side_effect=write):
+        report = online.reference_audit([audit_dataset(tmp_path, 4)], ["http://one"], tmp_path / "audit", client=client, workers_per_endpoint=2)
+    assert len([c for c in client.calls if c[1] == "/claim"]) == 2
+    assert report["counts"] == {"cleanup_unverified": 1, "endpoint_quarantined": 3}
+    assert report["quarantined_endpoints"] == ["http://one"]
+
+
+def test_reference_audit_fast_endpoint_steals_remaining_compatible_cases(tmp_path):
+    fast_progress = threading.Event()
+    class UnevenClient(AuditClient):
+        completed_fast_rewards = 0
+        def post(self, url, path, payload, deadline):
+            result = super().post(url, path, payload, deadline)
+            if path == "/reward" and url == "http://slow":
+                assert fast_progress.wait(10)
+            if path == "/reward" and url == "http://fast":
+                self.completed_fast_rewards += 1
+                if self.completed_fast_rewards >= 4:
+                    fast_progress.set()
+            return result
+    client = UnevenClient()
+    report = online.reference_audit([audit_dataset(tmp_path, 5)], ["http://slow", "http://fast"], tmp_path / "audit", client=client, workers_per_endpoint=1)
+    assert report["counts"] == {"reference_verified": 5}
+    fast_tasks = {p["task"]["task_id"] for url, route, p in client.calls if url == "http://fast" and route == "/claim"}
+    assert len(fast_tasks) >= 3
+
+
+def test_reference_audit_resume_scans_late_unsafe_checkpoint_before_new_claims(tmp_path):
+    client = AuditClient()
+    path = audit_dataset(tmp_path, 2)
+    directory = tmp_path / "audit"
+    report = online.reference_audit([path], ["http://one"], directory, client=client)
+    first, last = [directory / "cases" / r["id"] for r in report["results"]]
+    (first / "result.json").unlink()
+    arm_path = last / "gold" / "0.json"
+    arm = json.loads(arm_path.read_text())
+    arm.update(phase="reward", cleanup={"verified": False})
+    online.audit_write_json(arm_path, arm)
+    before = len(client.calls)
+    report = online.reference_audit([path], ["http://one"], directory, client=client, resume=True)
+    assert len(client.calls) == before
+    assert report["results"][0]["status"] == "endpoint_quarantined"
+
+
+@pytest.mark.parametrize("f2p,p2p,expected", [(1, True, "reference_verified"), (0, True, "baseline_required_tests_review"), (1, False, "baseline_required_tests_review")])
+def test_reference_audit_requires_intended_baseline_failure(f2p, p2p, expected):
+    result = {"arms": {
+        "gold": {"classification": "tests_passed", "cleanup": {"verified": True}},
+        "baseline": {"classification": "required_tests_failed", "cleanup": {"verified": True}, "reward": {"metadata": {
+            "official_fail_to_pass_failed": f2p, "official_pass_to_pass_complete": p2p}}}}}
+    assert online.audit_result_status(result) == expected
+
+
+def test_reference_audit_rejects_old_service_scoring_for_official_contract():
+    arm = {"mode": "baseline", "official_test_contract_required": True, "claim": {"ok": True},
+           "base": {"ok": True, "text": "exit_code: 0\n"}, "reward": {"ok": True, "score": 1, "metadata": {
+               "hidden_tests_started": True, "hidden_runner_provenance": "launch_marker_v1",
+               "hidden_test_counts_complete": True, "hidden_tests_total_count": 1}}}
+    assert online.audit_classify(arm) == "official_scoring_unavailable"
+    arm["reward"]["metadata"]["failure_reason"] = "silent_command_timeout"
+    assert online.audit_classify(arm) == "evaluation_timeout"
+
+
+@pytest.mark.parametrize("fault", [None, "hash", "launch", "pytest"])
+def test_reference_replay_reverifies_retained_evidence(tmp_path, fault):
+    import gzip
+    import hashlib
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    path = audit_dataset(tmp_path, 1)
+    rows = pq.read_table(path).to_pylist()
+    task = json.loads(rows[0]["extra_info"]["tools_kwargs"]["__swe_task_json__"])
+    runner = "pytest -v" if fault == "pytest" else "python tests/runtests.py -v 2"
+    task["test_commands"][0] = task["test_commands"][0].rsplit("\n", 1)[0] + "\n" + runner
+    rows[0]["extra_info"]["tools_kwargs"]["__swe_task_json__"] = json.dumps(task)
+    rows[0]["reward_model"] = {"ground_truth": json.dumps({"benchmark": "swe_bench_verified",
+        "expected": "all_official_tests_pass", "fail_to_pass": ["test_required (suite.Case)"], "pass_to_pass": []})}
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    _, cases = online.audit_inventory([path])
+    assert cases[0]["inventory"]["eligible"] and cases[0]["task"]["official_test_contract"]["version"] == 1
+    marker = "" if fault == "launch" else "SWE_RUNNER_LAUNCHED_abcdef\n"
+    raw = ("exit_code: 0\n" + marker + "test_required (suite.Case) ... ok\n"
+           "\n----------------------------------------------------------------------\nRan 1 test in 0.1s\n\nOK\n").encode()
+    compressed = gzip.compress(raw, mtime=0)
+    digest = hashlib.sha256(compressed).hexdigest()
+    raw_digest = hashlib.sha256(raw).hexdigest()
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / (digest + ".log.gz")).write_bytes(compressed)
+    ref = {"file": digest + ".log.gz", "sha256": digest, "compression": "gzip", "bytes": len(compressed),
+           "uncompressed_bytes": len(raw), "original_bytes": len(raw), "uncompressed_sha256": raw_digest, "complete": True}
+    data = json.dumps({"task_id": "case-0", "phases": {"test_commands": {"sha256": raw_digest, "full_log": ref}}}).encode()
+    artifact_sha = hashlib.sha256(data).hexdigest()
+    artifact = private / (artifact_sha + ".json")
+    artifact.write_bytes(data if fault != "hash" else b"modified after diagnosis")
+    diagnosis = tmp_path / "diagnosis.json"
+    diagnosis.write_text(json.dumps({"reference_audits": [{"arms": [{"task_id": "case-0", "mode": "gold",
+        "runner_provenance": "launch_marker_v1", "private_evaluator": {"status": "verified", "sha256": artifact_sha,
+        "private_copy": str(artifact)}}]}]}))
+    record = online.reference_replay([path], diagnosis, tmp_path / "replay/report.json")["cases"][0]
+    if fault is None:
+        assert record["official_tests_success"] and record["official_tests_complete"]
+    else:
+        assert not record.get("official_tests_success")
+        assert record["reason"] == {"hash": "unverified_or_incomplete_private_logs", "launch": "runner_launch_unverified",
+                                    "pytest": "unsupported_runner"}[fault]
+
+
+def retained_arm(tmp_path, task_id, mode, phases):
+    import gzip
+    import hashlib
+    private = tmp_path / "private-fixture"
+    private.mkdir(exist_ok=True)
+    refs = {}
+    for name, value in phases.items():
+        raw = value.encode()
+        blob = gzip.compress(raw, mtime=0)
+        digest = hashlib.sha256(blob).hexdigest()
+        raw_digest = hashlib.sha256(raw).hexdigest()
+        (private / (digest + ".log.gz")).write_bytes(blob)
+        refs[name] = {"sha256": raw_digest, "full_log": {"file": digest + ".log.gz", "sha256": digest,
+            "compression": "gzip", "bytes": len(blob), "uncompressed_bytes": len(raw), "original_bytes": len(raw),
+            "uncompressed_sha256": raw_digest, "complete": True}}
+    data = json.dumps({"task_id": task_id, "phases": refs}).encode()
+    digest = hashlib.sha256(data).hexdigest()
+    artifact = private / (digest + ".json")
+    artifact.write_bytes(data)
+    return {"task_id": task_id, "mode": mode, "runner_provenance": "launch_marker_v1",
+            "private_evaluator": {"status": "verified", "sha256": digest, "private_copy": str(artifact)}}
+
+
+@pytest.mark.parametrize("raw_xml,mutation", [(False, None), (True, None), (True, "invalid"), (True, "missing")])
+def test_replay_structured_and_raw_junit_evidence(tmp_path, raw_xml, mutation):
+    from recipe.swe_agent.test_results import official_test_outcomes
+    task = {"evaluator_test_commands": [{"run": "pytest tests/a.py", "prepare": []}]}
+    xml = '<testsuite tests="1"><testcase classname="tests.a" name="test_ok"/></testsuite>'
+    evidence = official_test_outcomes("pytest", "", exit_code=0, junit_xml=xml)
+    phases = {"test_commands": "exit_code: 0\nSWE_RUNNER_LAUNCHED_abcdef\n", "official_tests": json.dumps({"evidence": [evidence]})}
+    if raw_xml:
+        phases["runner_evidence_0"] = json.dumps({"command": "pytest tests/a.py", "exit_code": 0,
+                                                 "junit_requested": True, "evidence": evidence})
+        if mutation != "missing":
+            phases["junit_xml_0"] = xml if mutation is None else "<broken"
+    if mutation == "missing":
+        with pytest.raises(ValueError, match="missing_raw_junit"):
+            online.replay_runner_evidence(task, phases)
+        return
+    replayed, kind = online.replay_runner_evidence(task, phases)
+    assert kind == ("raw_junit_or_runner_evidence" if raw_xml else "retained_structured_score_replay")
+    assert replayed[0]["complete"] == (mutation is None)
+
+
+def test_dataset_version_preserves_original_schema_order_and_excludes_only_requested(tmp_path):
+    import hashlib
+    import pyarrow.parquet as pq
+    path = audit_dataset(tmp_path, 5)
+    original = path.read_bytes()
+    table = pq.read_table(path)
+    output = tmp_path / "v9.parquet"
+    receipt = online.dataset_version(path, output, ["case-1", "case-3"])
+    assert path.read_bytes() == original
+    assert receipt["source_sha256"] == hashlib.sha256(original).hexdigest()
+    assert receipt["rows"] == 3 and receipt["retained_rows_unchanged"]
+    result = pq.read_table(output)
+    assert result.schema == table.schema
+    assert result.to_pylist() == [table.to_pylist()[i] for i in (0, 2, 4)]
+    with pytest.raises(ValueError, match="overwrite"):
+        online.dataset_version(path, output, [])
+    with pytest.raises(ValueError, match="all exclusions present"):
+        online.dataset_version(path, tmp_path / "bad.parquet", ["absent"])
+
+
+def test_dataset_version_pins_only_verified_complete_baseline_gold_members(tmp_path):
+    import hashlib
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    path = audit_dataset(tmp_path, 1)
+    rows = pq.read_table(path).to_pylist()
+    rows[0]["reward_model"] = {"ground_truth": json.dumps({"benchmark": "swe_bench_verified",
+        "expected": "all_official_tests_pass", "fail_to_pass": ["tests/a.py::test_value[axes"], "pass_to_pass": []})}
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    arms = []
+    for mode in ("baseline", "gold"):
+        evidence = {"complete": True, "framework": "pytest_junit", "aliases": {}, "reason": "complete",
+            "outcomes": {"tests.a::test_value[axes one]": "failed" if mode == "baseline" else "passed",
+                         "tests.a::test_value[axes two]": "passed"}}
+        arms.append(retained_arm(tmp_path, "case-0", mode, {"test_commands": "exit_code: 0\nSWE_RUNNER_LAUNCHED_abcdef\n",
+                                                           "official_tests": json.dumps({"evidence": [evidence]})}))
+    diagnosis = tmp_path / "diagnosis.json"
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"signature": "audit", "identity": {"manifest": {"datasets": [
+        {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()}]}}}))
+    source_report = tmp_path / "source-audit.json"
+    source_report.write_text(json.dumps({"source_match": True, "signature": "audit", "manifest": str(manifest),
+        "results": [{"task_id": "case-0", "arms": {a["mode"]: {"reward": {"metadata": {
+            "private_evaluator_artifact_sha256": a["private_evaluator"]["sha256"],
+            "hidden_runner_provenance": "launch_marker_v1"}}} for a in arms}}]}))
+    diagnosis.write_text(json.dumps({"reference_audits": [{"arms": arms, "path": str(source_report),
+        "sha256": hashlib.sha256(source_report.read_bytes()).hexdigest()}]}))
+    output = tmp_path / "pinned.parquet"
+    receipt = online.dataset_version(path, output, [], diagnosis)
+    assert receipt["identity_upgrades"]["case-0"]["members"] == 2
+    replay = online.reference_replay([output], diagnosis, tmp_path / "replay/report.json")
+    assert all(r["official_tests_complete"] for r in replay["cases"])
+    assert [r["official_tests_success"] for r in replay["cases"]] == [False, True]
+    from recipe.swe_agent.task_payload import rollout_task_payload
+    _, cases = online.audit_inventory([output])
+    assert "official_test_contract" not in rollout_task_payload(cases[0]["task"])
+    altered = tmp_path / "altered.parquet"
+    pq.write_table(pa.Table.from_pylist(rows + rows), altered)
+    with pytest.raises(ValueError):
+        online.dataset_version(altered, tmp_path / "wrong-source.parquet", [], diagnosis)
+
+
+def test_reference_audit_missing_artifacts_and_interrupted_attempt_are_not_replayed(tmp_path):
+    path = audit_dataset(tmp_path)
+    manifest, cases = online.audit_inventory([path])
+    assert manifest["counts"]["eligible"] == 2
+    (tmp_path / "gold.patch").unlink()
+    client = AuditClient()
+    report = online.reference_audit([path], ["http://one"], tmp_path / "missing", client=client)
+    assert report["counts"] == {"unavailable_data": 2}
+    assert not client.calls
+    path = audit_dataset(tmp_path)
+    report = online.reference_audit([path], ["http://one"], tmp_path / "interrupted", limit=1, client=client)
+    case = report["results"][0]["id"]
+    directory = tmp_path / "interrupted" / "cases" / case
+    (directory / "result.json").unlink()
+    online.write_json(directory / "gold" / "0.json", {"phase": "patch", "request_id": "uncertain"})
+    count = len(client.calls)
+    report = online.reference_audit([path], ["http://one"], tmp_path / "interrupted", limit=1, resume=True, client=client)
+    assert len(client.calls) == count
+    assert report["counts"] == {"unavailable_data": 1}
+
+
+@pytest.mark.parametrize("metadata,score,expected", [
+    ({"hidden_tests_started": True}, 1., "runner_launch_unverified"),
+    ({"hidden_tests_started": True, "hidden_runner_provenance": "launch_marker_v1"}, 1., "test_coverage_unknown"),
+    ({"hidden_failure_phase": "evaluator_preparation"}, 0., "evaluator_preparation_failure"),
+    ({"terminal_reward_timeout": True}, 0., "evaluation_timeout"),
+])
+def test_reference_audit_reward_one_does_not_override_missing_evidence(metadata, score, expected):
+    arm = {"mode": "baseline", "claim": {"ok": True}, "base": {"ok": True, "text": "exit_code: 0\n"},
+           "reward": {"ok": True, "score": score, "metadata": metadata}}
+    assert online.audit_classify(arm) == expected
+
+
+def test_audit_path_mapping_has_component_boundary_and_longest_prefix():
+    assert str(online.audit_mapped_path("/cluster/data/file", ["/cluster=/ssd", "/cluster/data=/shared"])) == "/shared/file"
+    assert str(online.audit_mapped_path("/cluster-other/file", ["/cluster=/ssd"])) == "/cluster-other/file"
+    with pytest.raises(ValueError, match="ABSOLUTE"):
+        online.audit_mapped_path("/cluster/file", ["relative=/ssd"])
+
+
+def test_reference_audit_rejects_concurrent_output_writer(tmp_path):
+    import fcntl
+    directory = tmp_path / "audit"
+    directory.mkdir()
+    with (directory / ".audit.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match="another audit"):
+            online.reference_audit([], ["http://one"], directory, client=AuditClient())
+
+
+def test_reference_audit_never_pulls_or_builds_images(tmp_path):
+    _, cases = online.audit_inventory([audit_dataset(tmp_path, 1)])
+    task = online.audit_task(cases[0]["task"], 30)
+    assert task["docker_pull"] is False
+    assert task["environment"]["base_image"] == task["case_image"] == task["docker_image"]
+    assert task["evaluator_test_commands"][0]["run"] == "pytest tests/a.py"
+    with pytest.raises(ValueError, match="builds"):
+        online.audit_task({**cases[0]["task"], "dockerfile": "FROM fixture"}, 30)
+
+
+def test_reference_audit_prefers_endpoint_with_cached_case_image(tmp_path):
+    class CachedClient(AuditClient):
+        def get(self, url, path, **kwargs):
+            result = super().get(url, path, **kwargs)
+            if "?" not in path:
+                result["image_inventory_complete"] = True
+                result["cached_images"] = [{"tag": "cached", "id": "sha256:fixture"}] if url == "http://cached" else []
+            return result
+    client = CachedClient()
+    report = online.reference_audit([audit_dataset(tmp_path, 2)], ["http://missing", "http://cached"], tmp_path / "audit", client=client)
+    assert all(url == "http://cached" for url, _, _ in client.calls)
+    assert all(result["cached_image_id"] == "sha256:fixture" for result in report["results"])
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_reference_audit_exact_image_probe_resolves_truncated_inventory(tmp_path, available):
+    class ProbedClient(AuditClient):
+        def get(self, url, path, **kwargs):
+            if "image=" in path:
+                return {"image_probe": {"tag": "cached", "available": available, "id": "sha256:fixture" if available else None}}
+            result = super().get(url, path, **kwargs)
+            if "?" not in path:
+                result.update(cached_images=[], image_inventory_complete=False)
+            return result
+    client = ProbedClient()
+    report = online.reference_audit([audit_dataset(tmp_path, 1)], ["http://one"], tmp_path / "audit", client=client)
+    assert report["counts"] == ({"reference_verified": 1} if available else {"image_unavailable": 1})
+    assert bool(client.calls) is available
+
+
+@pytest.mark.parametrize("code,output,expected", [
+    (0, "sha256:fixture\n", True), (1, "Error: No such image: fixture", False), (1, "daemon unavailable", None),
+])
+def test_exact_image_diagnostic_never_pulls_or_builds(code, output, expected):
+    commands = []
+    def docker(command, **kwargs):
+        commands.append(command)
+        return code, output
+    result = info.deployment_info(manager_stub(), docker, {}, image_tag="fixture")
+    assert result["image_probe"]["available"] is expected
+    assert commands == [["docker", "image", "inspect", "--format", "{{.Id}}", "--", "fixture"]]
+
+
+def test_reference_audit_quarantines_endpoint_after_unverified_cleanup(tmp_path):
+    class UncleanClient(AuditClient):
+        def get(self, url, path, **kwargs):
+            result = super().get(url, path, **kwargs)
+            if "key=" in path:
+                result["cleanup_state"]["complete"] = False
+            return result
+    client = UncleanClient()
+    from unittest.mock import patch
+    with patch.object(online.time, "monotonic", side_effect=range(0, 100000, 100)):
+        report = online.reference_audit([audit_dataset(tmp_path, 2)], ["http://one"], tmp_path / "audit", client=client)
+    assert report["counts"] == {"cleanup_unverified": 1, "endpoint_quarantined": 1}
+    assert len([c for c in client.calls if c[1] == "/claim"]) == 1
+
+
+@pytest.mark.parametrize("checkpoint", ["result", "complete_arm", "interrupted_arm", "interrupted_retry"])
+def test_reference_audit_resume_preserves_endpoint_quarantine(tmp_path, checkpoint):
+    path = audit_dataset(tmp_path, 2)
+    client = AuditClient()
+    directory = tmp_path / "audit"
+    report = online.reference_audit([path], ["http://one"], directory, client=client)
+    first = directory / "cases" / report["results"][0]["id"]
+    second = directory / "cases" / report["results"][1]["id"]
+    arm_path = first / "baseline" / "0.json"
+    arm = json.loads(arm_path.read_text())
+    arm["cleanup"] = {"verified": False}
+    if checkpoint in {"interrupted_arm", "interrupted_retry"}:
+        arm["phase"] = "claim"
+    if checkpoint == "interrupted_retry":
+        arm_path = first / "baseline" / "1.json"
+    online.audit_write_json(arm_path, arm)
+    if checkpoint == "result":
+        result = json.loads((first / "result.json").read_text())
+        result["arms"]["baseline"] = arm
+        result["status"] = "cleanup_unverified"
+        online.audit_write_json(first / "result.json", result)
+    else:
+        (first / "result.json").unlink()
+    (second / "result.json").unlink()
+    count = len(client.calls)
+    report = online.reference_audit([path], ["http://one"], directory, resume=True, client=client)
+    assert len(client.calls) == count
+    assert report["results"][1]["status"] == "endpoint_quarantined"
+    assert report["results"][0]["status"] == (
+        "unavailable_data" if checkpoint in {"interrupted_arm", "interrupted_retry"} else "cleanup_unverified")
+
+
+@pytest.mark.parametrize("failure", ["transport", "cleanup", "source"])
+def test_reference_audit_retry_and_failure_gates(tmp_path, failure):
+    class FailingClient(AuditClient):
+        interrupted = False
+
+        def get(self, url, path, **kwargs):
+            result = super().get(url, path, **kwargs)
+            if failure == "source" and "?" not in path:
+                result["source_fingerprint"] = {"sha256": "old-service"}
+            if failure == "cleanup" and "?" in path:
+                result["cleanup_state"]["complete"] = False
+            return result
+
+        def post(self, url, path, payload, deadline):
+            if failure == "transport" and path == "/reward" and not self.interrupted:
+                self.interrupted = True
+                raise ConnectionError("connection dropped")
+            return super().post(url, path, payload, deadline)
+
+    client = FailingClient()
+    if failure == "cleanup":
+        # Avoid waiting for a deliberately non-completing cleanup probe.
+        from unittest.mock import patch
+        with patch.object(online.time, "monotonic", side_effect=range(0, 100000, 100)):
+            report = online.reference_audit([audit_dataset(tmp_path, 1)], ["http://one"], tmp_path / "audit", client=client)
+    else:
+        report = online.reference_audit([audit_dataset(tmp_path, 1)], ["http://one"], tmp_path / "audit", client=client)
+    claims = [c for c in client.calls if c[1] == "/claim"]
+    assert len(claims) == (3 if failure == "transport" else 1 if failure == "cleanup" else 2)
+    assert report["regression_pass"] is (failure == "transport")
+    if failure == "cleanup":
+        assert report["counts"] == {"cleanup_unverified": 1}
 
 
 def manager_stub():
@@ -672,11 +1887,11 @@ def test_service_diagnosis_probes_all_available_services_and_preserves_source_ga
     assert not report["regression_pass"]
 
 
-def test_search_diagnosis_reproduces_unicode_fallback_gap_without_changing_pattern(tmp_path, monkeypatch):
+def test_search_diagnosis_reports_missing_backend_for_all_searches(tmp_path, monkeypatch):
     from recipe.swe_agent import search_utils as search
     original = search._stream_command
     def missing_rg(command, **kwargs):
-        if command[0] == "rg":
+        if command[0] == (os.environ.get("SWE_AGENT_RG_BINARY") or "rg"):
             return search._StreamResult([], 127, backend_missing=True)
         return original(command, **kwargs)
     monkeypatch.setattr(search, "_stream_command", missing_rg)
@@ -690,9 +1905,9 @@ def test_search_diagnosis_reproduces_unicode_fallback_gap_without_changing_patte
         text, _, metadata = session.run_tool(item["name"], item["arguments"])
         if online.check_response(item["expected"], {"ok": True, "text": text, "metadata": metadata}):
             failed_indices.append(index)
-            assert "requires rg" in text
-            assert "results incomplete" in text
-    assert failed_indices == [4, 6]
+            assert text.startswith("Search unavailable: required ripgrep")
+            assert not online.check_response(item["missing_rg_expected"], {"ok": True, "text": text})
+    assert failed_indices == [2, 4, 5, 6, 7]
 
 
 def test_container_environment_probe_executes_and_returns_scoped_package_evidence():
@@ -796,9 +2011,11 @@ def pinned_release(tmp_path, monkeypatch):
     # without making unit tests depend on network access or a system rg package.
     binary = (f"#!{sys.executable}\n"
               "import sys\n"
-              "a=sys.argv[1:]\n"
+              "a=[x for x in sys.argv[1:] if x != '--no-config']\n"
               "if a == ['--version']:\n"
               f"    print('ripgrep {rg_backend.VERSION} (rev af60c2de9d)\\n\\nfeatures:+pcre2'); sys.exit(0)\n"
+              "if '--files' in a:\n"
+              "    print('./src/Convenience.m\\n./src/Convenience.swift'); sys.exit(0)\n"
               "data=sys.stdin.read(); p=a[-1]\n"
               "if p in ('needle', 'caf\\u00e9'): print('1:Needle caf\\u00e9')\n"
               "elif '-F' not in a: print('2:Item(')\n"
@@ -839,13 +2056,98 @@ def test_persistent_rg_alias_mount_uses_relative_manifest(pinned_release, tmp_pa
     assert "root" not in json.loads((rg_backend.installation_dir(alias) / "manifest.json").read_text())
 
 
+def test_persistent_rg_archive_cache_survives_reinstallation(pinned_release, monkeypatch):
+    import shutil
+    root, source = pinned_release
+    calls = []
+    def download(destination):
+        calls.append(destination)
+        destination.write_bytes(source.read_bytes())
+    monkeypatch.setattr(rg_backend, "_download", download)
+    first = rg_backend.prepare(root)
+    cached = root / "downloads" / rg_backend.ASSET
+    assert first["archive"] == str(cached) and cached.read_bytes() == source.read_bytes()
+    assert rg_backend.prepare(root)["reused"]
+    shutil.rmtree(rg_backend.installation_dir(root))
+    assert not rg_backend.prepare(root)["reused"]
+    assert len(calls) == 1
+
+
+def test_persistent_rg_corrupt_cache_is_not_overwritten(pinned_release, monkeypatch):
+    root, _ = pinned_release
+    cached = root / "downloads" / rg_backend.ASSET
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"corrupt cache")
+    monkeypatch.setattr(rg_backend, "_download", lambda *a: pytest.fail("corrupt cache silently replaced"))
+    with pytest.raises(ValueError, match="cached rg archive checksum mismatch"):
+        rg_backend.prepare(root)
+    assert cached.read_bytes() == b"corrupt cache"
+    assert not rg_backend.installation_dir(root).exists()
+
+
+@pytest.mark.parametrize("short_mounted", [False, True])
+def test_persistent_rg_known_storage_prefixes_reuse_same_installation(pinned_release, tmp_path, monkeypatch, short_mounted):
+    _, source = pinned_release
+    short, long = tmp_path / "short", tmp_path / "long"
+    visible, absent = (short, long) if short_mounted else (long, short)
+    visible.mkdir()
+    monkeypatch.setattr(rg_backend, "SHORT_STORAGE", short)
+    monkeypatch.setattr(rg_backend, "LONG_STORAGE", long)
+    configured = absent / ".swe-tools"
+    cached_source = visible / "downloads" / source.name
+    cached_source.parent.mkdir()
+    cached_source.write_bytes(source.read_bytes())
+    prepared = rg_backend.prepare(configured, archive=absent / "downloads" / source.name)
+    assert prepared["configured_root"] == str(configured)
+    assert prepared["root"] == str(visible / ".swe-tools")
+    assert prepared["storage_alias_used"] and not absent.exists()
+    assert rg_backend.prepare(visible / ".swe-tools")["reused"]
+    assert rg_backend.prepare(configured)["reused"]
+    monkeypatch.setenv("SWE_AGENT_TOOLS_ROOT", str(configured))
+    for name in ("SWE_AGENT_RG_BINARY", "SWE_AGENT_RG_DISABLED", "SWE_AGENT_RG_STARTUP_STATUS"):
+        monkeypatch.setenv(name, "")
+    rg_backend.activate()
+    # A second path to the same executable is valid, including bind mount aliases.
+    alias = tmp_path / "mounted alias"
+    alias.symlink_to(visible, target_is_directory=True)
+    monkeypatch.setenv("SWE_AGENT_RG_BINARY", str(rg_backend.installation_dir(alias / ".swe-tools") / "rg"))
+    assert rg_backend.readiness()["ok"]
+    assert rg_backend.readiness()["configured_root"] == str(configured)
+
+
+def test_persistent_rg_new_version_preserves_old_installation(pinned_release):
+    root, source = pinned_release
+    old = root / "ripgrep" / "previous-version" / rg_backend.TARGET
+    old.mkdir(parents=True)
+    (old / "rg").write_bytes(b"previous executable")
+    rg_backend.prepare(root, archive=source)
+    assert (old / "rg").read_bytes() == b"previous executable"
+
+
+def test_persistent_rg_concurrent_alias_preparation_downloads_once(pinned_release, tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    root, source = pinned_release
+    alias = tmp_path / "second cluster"
+    alias.symlink_to(root, target_is_directory=True)
+    calls = []
+    def download(destination):
+        calls.append(True)
+        destination.write_bytes(source.read_bytes())
+    monkeypatch.setattr(rg_backend, "_download", download)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(rg_backend.prepare, [root, alias, root, alias]))
+    assert len(calls) == 1
+    assert all(result["ok"] for result in results)
+    assert sum(not result["reused"] for result in results) == 1
+
+
 @pytest.mark.parametrize("version", ["ripgrep 15.1.00", "ripgrep 15.1.0-dev", "other 15.1.0", ""])
 def test_persistent_rg_version_accepts_official_revision_but_rejects_other_releases(pinned_release, monkeypatch, version):
     root, source = pinned_release
     rg_backend.prepare(root, archive=source)
     original = rg_backend.subprocess.run
     def wrong_version(command, **kwargs):
-        if command[1:] == ["--version"]:
+        if command[1:] == ["--no-config", "--version"]:
             return SimpleNamespace(stdout=version, stderr="", returncode=0)
         return original(command, **kwargs)
     monkeypatch.setattr(rg_backend.subprocess, "run", wrong_version)
@@ -892,6 +2194,8 @@ def test_persistent_rg_download_failure_and_stage_cleanup(pinned_release, monkey
     target = rg_backend.installation_dir(root)
     assert not target.exists()
     assert not list(target.parent.glob("*.stage-*"))
+    assert not (root / "downloads" / rg_backend.ASSET).exists()
+    assert not list((root / "downloads").glob(".rg-download-*"))
 
 
 def test_persistent_rg_concurrent_preparation_downloads_once(pinned_release, monkeypatch):
@@ -968,20 +2272,19 @@ def test_production_search_selects_verified_binary_and_degraded_mode_skips_it(tm
     assert search.search_text(tmp_path, {"pattern": "needle"}) == "a.txt:1:Needle caf\u00e9"
     assert len(calls) == 1
     monkeypatch.setenv("SWE_AGENT_RG_DISABLED", "1")
-    monkeypatch.setattr(search, "_fallback", lambda *args: search._StreamResult([], 2, error="requires rg; results incomplete"))
-    assert "requires rg" in search.search_text(tmp_path, {"pattern": "needle"})
+    assert "Search unavailable: required ripgrep" in search.search_text(tmp_path, {"pattern": "needle"})
     assert len(calls) == 1
 
 
 def test_unicode_success_case_is_required_online_and_degraded_oracles_are_offline_only(tmp_path, monkeypatch):
     case = next(case for case in online.scenarios() if case["id"] == "unicode_search_capability")
-    assert sum("missing_rg_expected" in item for item in case["steps"]) == 5
+    assert sum("missing_rg_expected" in item for item in case["steps"]) == 7
     monkeypatch.setattr(online, "scenarios", lambda: [case])
     online.build(tmp_path / "frozen")
     report = online.offline(tmp_path / "frozen", tmp_path / "report.json")
     assert report["regression_pass"]
     assert report["missing_rg_capability_complete"] is False
-    assert sum(event.get("expected_degraded_response", False) for result in report["cases"] for event in result["events"]) == 5
+    assert sum(event.get("expected_degraded_response", False) for result in report["cases"] for event in result["events"]) == 7
     for item in case["steps"]:
         if "missing_rg_expected" in item:
             assert online.check_response(item["expected"], {"ok": True, "text": item["missing_rg_expected"]["contains"]})
@@ -1005,6 +2308,7 @@ def test_ssh_startup_cli_and_remote_shell_syntax():
                                "--rg-archive", "/persistent tools/release.tar.gz"])
     assert args.prepare_rg and args.tools_root == "/persistent tools/cache"
     assert not startup.parse_args([]).prepare_rg
+    assert startup.parse_args([]).tools_root == startup.DEFAULT_TOOLS_ROOT
     for argv in (["--tools-root", "relative"], ["--rg-archive", "/release.tar.gz"]):
         with pytest.raises(SystemExit):
             startup.parse_args(argv)
@@ -1095,8 +2399,10 @@ def test_ssh_argument_quoting_preserves_remote_paths_and_empty_arguments(monkeyp
         "32_cpus_2", script, "90", "1", "0", "1", root, "1" if prepare else "0", archive]
 
 
-@pytest.mark.parametrize("prepare,reuse_valid", [(False, True), (False, False), (True, True), (True, False)])
-def test_remote_startup_preparation_is_explicit_and_fixed_ranges_are_preserved(tmp_path, monkeypatch, prepare, reuse_valid):
+@pytest.mark.parametrize("prepare", [False, True])
+@pytest.mark.parametrize("reuse_valid", [False, True])
+@pytest.mark.parametrize("fault", [None, "prepare", "verify"])
+def test_remote_startup_preparation_is_explicit_and_fixed_ranges_are_preserved(tmp_path, monkeypatch, prepare, reuse_valid, fault):
     import os
     import subprocess
     import note_start_service as startup
@@ -1122,11 +2428,16 @@ def test_remote_startup_preparation_is_explicit_and_fixed_ranges_are_preserved(t
     executable("pgrep", "echo '123 recipe.swe_agent.remote_execution_service --advertise-host reused'\n")
     executable("python3", '''
 if [[ "$1" == "-m" ]]; then
-    [[ "$2" == "recipe.swe_agent.rg_backend" && "$3" == "prepare" ]]
+    [[ "$2" == "recipe.swe_agent.rg_backend" ]]
     [[ "$SWE_AGENT_TOOLS_ROOT" == "$FIXTURE_ROOT" ]]
-    [[ "$4" == "--archive" && "$5" == "$FIXTURE_ARCHIVE" ]]
-    echo fixture-explicit-preparation-failed
-    exit 1
+    if [[ "$3" == "prepare" ]]; then
+        [[ "$4" == "--archive" && "$5" == "$FIXTURE_ARCHIVE" ]]
+        echo fixture-explicit-preparation
+        exit "$FIXTURE_PREPARE_EXIT"
+    fi
+    [[ "$3" == "verify" ]]
+    echo fixture-verification
+    exit "$FIXTURE_VERIFY_EXIT"
 fi
 [[ "$1" == "-" ]]
 cat >/dev/null
@@ -1136,15 +2447,24 @@ exit "$FIXTURE_REUSE_EXIT"
     archive = root / "release.tar.gz"
     env = {**os.environ, "PATH": str(bin_dir) + ":" + os.environ["PATH"],
            "FIXTURE_ROOT": str(root), "FIXTURE_ARCHIVE": str(archive),
+           "FIXTURE_PREPARE_EXIT": "1" if fault == "prepare" else "0",
+           "FIXTURE_VERIFY_EXIT": "1" if fault == "verify" else "0",
            "FIXTURE_REUSE_EXIT": "0" if reuse_valid else "1"}
     result = subprocess.run(["bash", "-s", "--", "unit_2", str(script), "5", "1", "0", "1",
                              str(root), "1" if prepare else "0", str(archive) if prepare else ""],
                             input=startup.REMOTE_RUNNER, env=env, capture_output=True, text=True, timeout=10)
-    assert result.returncode == 0, result.stderr
+    blocked = fault == "verify" or (prepare and fault == "prepare")
+    assert result.returncode == (1 if blocked else 0), result.stderr
     assert script.read_bytes() == original
-    assert ("fixture-explicit-preparation-failed" in result.stdout) == prepare
-    assert ("fixture-cleanup" in result.stdout) == (not reuse_valid)
-    assert ("fixture-start:unit_2" in result.stdout) == (not reuse_valid)
+    assert ("fixture-explicit-preparation" in result.stdout) == prepare
+    assert ("fixture-verification" in result.stdout) == (not (prepare and fault == "prepare"))
+    assert ("fixture-cleanup" in result.stdout) == (not reuse_valid and not blocked)
+    assert ("fixture-start:unit_2" in result.stdout) == (not reuse_valid and not blocked)
+    if blocked:
+        assert "__SWE_SERVICE_ERROR__=required ripgrep" in result.stdout
+        assert "__SWE_SERVICE_URL__=" not in result.stdout
+        assert "unexpected-install" not in result.stdout
+        return
     expected = "reused" if reuse_valid else "fresh"
     assert f"__SWE_SERVICE_URL__=http://{expected}:18080" in result.stdout
     assert "unexpected-install" not in result.stdout

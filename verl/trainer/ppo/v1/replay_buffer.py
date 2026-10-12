@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import json
 import math
 import os
 import time
+import uuid
 from collections import Counter, defaultdict
+from pathlib import Path
 
 import numpy as np
 import transfer_queue as tq
@@ -31,6 +34,37 @@ VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS = int(os.getenv("VERL_REPLAY_BUFFER_DE
 
 DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
 GOLDEN_REPLAY_PARTITION = "golden_replay"
+
+
+def rollout_diagnostics(extra) -> dict:
+    """Versioned nonsecret metadata shared by rollout dumps and discard evidence."""
+    extra = getattr(extra, "data", extra)
+    if not isinstance(extra, dict):
+        extra = {}
+    reward = extra.get("reward_extra_info", {})
+    values = {**(reward if isinstance(reward, dict) else {}), **{k: v for k, v in extra.items() if k != "reward_extra_info"}}
+    exact = {"raw_score", "shaped_score", "acc", "infrastructure_failure", "reward_eligible", "evaluation_valid",
+             "evaluator_failure_excluded", "evaluator_group_excluded", "unverified_trajectory", "evaluator_invalid_reason", "rebench_failure_kind", "hidden_failure_phase", "hidden_tests_started",
+             "hidden_runner_provenance", "evaluator_preparation_ok", "hidden_tests_exit_code", "hidden_tests_passed",
+             "terminal_reward_timeout", "timeout_stage", "claim_attempts", "claim_wait_seconds", "task_id", "request_id",
+             "execution_url", "key", "verifier_staging_ok", "verifier_setup_ok", "hidden_patch_check_ok", "hidden_patch_apply_ok"}
+    exact.update({"hidden_verifier_staging_ok", "hidden_verifier_setup_ok", "hidden_failure_phase_code",
+                  "hidden_reward_seconds", "hidden_tests_seconds", "hidden_patch_check_seconds", "hidden_patch_valid",
+                  "verification_invalidated", "submission_after_fresh_verification", "diagnostic_outcome_code",
+                  "hidden_pass", "verification_attempted", "verification_passed", "verification_meaningful",
+                  "verification_meaningful_reason"})
+    prefixes = ("trajectory_", "partial_hidden_reward_", "repeat_reward_", "observed_infrastructure_failure",
+                "private_evaluator_", "hidden_test_count", "hidden_test_commands_", "hidden_tests_total_", "hidden_tests_passed_",
+                "oom_", "public_verification_", "public_patch_", "public_hidden_workspace_", "final_patch_")
+    result = {"rollout_diagnostic_version": 1}
+    for key, value in values.items():
+        if key not in exact and not key.startswith(prefixes):
+            continue
+        if value is None or isinstance(value, (bool, int, float)):
+            result[key] = value
+        elif isinstance(value, str):
+            result[key] = value[:2048]
+    return result
 
 
 def golden_replay_enabled() -> bool:
@@ -104,6 +138,45 @@ INFRA_FAILURE_RATIO_ENV = {
     "train": "SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD",
     "val": "SWE_AGENT_ROLLOUT_VALIDATION_INFRA_FAILURE_GROUP_RATIO_THRESHOLD",
 }
+
+UNVERIFIED_RATIO_ENV = {
+    "train": "SWE_AGENT_ROLLOUT_TRAINING_UNVERIFIED_TRAJECTORY_RATIO_THRESHOLD",
+    "val": "SWE_AGENT_ROLLOUT_VALIDATION_UNVERIFIED_TRAJECTORY_RATIO_THRESHOLD",
+}
+
+
+def unverified_trajectory_ratio_threshold(partition_id: str) -> float | None:
+    name = UNVERIFIED_RATIO_ENV[partition_id]
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return value
+
+
+def trajectory_is_unverified(tag: dict) -> bool:
+    # The older marker described an unconditional group exclusion. Keep it as
+    # an input alias for checkpoints made before ratio filtering was introduced.
+    return bool(tag.get("unverified_trajectory", tag.get("evaluator_group_excluded", False)))
+
+
+def unverified_group_decision(tags: list[dict], expected: int, threshold: float | None,
+                              *, minimum_valid: int = 2) -> tuple[bool, float, int]:
+    """Classify one terminal group, counting a session's final output once."""
+    bad = sum(trajectory_is_unverified(tag) for tag in tags)
+    if threshold is None:
+        return bool(bad), bad / max(expected, 1), len(tags) - bad
+    # Missing terminal sessions have no established reward either. Do not let
+    # their absence reduce the measured failure ratio.
+    bad += max(0, expected - len(tags))
+    valid = len(tags) - sum(trajectory_is_unverified(tag) for tag in tags)
+    ratio = bad / expected
+    return ratio > threshold or valid < minimum_valid or len(tags) > expected, ratio, valid
 
 
 def completion_ratio_threshold(partition_id: str) -> float | None:
@@ -285,6 +358,9 @@ class ReplayBuffer:
             partition_id: infrastructure_failure_ratio_threshold(partition_id)
             for partition_id in INFRA_FAILURE_RATIO_ENV
         }
+        self.unverified_ratio_thresholds = {
+            pid: unverified_trajectory_ratio_threshold(pid) for pid in UNVERIFIED_RATIO_ENV
+        }
         self.expected_rollout_counts = {
             "train": expected_rollout_n,
             "val": expected_validation_rollout_n,
@@ -360,6 +436,18 @@ class ReplayBuffer:
                     raise ValueError("Training infrastructure group filtering requires refill_fn")
                 if partition_id == "val" and self.validation_refill_fn is None:
                     raise ValueError("Validation infrastructure group filtering requires validation_refill_fn")
+        for pid, threshold in self.unverified_ratio_thresholds.items():
+            if threshold is None:
+                continue
+            if self.trainer_mode != "sync":
+                raise ValueError("Unverified trajectory filtering requires V1 synchronous mode")
+            count = self.expected_rollout_counts[pid]
+            if not isinstance(count, int) or count <= 0:
+                raise ValueError("Unverified trajectory filtering requires a positive rollout count")
+            if (self.refill_fn if pid == "train" else self.validation_refill_fn) is None:
+                raise ValueError("Unverified trajectory filtering requires a refill callback")
+        logger.info("Unverified trajectory thresholds train/val=%s/%s",
+                    self.unverified_ratio_thresholds["train"], self.unverified_ratio_thresholds["val"])
         self._validate_mode_config()
         # partition_id => {key: tag}
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
@@ -539,8 +627,16 @@ class ReplayBuffer:
             trajectory_tags = [items.get(key, {}) for key, _ in rows]
             cutoff = cutoff or any(tag.get("completion_ratio_cutoff", False) for tag in trajectory_tags)
             final_tag_by_key = {key: items.get(key, {}) for key in final_rows}
+            expected = self.expected_rollout_counts.get("train") or len(final_rows)
+            drop, _, _ = unverified_group_decision(
+                list(final_tag_by_key.values()), expected, self.unverified_ratio_thresholds["train"])
+            if drop:
+                continue
+            final_rewards = [reward_by_key[key] for key in final_rows
+                             if not trajectory_is_unverified(final_tag_by_key[key])]
             infrastructure_failures = sum(
-                int(self._infrastructure_flag(tag)) for tag in final_tag_by_key.values()
+                int(self._infrastructure_flag(tag) and not trajectory_is_unverified(tag))
+                for tag in final_tag_by_key.values()
             )
             threshold = self.infrastructure_failure_ratio_thresholds.get("train")
             eligible = golden_group_is_eligible(
@@ -699,11 +795,58 @@ class ReplayBuffer:
         except (TypeError, ValueError, OverflowError):
             return False
 
+    def _unverified_filtered_uids(self, partition_id: str) -> tuple[set[str], dict[str, float]]:
+        terminal = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        grouped = defaultdict(list)
+        for key in self._final_session_keys(list(self.partitions[partition_id])):
+            uid = self._uid_from_key(key)
+            if uid in terminal:
+                grouped[uid].append(self.partitions[partition_id][key])
+        threshold = self.unverified_ratio_thresholds.get(partition_id)
+        discarded, ratios = set(), {}
+        retained_partial = 0
+        excluded_sessions = 0
+        for uid in terminal:
+            tags = grouped[uid]
+            expected = self.expected_rollout_counts.get(partition_id) or len(tags) or 1
+            if uid in self.completion_ratio_cutoff_keys[partition_id]:
+                # Cancelled sessions belong to completion-cutoff handling, but
+                # evaluator uncertainty must still never be rescued by a predictor.
+                bad = sum(trajectory_is_unverified(tag) for tag in tags)
+                ratio, valid = bad / expected, len(tags) - bad
+                drop = bool(bad) if threshold is None else (
+                    ratio > threshold or bool(bad and valid < (2 if expected > 1 else 1)))
+            else:
+                drop, ratio, valid = unverified_group_decision(
+                    tags, expected, threshold, minimum_valid=2 if expected > 1 else 1)
+            ratios[uid] = ratio
+            excluded_sessions += sum(trajectory_is_unverified(tag) for tag in tags)
+            if drop:
+                discarded.add(uid)
+            elif threshold is not None:
+                retained_partial += int(ratio > 0)
+                logger.debug("Retained verified siblings: partition=%s uid=%s ratio=%s valid=%s",
+                             partition_id, uid, ratio, valid)
+        prefix = self._metrics_prefix(partition_id)
+        self._unverified_filter_metrics = {
+            f"{prefix}/unverified_group_filter/discarded_groups": float(len(discarded)),
+            f"{prefix}/unverified_group_filter/retained_partial_groups": float(retained_partial),
+            f"{prefix}/unverified_group_filter/excluded_sessions": float(excluded_sessions),
+            f"{prefix}/unverified_group_filter/failure_ratio_max": max(ratios.values(), default=0.0),
+        } if threshold is not None or excluded_sessions or discarded else {}
+        return discarded, ratios
+
     def _infrastructure_filtered_uids(self, partition_id: str) -> tuple[set[str], dict[str, float]]:
         """Classify terminal groups before they participate in completion accounting."""
+        terminal_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        evaluator_exclusions, evaluator_ratios = self._unverified_filtered_uids(partition_id)
         threshold = self.infrastructure_failure_ratio_thresholds.get(partition_id)
         if threshold is None:
-            return set(), {}
+            return evaluator_exclusions, evaluator_ratios
+
+        # Preserve the legacy infrastructure metric semantics: evaluator-only
+        # exclusions were not infrastructure failures in this metric.
+        evaluator_ratios = {uid: 0.0 for uid in evaluator_exclusions}
 
         terminal_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
         cache = self._infrastructure_classification_cache[partition_id]
@@ -726,7 +869,8 @@ class ReplayBuffer:
 
         failures_by_uid: dict[str, int] = defaultdict(int)
         for (_uid, _session), (_index, key) in final_key_by_session.items():
-            if self._infrastructure_flag(self.partitions[partition_id][key]):
+            if (self._infrastructure_flag(self.partitions[partition_id][key])
+                    and not trajectory_is_unverified(self.partitions[partition_id][key])):
                 failures_by_uid[_uid] += 1
 
         expected_count = self.expected_rollout_counts[partition_id]
@@ -736,6 +880,9 @@ class ReplayBuffer:
 
         ratios = {uid: cache[uid] for uid in terminal_uids}
         discarded_uids = {uid for uid, ratio in ratios.items() if ratio > threshold}
+        discarded_uids.update(evaluator_exclusions)
+        for uid in evaluator_exclusions:
+            ratios[uid] = max(ratios.get(uid, 0), evaluator_ratios[uid])
         if new_uids:
             logger.info(
                 "V1 infrastructure group scan: partition=%s terminal_groups=%d newly_classified=%d "
@@ -755,7 +902,7 @@ class ReplayBuffer:
     def _discard_infrastructure_groups(self, partition_id: str) -> tuple[set[str], dict[str, float]]:
         discarded_uids, ratios = self._infrastructure_filtered_uids(partition_id)
         if not discarded_uids:
-            return set(), {}
+            return set(), dict(getattr(self, "_unverified_filter_metrics", {}))
         prefix = self._metrics_prefix(partition_id)
         discarded_ratios = [ratios[uid] for uid in discarded_uids]
         metrics = {
@@ -763,6 +910,7 @@ class ReplayBuffer:
             f"{prefix}/infrastructure_group_filter/failure_ratio_mean": float(np.mean(discarded_ratios)),
             f"{prefix}/infrastructure_group_filter/failure_ratio_max": float(np.max(discarded_ratios)),
         }
+        metrics.update(getattr(self, "_unverified_filter_metrics", {}))
         logger.info(
             "V1 infrastructure group filter discarded partition=%s groups=%d ratio_mean=%.4f ratio_max=%.4f",
             partition_id,
@@ -770,8 +918,46 @@ class ReplayBuffer:
             float(np.mean(discarded_ratios)),
             float(np.max(discarded_ratios)),
         )
+        metrics[f"{prefix}/infrastructure_group_filter/evidence_persisted"] = float(
+            self._persist_infrastructure_discard(partition_id, discarded_uids, ratios)
+        )
         self._clear_groups(partition_id, discarded_uids)
         return discarded_uids, metrics
+
+    def _persist_infrastructure_discard(self, partition_id: str, uids: set[str], ratios: dict) -> bool:
+        """Save evidence before TransferQueue deletion, without copying prompts or hidden code."""
+        keys = sorted(key for key in self.partitions[partition_id] if key.rsplit("_", 2)[0] in uids)
+        rows = [{} for _ in keys]
+        coverage = "available"
+        try:
+            rows = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["extra_fields"])["extra_fields"].tolist()
+            if len(rows) != len(keys):
+                raise ValueError("diagnostic row alignment mismatch")
+        except Exception as exc:
+            coverage = "unavailable:" + type(exc).__name__
+            rows = [{} for _ in keys]
+        config = self.trainer_config
+        directory = (os.environ.get("SWE_AGENT_INFRA_DISCARD_AUDIT_DIR")
+                     or config.get("rollout_data_dir" if partition_id == "train" else "validation_data_dir")
+                     or config.get("default_local_dir") or "checkpoints")
+        try:
+            root = Path(directory) / "infrastructure_discard"
+            root.mkdir(parents=True, exist_ok=True)
+            target = root / (partition_id + "-" + uuid.uuid4().hex + ".json")
+            evidence = {"version": 1, "partition": partition_id, "failure_ratios": {uid: ratios[uid] for uid in sorted(uids)},
+                        "diagnostic_coverage": coverage, "trajectories": [
+                            {"uid": key, **rollout_diagnostics({**rollout_diagnostics(row), **self.partitions[partition_id][key]})}
+                            for key, row in zip(keys, rows, strict=True)]}
+            temporary = target.with_suffix(".tmp")
+            with temporary.open("x") as stream:
+                json.dump(evidence, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(target)
+            return True
+        except Exception:
+            logger.exception("Infrastructure discard evidence could not be persisted: partition=%s groups=%d", partition_id, len(uids))
+            return False
 
     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
         """Finished groups whose configured DAPO metric is identical across all trajectories.
@@ -1064,6 +1250,8 @@ class ReplayBuffer:
             self._sync_metadata_from_transfer_queue()
 
             discarded_uids, infrastructure_metrics = self._discard_infrastructure_groups(partition_id)
+            eviction_metrics.update({key: value for key, value in infrastructure_metrics.items()
+                                     if "/unverified_group_filter/" in key})
             if discarded_uids:
                 _accumulate_eviction_metrics(eviction_metrics, infrastructure_metrics, stale_count=0)
                 if not cutoff_requested:

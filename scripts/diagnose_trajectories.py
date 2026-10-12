@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import argparse
 import collections
+import errno
 import hashlib
 import json
 import math
 import re
 import statistics
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -167,6 +169,48 @@ def _bounded(value: Any, limit: int = DEFAULT_RESPONSE_CHARS) -> str:
     return text[:limit] + "...[truncated]"
 
 
+def _contract_review_signals(name: str, arguments: dict[str, Any], response: str) -> list[str]:
+    """Review categories from full public results, never inferred infra/reward labels."""
+    text = response.strip()
+    flags = []
+    if text.startswith("Read error:"):
+        flags.append("read_argument_rejected")
+        match = re.match(r"Read error: (offset|limit|max_chars|start_line|end_line) must be", text)
+        if match and re.fullmatch(r"[+]?\d+\.0+", str(arguments.get(match[1], ""))):
+            flags.append("read_integral_decimal_rejected")
+    if text.startswith("Search error:"):
+        if "unsupported fallback glob syntax" in text:
+            flags.append("glob_capability_rejected")
+        elif "regex parse error" in text:
+            flags.append("regex_pattern_rejected")
+            if "look-around" in text:
+                flags.append("regex_unsupported_lookaround")
+        elif "multiline" in text or 'literal "\\n"' in text:
+            flags.append("multiline_search_rejected")
+        else:
+            flags.append("search_argument_rejected")
+    if text.startswith("Search unavailable:"):
+        flags.append("search_infrastructure_unavailable")
+    if text.startswith("Error: Path rejected:"):
+        flags.append("path_boundary_rejected")
+    if text.startswith("Error: execute operation exceeded"):
+        flags.append("execute_hard_timeout")
+    if text.startswith("Error: Command produced no output for"):
+        flags.append("execute_silent_timeout")
+    if text.startswith(("Remote execution error:", "Error executing tool", "Error when executing tool:")):
+        flags.append("execution_error_response")
+    shell = name in {"Bash", "bash", "run_shell", "run_tests", "build_project"}
+    if shell:
+        core = re.split(r"\n\[(?:test outcome|test feedback|tool feedback)\]", response, maxsplit=1)[0]
+        if re.search(r"(?m)^ok\s+\S+\s+(?:[\d.]+s|\(cached\))\s*$", core):
+            flags.append("go_package_success_evidence")
+            if "[test outcome] not_run" in response:
+                flags.append("go_package_success_reported_not_run")
+        if "[test outcome] passed" in response and re.search(r"(?m)^FAIL(?:\s|$)", core):
+            flags.append("terminal_failure_with_passed_feedback")
+    return flags
+
+
 def _response_signals(name: str, arguments: dict[str, Any], response: str) -> dict[str, Any]:
     """Inspect complete responses before truncation; signals require review."""
     search_error = name in {"Grep", "search_text", "search_files", "Glob"} and response.strip().startswith(("Search error:", "Search unavailable:"))
@@ -204,6 +248,7 @@ def _response_signals(name: str, arguments: dict[str, Any], response: str) -> di
     replay = summarize_test_execution(str(arguments.get("command") or ""), core,
                                      exit_code=int(status.group(1)) if status else None) if shell and not artifact else {}
     return {
+        "contract_review_signals": _contract_review_signals(name, arguments, response),
         "test_summary_replay": replay,
         "test_summary_replay_provenance": "current_parser_on_saved_response" if replay else "unavailable_artifact_or_non_shell",
         "incomplete_test_evidence": replay.get("test_incomplete_failure_evidence", False),
@@ -464,6 +509,8 @@ def _record(
         "shaped_score": _number(row.get("shaped_score", row.get("score"))),
         "is_padding": bool(row.get("is_padding")),
         "train_sample_mask": row.get("train_sample_mask"),
+        "train_exclusion_reason": row.get("train_exclusion_reason"),
+        "completion_ratio_cutoff": row.get("completion_ratio_cutoff"),
         "reward_eligible": row.get("reward_eligible"),
         "infrastructure_failure": row.get("infrastructure_failure"),
         "infrastructure_evidence": {key: row.get(key) for key in (
@@ -498,6 +545,8 @@ def _record(
             "raw_repeats": _integer(row.get("trajectory_repeated_tool_calls")),
             "tool_dispatches": stored_dispatches,
             "tool_errors": _integer(row.get("trajectory_tool_error_returns")),
+            "terminal_tool_failure": row.get("trajectory_terminal_tool_failure"),
+            "trajectory_timeout": row.get("trajectory_timeout"),
             "assistant_turns": _integer(row.get("trajectory_assistant_turns")),
             "response_tokens": _integer(row.get("trajectory_response_tokens")),
             "budget_reached": bool(row.get("trajectory_budget_reached")),
@@ -516,6 +565,7 @@ def _record(
             "assistant_turns": sum(message["role"] == "assistant" for message in messages),
             "tool_errors": tool_errors,
             "tool_counts": dict(collections.Counter(event["name"] for event in events)),
+            "contract_review_counts": dict(collections.Counter(flag for e in events for flag in e["contract_review_signals"])),
             "unknown_tool_call_count": sum(event["name"] not in supported_tools for event in events),
             "unknown_tool_names": unknown_tool_names,
             "same_search_observation_count": same_search_observations,
@@ -622,6 +672,14 @@ def _metric_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     tool_errors = sum(r["reconstructed"]["tool_errors"] > 0 for r in records)
     return {
         "trajectories": n,
+        "contract_review_event_counts": dict(collections.Counter(
+            flag for r in records for e in r["events"] for flag in e["contract_review_signals"])),
+        "contract_review_trajectory_counts": dict(collections.Counter(
+            flag for r in records for flag in r["reconstructed"]["contract_review_counts"])),
+        "metadata_coverage": {key: sum(r.get(key) is not None for r in records)
+                              for key in ("infrastructure_failure", "reward_eligible", "train_sample_mask")},
+        "terminal_tool_failure_count": sum(bool(r["stored"]["terminal_tool_failure"]) for r in records),
+        "train_exclusion_reasons": dict(collections.Counter(str(r["train_exclusion_reason"]) for r in records)),
         "raw_success_rate": raw_success / n if n else 0.0,
         "shaped_success_rate": shaped_success / n if n else 0.0,
         "mean_raw_score": _mean(records, ("raw_score",)),
@@ -890,6 +948,35 @@ def _markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _private_evaluator_review_signals(text: str) -> list[str]:
+    """Evidence for operator review, not automatic reward/infra classification."""
+    flags = []
+    if "ModuleNotFoundError: No module named 'setuptools.dep_util'" in text:
+        flags.append("setuptools_dep_util_missing")
+        if "get_requires_for_build_editable" in text and "test session starts" not in text:
+            flags.append("editable_build_failure_without_pytest_session_evidence")
+    if re.search(r"recursive dependency involving fixture ['\"]httpbin['\"]", text):
+        flags.append("httpbin_fixture_dependency_error")
+    if re.search(r"fixture ['\"][^'\"]+['\"] not found", text):
+        flags.append("missing_test_fixture")
+    return flags
+
+
+def _read_diagnostic_bytes(path: Path, limit: int, digest: str) -> bytes:
+    """Reopen stale CPFS handles; a persistent checksum mismatch is still rejected."""
+    for attempt in range(3):
+        try:
+            with path.open("rb") as stream:
+                data = stream.read(limit + 1)
+            if len(data) > limit or hashlib.sha256(data).hexdigest() == digest or attempt == 2:
+                return data
+        except OSError as exc:
+            if exc.errno != errno.ESTALE or attempt == 2:
+                raise
+        time.sleep(0.05 * (attempt + 1))
+    raise RuntimeError("diagnostic read failed")
+
+
 def collect_private_evaluator(record: dict, mappings: Iterable[str], output_dir: Path) -> dict:
     """Operator-only filesystem collection; never fetch arbitrary recorded URLs.
 
@@ -923,8 +1010,7 @@ def collect_private_evaluator(record: dict, mappings: Iterable[str], output_dir:
         return {"status": "unmapped_service_path"}
     for path in candidates:
         try:
-            with path.open("rb") as stream:
-                data = stream.read(1024 * 1024 + 1)
+            data = _read_diagnostic_bytes(path, 1024 * 1024, digest)
         except OSError:
             continue
         if len(data) > 1024 * 1024:
@@ -948,6 +1034,7 @@ def collect_private_evaluator(record: dict, mappings: Iterable[str], output_dir:
         import io
         import zlib
         blobs = {}
+        review_signals = set()
         complete = True
         phases = artifact.get("phases", {})
         if not isinstance(phases, dict):
@@ -959,6 +1046,7 @@ def collect_private_evaluator(record: dict, mappings: Iterable[str], output_dir:
             ref = phase.get("full_log")
             if not ref:
                 complete = complete and not phase.get("truncated", True)
+                review_signals.update(_private_evaluator_review_signals(str(phase.get("output", ""))))
                 continue
             try:
                 blob_digest = ref["sha256"]
@@ -968,8 +1056,7 @@ def collect_private_evaluator(record: dict, mappings: Iterable[str], output_dir:
                 if blob_path.is_symlink() or blob_path.resolve().parent != path.parent:
                     return {"status": "rejected_log_path"}
                 if blob_digest not in blobs:
-                    with blob_path.open("rb") as stream:
-                        compressed = stream.read(101 * 1024 * 1024 + 1)
+                    compressed = _read_diagnostic_bytes(blob_path, 101 * 1024 * 1024, blob_digest)
                     if len(compressed) > 101 * 1024 * 1024:
                         return {"status": "oversized_log"}
                     if hashlib.sha256(compressed).hexdigest() != blob_digest or len(compressed) != ref["bytes"]:
@@ -979,6 +1066,7 @@ def collect_private_evaluator(record: dict, mappings: Iterable[str], output_dir:
                     if len(raw) > 100 * 1024 * 1024:
                         return {"status": "oversized_log"}
                     blobs[blob_digest] = (compressed, len(raw), hashlib.sha256(raw).hexdigest())
+                    review_signals.update(_private_evaluator_review_signals(raw.decode("utf-8", errors="replace")))
                 _, size, raw_digest = blobs[blob_digest]
                 if size != ref["uncompressed_bytes"] or raw_digest != ref["uncompressed_sha256"]:
                     return {"status": "log_hash_mismatch"}
@@ -987,7 +1075,11 @@ def collect_private_evaluator(record: dict, mappings: Iterable[str], output_dir:
                 if ref["complete"] and (size != ref["original_bytes"] or raw_digest != phase["sha256"]):
                     return {"status": "log_hash_mismatch"}
                 complete = complete and ref["complete"]
-            except (OSError, EOFError, ValueError, KeyError, TypeError, zlib.error):
+            except OSError as exc:
+                if exc.errno is not None:
+                    return {"status": "storage_read_error", "errno": exc.errno}
+                return {"status": "invalid_or_missing_log"}
+            except (EOFError, ValueError, KeyError, TypeError, zlib.error):
                 return {"status": "invalid_or_missing_log"}
         private = output_dir / "private_evaluator"
         private.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1006,8 +1098,53 @@ def collect_private_evaluator(record: dict, mappings: Iterable[str], output_dir:
                 stream.write(compressed)
         return {"status": "verified", "sha256": digest, "private_copy": str(target),
                 "failure_phase": artifact.get("failure_phase"), "service_id": artifact.get("service_id"),
-                "logs_complete": complete, "full_log_blobs": len(blobs)}
+                "logs_complete": complete, "full_log_blobs": len(blobs),
+                "review_signals": sorted(review_signals)}
     return {"status": "not_accessible"}
+
+
+def summarize_reference_audit(path: Path, *, evaluator_roots: Iterable[str] = (), output_dir: Path | None = None) -> dict:
+    report = json.loads(path.read_text())
+    if report.get("version") != "swe-reference-audit-v1":
+        raise ValueError("unsupported reference audit version")
+    results = report["results"]
+    arms = []
+    for result in results:
+        for mode, arm in result.get("arms", {}).items():
+            reward = arm.get("reward") or {}
+            metadata = reward.get("metadata") or {}
+            evidence = (collect_private_evaluator({"task_id": result.get("task_id"), "reward_evidence": metadata},
+                                                 evaluator_roots, output_dir)
+                        if output_dir is not None else {"status": "not_requested"})
+            arms.append({"task_id": result.get("task_id"), "mode": mode, "endpoint": arm.get("endpoint"),
+                         "classification": arm["classification"], "score": reward.get("score"),
+                         "failure_phase": metadata.get("hidden_failure_phase"),
+                         "runner_provenance": metadata.get("hidden_runner_provenance", "unreported"),
+                         "counts_complete": metadata.get("hidden_test_counts_complete"),
+                         "official_scoring_version": metadata.get("official_test_scoring_version"),
+                         "official_tests_complete": metadata.get("official_tests_complete"),
+                         "official_tests_reason": metadata.get("official_tests_reason"),
+                         "official_tests_required": metadata.get("official_tests_required"),
+                         "official_tests_passed": metadata.get("official_tests_passed"),
+                         "official_tests_missing": metadata.get("official_tests_missing"),
+                         "fail_to_pass_failed": metadata.get("official_fail_to_pass_failed"),
+                         "pass_to_pass_complete": metadata.get("official_pass_to_pass_complete"),
+                         "full_suite_passed": metadata.get("full_suite_passed"),
+                         "evaluation_valid": metadata.get("evaluation_valid"),
+                         "failure_reason": metadata.get("failure_reason"),
+                         "cleanup_verified": arm.get("cleanup", {}).get("verified"),
+                         "private_evaluator": evidence})
+    return {"path": str(path), "sha256": _sha256(path), "signature": report["signature"],
+            "source_match": report["source_match"], "regression_pass": report["regression_pass"],
+            "cases": len(results), "statuses": dict(collections.Counter(r["status"] for r in results)),
+            "arm_classifications": dict(collections.Counter(
+                arm["classification"] for r in results for arm in r.get("arms", {}).values())),
+            "arms": arms,
+            "review_cases": [{"task_id": r.get("task_id"), "status": r["status"]}
+                             for r in results if r["status"] != "reference_verified"],
+            "workers_per_endpoint": report.get("workers_per_endpoint", 1),
+            "quarantined_endpoints": report.get("quarantined_endpoints", []),
+            "limitation": "Only complete official identity evidence certifies Verified cases. Legacy count-only reports cannot establish required-test coverage. Reference checks do not prove model ability."}
 
 
 def diagnose(
@@ -1023,6 +1160,8 @@ def diagnose(
     evaluator_roots: Iterable[str] = (),
     expected_dataset: Path | None = None,
     expected_samples_per_task: int = 1,
+    write_markdown: bool = True,
+    reference_audits: Iterable[Path] = (),
 ) -> dict[str, Any]:
     specs = list(specs)
     inspect = list(inspect)
@@ -1078,6 +1217,7 @@ def diagnose(
             "Tool names use input declarations when available; otherwise a cross-profile fallback is explicitly marked.",
             "Repeated search observations and zero-exit failure text are review candidates, not proof of a tool failure or a reward rule.",
             "149 calls is a historical heuristic; budget and response-limit fields are reported separately.",
+            "Contract review flags are evidence categories, not proof of infrastructure failure. Absent infrastructure metadata remains unknown, not a negative observation.",
             "Empty ineligible rows with a recorded infrastructure reason are pre-generation failures, not parser failures. Observed and policy infrastructure flags may disagree; original causal reasons are preserved.",
             "Eligible success is conditional on admission and can be selection-biased. A single step does not establish behavior drift over training or absence of rare bugs.",
             "Identical call/observation groups do not prove unchanged workspace state. Shell failure-text and public-test command detection are review heuristics, not authoritative test outcomes.",
@@ -1097,6 +1237,8 @@ def diagnose(
         "detail_trajectories": len(selected_records),
         "requested_inspections": list(inspect),
         "completion_coverage": {"status": "unavailable", "reason": "No explicit run log supplied; saved rows do not prove complete coverage."},
+        "reference_audits": [summarize_reference_audit(path, evaluator_roots=evaluator_roots, output_dir=output_dir)
+                             for path in reference_audits],
     }
     if run_log is not None:
         if len(specs) != 1:
@@ -1151,17 +1293,20 @@ def diagnose(
     with (output_dir / "all_trajectories.jsonl").open("w", encoding="utf-8") as stream:
         for record in all_records:
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-    (output_dir / "report.md").write_text(_markdown(report), encoding="utf-8")
+    if write_markdown:
+        (output_dir / "report.md").write_text(_markdown(report), encoding="utf-8")
     return report
 
 
 def _cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--no-markdown", action="store_true", help="Write machine-readable evidence only; discuss conclusions separately")
+    parser.add_argument("--reference-audit", type=Path, action="append", default=[], help="Existing reference-audit report; may be used without trajectory input")
     parser.add_argument("--run-log", type=Path, help="optional matching launcher log; retain completion-cutoff denominators without exposing log contents")
     parser.add_argument("--evaluator-root", action="append", default=[], help="Operator-only private evidence mapping SERVICE_ROOT=LOCAL_ROOT; repeatable")
     parser.add_argument("--expected-dataset", type=Path, help="Parquet cohort to compare with the one saved trajectory input")
     parser.add_argument("--expected-samples-per-task", type=int, default=1)
-    parser.add_argument("--input", dest="inputs", action="append", required=True, type=Path, help="Explicit JSONL trajectory file; repeat for each cohort.")
+    parser.add_argument("--input", dest="inputs", action="append", default=[], type=Path, help="Explicit JSONL trajectory file; repeat for each cohort.")
     parser.add_argument("--label", dest="labels", action="append", help="Label matching each --input, in order.")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--inspect", action="append", default=[], metavar="LABEL:LINE", help="Also export a complete source row and transcript for this 1-based line.")
@@ -1175,6 +1320,8 @@ def _cli() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _cli()
     args = parser.parse_args(argv)
+    if not args.inputs and not args.reference_audit:
+        parser.error("at least one --input or --reference-audit is required")
     if args.read_window < 0 or args.exec_window < 0 or args.transcript_chars < 100 or args.examples_per_category < 1:
         parser.error("window, transcript, and example limits must be positive")
     labels = args.labels or []
@@ -1195,6 +1342,8 @@ def main(argv: list[str] | None = None) -> int:
         evaluator_roots=args.evaluator_root,
         expected_dataset=args.expected_dataset,
         expected_samples_per_task=args.expected_samples_per_task,
+        write_markdown=not args.no_markdown,
+        reference_audits=args.reference_audit,
     )
     print(json.dumps({"groups": len(report["groups"]), "trajectories": report["total_non_padding_trajectories"], "output_dir": str(args.output_dir)}))
     return 0

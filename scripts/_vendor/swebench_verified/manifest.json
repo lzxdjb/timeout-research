@@ -1,0 +1,22 @@
+{
+  "commit": "b8d53321b98c1193f9df999ff11d57ac5f5f551d",
+  "files": {
+    "LICENSE": {
+      "sha256": "2bd2e08df7147f67a69b42c10efae09bd4bf119df397371036187d5dd1b02f57",
+      "upstream": "LICENSE"
+    },
+    "constants.py": {
+      "sha256": "affe7f83b4cbe581c28a4c4b821ce1bfd1d5e6e46d8776486259133b30245ba5",
+      "upstream": "swebench/harness/constants/__init__.py"
+    },
+    "grading.py": {
+      "sha256": "93649804d23711567a93a75981cac3eea835c5adce89f95ea67ba87d96c5aa31",
+      "upstream": "swebench/harness/grading.py"
+    },
+    "python.py": {
+      "sha256": "42f564edfee3c21751739bbf09d60cf3a3ecdc58ac5cf45717dc6b47a85d7459",
+      "upstream": "swebench/harness/log_parsers/python.py"
+    }
+  },
+  "repository": "https://github.com/SWE-bench/SWE-bench"
+}

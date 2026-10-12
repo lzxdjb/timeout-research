@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import concurrent.futures
+import collections
+import fcntl
 import hashlib
 import importlib
 import importlib.util
 import json
 import os
+import re
 import shlex
 import sys
 import time
 import tempfile
+import threading
 import urllib.parse
 import urllib.request
 import uuid
@@ -23,11 +29,16 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent / "stock-rl-reflect"))
 sys.path.insert(0, str(ROOT))
-VERSION = "swe-tool-online-v9"
+VERSION = "swe-tool-online-v10"
+AUDIT_VERSION = "swe-reference-audit-v1"
 
 
-def step(name: str, arguments: dict, **expected: Any) -> dict:
-    return {"name": name, "arguments": arguments, "expected": expected}
+def step(name: str, arguments: dict, *, requires_search_backend: bool = True, **expected: Any) -> dict:
+    item = {"name": name, "arguments": arguments, "expected": expected}
+    if (name in {"Glob", "Grep", "search_files", "search_text"} and requires_search_backend
+            and expected.get("prefix") != "Path not found:"):
+        item["missing_rg_expected"] = {"prefix": "Search unavailable:", "contains": "required ripgrep"}
+    return item
 
 
 def scenarios() -> list[dict]:
@@ -49,18 +60,13 @@ def scenarios() -> list[dict]:
         ("grep_filters_and_bounds", [write, step("Write", {"file_path": "src/b.txt", "content": "needle\nneedle\n-dash\n"}, contains="Wrote"), step("Write", {"file_path": "node_modules/hidden.py", "content": "needle\n"}, contains="Wrote"), step("Grep", {"pattern": "needle", "glob": "*.py", "output_mode": "count"}, equals="src/a.py:1"), step("Grep", {"pattern": "needle", "glob": "*.txt", "output_mode": "count"}, equals="src/b.txt:2"), step("Grep", {"pattern": "-dash", "literal": True}, contains="src/b.txt:3:-dash"), step("Grep", {"pattern": "needle", "path": "src", "max_results": 1}, contains="incomplete"), step("Grep", {"pattern": "["}, prefix="Search error:")]),
         ("unicode_search_capability", [
             step("Write", {"file_path": "probe/unicode.txt", "content": "Needle caf\u00e9\nItem(\n"}, contains="Wrote"),
-            step("Grep", {"pattern": "needle", "path": "probe/unicode.txt"}, equals="probe/unicode.txt:1:Needle caf\u00e9")
-                | {"missing_rg_expected": {"prefix": "Search error:", "contains": "non-ASCII case-insensitive search requires rg"}},
-            step("Grep", {"pattern": "needle", "literal": True, "path": "probe/unicode.txt"}, equals="probe/unicode.txt:1:Needle caf\u00e9")
-                | {"missing_rg_expected": {"prefix": "Search error:", "contains": "non-ASCII case-insensitive search requires rg"}},
+            step("Grep", {"pattern": "needle", "path": "probe/unicode.txt"}, equals="probe/unicode.txt:1:Needle caf\u00e9"),
+            step("Grep", {"pattern": "needle", "literal": True, "path": "probe/unicode.txt"}, equals="probe/unicode.txt:1:Needle caf\u00e9"),
             step("Grep", {"pattern": "caf\u00e9", "literal": True, "case_sensitive": True, "path": "probe/unicode.txt"}, equals="probe/unicode.txt:1:Needle caf\u00e9"),
-            step("Grep", {"pattern": r"Item\(", "case_sensitive": True, "path": "probe/unicode.txt"}, equals="probe/unicode.txt:2:Item(")
-                | {"missing_rg_expected": {"prefix": "Search error:", "contains": "non-ASCII regex input requires rg"}},
+            step("Grep", {"pattern": r"Item\(", "case_sensitive": True, "path": "probe/unicode.txt"}, equals="probe/unicode.txt:2:Item("),
             step("Grep", {"pattern": r"Item\(", "literal": True, "case_sensitive": True, "path": "probe/unicode.txt"}, prefix="No matches.", contains="backslashes literally"),
-            step("Grep", {"pattern": "needle", "output_mode": "count", "path": "probe/unicode.txt"}, equals="probe/unicode.txt:1")
-                | {"missing_rg_expected": {"prefix": "Search error:", "contains": "requires rg"}},
-            step("Grep", {"pattern": "needle", "output_mode": "files_with_matches", "path": "probe/unicode.txt"}, equals="probe/unicode.txt")
-                | {"missing_rg_expected": {"prefix": "Search error:", "contains": "requires rg"}},
+            step("Grep", {"pattern": "needle", "output_mode": "count", "path": "probe/unicode.txt"}, equals="probe/unicode.txt:1"),
+            step("Grep", {"pattern": "needle", "output_mode": "files_with_matches", "path": "probe/unicode.txt"}, equals="probe/unicode.txt"),
         ]),
         ("patch_atomicity", [write, step("apply_patch", {"patch": "--- a/src/a.py\n+++ b/src/a.py\n@@ -1,3 +1,3 @@\n-VALUE = 1\n+VALUE = 2\n needle\n third\n"}, contains="successfully"), step("Read", {"file_path": "src/a.py"}, contains="VALUE = 2"), step("apply_patch", {"patch": "--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-absent\n+bad\n"}, contains="failed"), step("Read", {"file_path": "src/a.py"}, contains="VALUE = 2", excludes="bad"), step("apply_patch", {"patch": "garbage"}, contains="Malformed")]),
         ("legitimate_progress", [write, read, edit, step("Read", {"file_path": "src/a.py"}, contains="VALUE = 2"), step("Write", {"file_path": "tests/test_contract.py", "content": test_file}, contains="Wrote"), step("run_tests", {"command": test_command}, contains="SWE_PUBLIC_TEST_STATUS: PASS"), step("Edit", {"file_path": "src/a.py", "old_string": "VALUE = 2", "new_string": "VALUE = 3"}, contains="Edited"), step("run_tests", {"command": test_command}, contains="SWE_PUBLIC_TEST_STATUS: FAIL")]),
@@ -90,6 +96,15 @@ def scenarios() -> list[dict]:
     ]
     artifact_command = 'python -c "print(\'log needle\\n\'*1000, end=\'\')"'
     cases.extend([
+        ("integral_decimals_and_mature_globs", [write,
+            step("Read", {"file_path": "src/a.py", "offset": 1.0, "limit": "1.0"}, equals="needle"),
+            step("Grep", {"pattern": "needle", "limit": "1.0", "max_results": 1.0}, contains="src/a.py:2:needle"),
+            step("Write", {"file_path": "src/Convenience.swift", "content": "swift\n"}, contains="Wrote"),
+            step("Write", {"file_path": "src/Convenience.m", "content": "objc\n"}, contains="Wrote"),
+            step("Glob", {"pattern": "**/Convenience*.{swift,m}"}, equals="src/Convenience.m\nsrc/Convenience.swift"),
+            step("Glob", {"pattern": "Convenience.[ms]*", "path": "src"}, equals="src/Convenience.m\nsrc/Convenience.swift"),
+            step("Glob", {"pattern": "*.{swift,m}", "path": "src", "max_results": "1.0"}, contains="incomplete"),
+        ]),
         ("observed_tests_preserve_explicit_intent", [
             step("Write", {"file_path": "tests/test_contract.py", "content": "import unittest\nclass Contract(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(1, 1)\n"}, contains="Wrote"),
             *[step("Bash", {"command": test_command, **({"verification": flag} if flag is not None else {})},
@@ -99,7 +114,7 @@ def scenarios() -> list[dict]:
             step("Bash", {"command": "git log -- src/_pytest/python.py"}, metadata_absent="public_test_attempt"),
         ]),
         ("grep_offset_actionable_correction", [write,
-            step("Grep", {"pattern": "needle", "offset": 10}, prefix="Search error:", contains='Read(file_path="relative/file.py", offset=0, limit=100)'),
+            step("Grep", {"pattern": "needle", "offset": 10}, requires_search_backend=False, prefix="Search error:", contains='Read(file_path="relative/file.py", offset=0, limit=100)'),
             step("Read", {"file_path": "src/a.py", "offset": 1, "limit": 1}, equals="needle")]),
         ("ansi_and_partial_runner_evidence", [
             step("Write", {"file_path": "pytest.py", "content": "print('\\x1b[31m1 failed\\x1b[0m, \\x1b[32m4 passed\\x1b[0m in 0.1s')\n"}, contains="Wrote"),
@@ -108,10 +123,10 @@ def scenarios() -> list[dict]:
             step("Bash", {"command": "python -m pytest | head -100"}, contains="terminal runner summary is missing", metadata_paths={"public_test_attempt.test_outcome": "unknown", "public_test_attempt.test_incomplete_failure_evidence": True, "public_test_attempt.tests_executed": -1})]),
         ("grep_alias_contract", [write,
             step("Grep", {"pattern": "needle", "limit": 1}, contains="needle", metadata={"search_limit_alias_used": True}),
-            step("Grep", {"pattern": "needle", "limit": 1, "max_results": 2}, prefix="Search error:", contains="conflict"),
-            step("Grep", {"pattern": "needle", "limit": 0}, prefix="Search error:", contains="positive integer"),
-            step("Grep", {"pattern": "needle", "limit": True}, prefix="Search error:"),
-            step("Grep", {"pattern": "needle", "unknown": 1}, prefix="Search error:", contains="Supported parameters")]),
+            step("Grep", {"pattern": "needle", "limit": 1, "max_results": 2}, requires_search_backend=False, prefix="Search error:", contains="conflict"),
+            step("Grep", {"pattern": "needle", "limit": 0}, requires_search_backend=False, prefix="Search error:", contains="integer >= 1"),
+            step("Grep", {"pattern": "needle", "limit": True}, requires_search_backend=False, prefix="Search error:"),
+            step("Grep", {"pattern": "needle", "unknown": 1}, requires_search_backend=False, prefix="Search error:", contains="Supported parameters")]),
         ("stable_artifact_retrieval", [
             step("Bash", {"command": artifact_command}, prefix="exit_code: 0\n[tool output stored]", contains="Read(file_path="),
             # Login-shell profiles can print a host-specific banner. Verify the
@@ -227,6 +242,7 @@ def evaluator_fixture_case() -> dict:
              "-print('base')\n+from pathlib import Path; assert Path('empty.py').read_bytes() == b''; assert Path('model.txt').read_text() == 'repair'\n"
              "diff --git a/empty.py b/empty.py\nnew file mode 100644\n")
     from recipe.swe_agent.benchmarks.convert_swe_benchmarks import hidden_patch_reset_commands
+    from recipe.swe_agent.task_payload import evaluator_command
     commands = hidden_patch_reset_commands(patch, "HEAD")
     if commands != ["git checkout HEAD -- check.py", "rm -f -- empty.py"]:
         raise ValueError("Synthetic evaluator reset generator differs from independently specified oracle")
@@ -234,7 +250,8 @@ def evaluator_fixture_case() -> dict:
             "steps": [step("Bash", {"command": "git init -q && git -c user.name=Fixture -c user.email=fixture@example.com commit --allow-empty -qm base && printf \"print('base')\\n\" > check.py && git add check.py && git -c user.name=Fixture -c user.email=fixture@example.com commit -qm check && printf repair > model.txt && printf stale > empty.py"}, prefix="exit_code: 0")],
             "evaluator_fixture": {"base_sha": "HEAD", "hidden_test_patch": patch,
                 "trusted_hidden_test_patch": True, "verifier_setup_commands": commands,
-                "test_commands": ["python check.py"]}}
+                "test_commands": [evaluator_command({"prepare": [], "run": "python check.py"})],
+                "evaluator_test_commands": [{"prepare": [], "run": "python check.py"}]}}
 
 
 def v8_scenarios() -> list[dict]:
@@ -272,13 +289,23 @@ def v9_scenarios() -> list[dict]:
         {"id": "sympy_native_runner", "expected_hits": None, "steps": [
             step("Write", {"file_path": "sympy/__init__.py", "content": "def test(path):\n    print('tests finished: 11 passed, in 0.07 seconds')\n"}, contains="Wrote"),
             step("Bash", {"command": "python -c \"import sympy; sympy.test('public.py')\""}, metadata_paths={"public_test_attempt.test_outcome": "passed", "public_test_attempt.tests_executed": 11}, metadata_absent="public_verification")]},
+        *[{"id": "runner_terminal_regression_" + str(index), "expected_hits": None, "steps": [],
+           "parser_replay": {"command": command, "output": output, "exit_code": 0, "expected": expected}}
+          for index, (command, output, expected) in enumerate([
+              ("go test ./... | tail", "--- PASS: TestOne (0.01s)\nFAIL\tpkg\t0.1s\nFAIL\n", {"test_outcome": "failed", "tests_executed": -1}),
+              ("go test ./...", "ok\tpkg\t1.316s\n", {"test_outcome": "passed", "tests_executed": -1}),
+              ("jest | tail", "Test Suites: 1 failed, 1 passed, 2 total\nTests: 8 passed, 8 total\n", {"test_outcome": "failed", "tests_passed": 8}),
+          ])],
     ]
 
 
 def check_evaluator_fixture(response: dict) -> list[str]:
     metadata = response.get("metadata", {})
+    # Legacy benchmark fixtures predate launch-marker provenance.  Their
+    # validity is intentionally unknown, rather than invalid; False still
+    # signals a confirmed evaluator failure.
     checks = {"ok": response.get("ok") is True, "score": response.get("score") == 1.,
-        "started": metadata.get("hidden_tests_started") is True, "valid": metadata.get("evaluation_valid") is True,
+        "started": metadata.get("hidden_tests_started") is True, "valid": metadata.get("evaluation_valid") in {True, None},
         "phase": metadata.get("hidden_failure_phase") == "none", "private_evidence": metadata.get("private_evaluator_artifact_status") == "available",
         "complete_private_logs": metadata.get("private_evaluator_logs_complete") is True}
     return ["evaluator fixture: " + name for name, passed in checks.items() if not passed]
@@ -287,16 +314,68 @@ def check_evaluator_fixture(response: dict) -> list[str]:
 def check_parser_replay(case: dict) -> dict:
     from recipe.swe_agent.test_results import summarize_test_execution
     fixture = case["parser_replay"]
-    actual = summarize_test_execution(fixture["command"], fixture["output"], exit_code=fixture["exit_code"])
+    if fixture.get("rebench_contract"):
+        from recipe.swe_agent.test_results import score_official_tests
+        contract = fixture["rebench_contract"]
+        parsed = audit_rebench_outcomes(fixture["command"], fixture["output"], fixture["exit_code"],
+            log_parser=contract["log_parser"], identity_scope=contract.get("identity_scope", "test"))
+        score = score_official_tests(contract, [parsed], 1)
+        actual = {"complete": score["official_tests_complete"],
+                  "reason": parsed["reason"] if not parsed["complete"] else score["official_tests_reason"],
+                  "all_required_passed": score["official_tests_success"]}
+    else:
+        actual = summarize_test_execution(fixture["command"], fixture["output"], exit_code=fixture["exit_code"])
     failures = [f"saved parser replay {key}: expected {value!r}, got {actual.get(key)!r}"
                 for key, value in fixture["expected"].items() if actual.get(key) != value]
     return {"scope": "local_saved_evidence_parser_only", "actual": actual, "failures": failures}
 
 
-def build(directory: Path, trajectory_input: Path | None = None, latest_trajectory_input: Path | None = None, sanity_trajectory_input: Path | None = None) -> dict:
+def reference_replay_scenarios(datasets: list[Path], audit_path: Path, reviewed_path: Path) -> list[dict]:
+    """Freeze reviewed, checksum-verified full logs in the existing benchmark."""
+    report = json.loads(audit_path.read_text())
+    reviewed = json.loads(reviewed_path.read_text())
+    if reviewed.get("audit_sha256") != hashlib.sha256(audit_path.read_bytes()).hexdigest():
+        raise ValueError("reviewed replay does not match the source audit")
+    _, cases = audit_inventory(datasets, profile="rebench")
+    by_id = {case["inventory"]["id"]: case for case in cases}
+    oracles = {(r["task_id"], r["mode"]): r for r in reviewed["cases"]}
+    frozen = []
+    for result in report["results"]:
+        case = by_id[result["id"]]
+        for mode, arm in result.get("arms", {}).items():
+            if not arm.get("private_evaluator", {}).get("private_copy"):
+                continue
+            evidence = oracles[(result["task_id"], mode)]["evidence"]
+            annotated = {**arm, "task_id": result["task_id"], "runner_provenance": arm["reward"]["metadata"].get("hidden_runner_provenance")}
+            phases, sha = retained_audit_phases(annotated, reviewed_path.parent / "freeze_private")
+            chunks = re.split(r"(?m)^exit_code: (-?\d+)\ncommand: ", phases.get("test_commands", ""))
+            commands = case["task"]["test_commands"]
+            if len(commands) != 1 or len(chunks) != 3:
+                raise ValueError("saved reference benchmark requires one complete runner per case")
+            markers = re.findall(r"^SWE_RUNNER_LAUNCHED_[a-f0-9]+$", chunks[2], re.M)
+            if len(markers) != 1:
+                raise ValueError("saved reference launch is unverified")
+            frozen.append({"id": "reference_" + result["task_id"] + "_" + mode, "expected_hits": None, "steps": [],
+                "provenance": {"audit_sha256": reviewed["audit_sha256"], "private_sha256": sha,
+                               "purpose": "Offline hidden-evaluator parser replay only; never sent as model tool observations"},
+                "parser_replay": {"command": commands[0], "output": chunks[2].split(markers[0] + "\n", 1)[1],
+                    "exit_code": int(chunks[1]), "rebench_contract": case["reference_contract"],
+                    "expected": {"complete": evidence.get("complete", False), "reason": evidence["reason"],
+                                 "all_required_passed": evidence.get("all_required_passed", False)}}})
+    return frozen
+
+
+def build(directory: Path, trajectory_input: Path | None = None, latest_trajectory_input: Path | None = None, sanity_trajectory_input: Path | None = None,
+          *, reference_datasets: list[Path] | None = None, reference_audit_report: Path | None = None,
+          reference_replay_report: Path | None = None) -> dict:
     data = scenarios()
     data.extend(v8_scenarios())
     data.extend(v9_scenarios())
+    if reference_audit_report or reference_replay_report or reference_datasets:
+        if not (reference_audit_report and reference_replay_report and reference_datasets):
+            raise ValueError("reference fixtures require datasets, source audit and reviewed replay")
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        data.extend(reference_replay_scenarios(reference_datasets, reference_audit_report, reference_replay_report))
     if trajectory_input is not None:
         data.extend(trajectory_replay_scenarios(trajectory_input))
     if latest_trajectory_input is not None:
@@ -307,6 +386,7 @@ def build(directory: Path, trajectory_input: Path | None = None, latest_trajecto
                 "read_offset_policy": "Read offset is zero-based as published; internal start_line is one-based",
                 "policy_changes_from_v2": ["Correct benchmark offset oracle to the documented zero-based schema; production indexing is preserved", "Accept only explicitly declared task mount prefixes in addition to relative paths", "Add limit-only/invalid Read ranges and Grep glob, count, leading-dash and truncation boundaries"],
                 "policy_changes_from_v3": ["Guide content queries after path-only search misses", "Expose bounded session feedback for repeated empty searches and unchanged failed commands", "Check progress and mutation false-positive guards"],
+                "policy_changes_from_v9": ["Require pinned ripgrep without a Python search fallback", "Use ripgrep for Glob and filename discovery", "Accept lossless integral decimal arguments"],
                 "historical_origin": "tool_contract_v1 categories: search, path rejection, failed mutation, reread, shell, public verification",
                 "unknown_policy": "missing deployment, cleanup or execution evidence is incomplete"}
     for name, value in (("scenarios.json", data), ("manifest.json", manifest)):
@@ -321,7 +401,7 @@ def build(directory: Path, trajectory_input: Path | None = None, latest_trajecto
 def load(directory: Path) -> tuple[dict, list[dict]]:
     manifest = json.loads((directory / "manifest.json").read_text())
     cases = json.loads((directory / "scenarios.json").read_text())
-    if manifest["version"] not in {VERSION, "swe-tool-online-v8", "swe-tool-online-v7", "swe-tool-online-v6", "swe-tool-online-v5", "swe-tool-online-v4", "swe-tool-online-v3", "swe-tool-online-v2"} or digest(cases) != manifest["scenarios_sha256"]:
+    if manifest["version"] not in {VERSION, "swe-tool-online-v9", "swe-tool-online-v8", "swe-tool-online-v7", "swe-tool-online-v6", "swe-tool-online-v5", "swe-tool-online-v4", "swe-tool-online-v3", "swe-tool-online-v2"} or digest(cases) != manifest["scenarios_sha256"]:
         raise ValueError("Online manifest version/checksum mismatch")
     return manifest, cases
 
@@ -450,7 +530,9 @@ class Client:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         try:
-            with urllib.request.urlopen(urllib.request.Request(url + path, headers=headers), timeout=timeout) as response:
+            tools = importlib.import_module("recipe.swe_agent.tools")
+            with tools._remote_execution_opener().open(
+                    urllib.request.Request(url + path, headers=headers), timeout=timeout) as response:
                 return json.loads(response.read(512 * 1024))
         except Exception as exc:
             return {"ok": False, "probe_error": f"{type(exc).__name__}: {exc}"}
@@ -620,7 +702,8 @@ def run_case(client: Any, url: str, image: str, case: dict, deadline_seconds: fl
             if result.get("preflight", {}).get("metadata", {}).get("container_name") and not release.get("container_removed") and not removed_on_timeout:
                 result["incomplete"].append("container removal not confirmed")
             query = {"key": key, "workspace_path": result.get("preflight", {}).get("metadata", {}).get("workspace", ""),
-                     "cleanup_path": release.get("workspace_cleanup_path") or ""}
+                     "cleanup_path": release.get("workspace_cleanup_path") or "",
+                     "container_name": result.get("preflight", {}).get("metadata", {}).get("container_name", "")}
             cleanup_deadline = time.monotonic() + 10
             while True:
                 state = client.get(url, "/tool_contract_info?" + urllib.parse.urlencode(query))
@@ -835,14 +918,1530 @@ def preflight(urls: list[str], output: Path, client: Any = None) -> dict:
     return report
 
 
+def file_sha256(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def audit_mapped_path(raw: str, mappings: list[str]) -> Path:
+    """Only explicit path-prefix mappings are allowed across clusters."""
+    matches = []
+    for mapping in mappings:
+        source, separator, target = mapping.partition("=")
+        if not separator or not Path(source).is_absolute() or not Path(target).is_absolute():
+            raise ValueError("path map must be ABSOLUTE_SOURCE=ABSOLUTE_TARGET")
+        if raw == source.rstrip("/") or raw.startswith(source.rstrip("/") + "/"):
+            matches.append((len(source.rstrip("/")), target.rstrip("/") + raw[len(source.rstrip("/")):]))
+    if matches:
+        raw = max(matches)[1]
+    return Path(raw).expanduser()
+
+
+def audit_inventory(datasets: list[Path], mappings: list[str] | None = None, *, profile: str = "validation") -> tuple[dict, list[dict]]:
+    import pyarrow.parquet as pq
+    mappings = mappings or []
+    manifest, cases = {"version": AUDIT_VERSION, "datasets": [], "cases": []}, []
+    seen = set()
+    for dataset in datasets:
+        dataset_sha = file_sha256(dataset)
+        manifest["datasets"].append({"path": str(dataset.resolve()), "sha256": dataset_sha})
+        parquet = pq.ParquetFile(dataset)
+        # Inventory only needs the task and reward columns. Batch iteration
+        # keeps the 4 GiB training source out of a single Python object graph.
+        index = 0
+        for batch in parquet.iter_batches(batch_size=256, columns=["extra_info", "reward_model"]):
+          for row in batch.to_pylist():
+            item = {"id": digest([dataset_sha, index]), "dataset": str(dataset.resolve()), "row": index,
+                    "dataset_sha256": dataset_sha, "issues": [], "artifacts": {}}
+            if item["id"] in seen:
+                raise ValueError("duplicate dataset input")
+            seen.add(item["id"])
+            task, gold, contract = {}, "", None
+            try:
+                task = json.loads(row["extra_info"]["tools_kwargs"]["__swe_task_json__"])
+                from recipe.swe_agent.task_payload import with_official_test_contract
+                task = with_official_test_contract(task, row.get("reward_model"))
+                item.update(task_id=str(task["task_id"]), repo=task.get("repo"), base_sha=task.get("base_sha"),
+                            docker_image=task.get("docker_image"), task_sha256=digest(task))
+                if not task.get("base_sha") or not task.get("docker_image") or not task.get("test_commands"):
+                    item["issues"].append("missing_execution_contract")
+                paths = {"gold_patch": (task.get("artifact_paths") or {}).get("gold_patch"),
+                         "hidden_test_patch": task.get("hidden_test_patch_path")}
+                paths.update({"verifier:" + key: value for key, value in (task.get("verifier_file_paths") or {}).items()})
+                for name, raw in paths.items():
+                    if not raw:
+                        if name == "gold_patch" or (name == "hidden_test_patch" and not task.get("hidden_test_patch")):
+                            item["issues"].append("missing_" + name)
+                        continue
+                    path = audit_mapped_path(str(raw), mappings)
+                    try:
+                        data = path.read_bytes()
+                    except OSError as exc:
+                        item["issues"].append("unavailable_" + name + ":" + type(exc).__name__)
+                        continue
+                    item["artifacts"][name] = {"path": str(path), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+                    if name == "gold_patch":
+                        gold = data.decode("utf-8")
+                        if not gold.strip():
+                            item["issues"].append("empty_reference_patch")
+                    elif name == "hidden_test_patch":
+                        task["hidden_test_patch_path"] = str(path)
+                    elif name.startswith("verifier:"):
+                        task["verifier_file_paths"][name[len("verifier:"):]] = str(path)
+                if profile == "rebench":
+                    from recipe.swe_agent.test_results import validate_official_test_contract
+                    truth = row.get("reward_model", {}).get("ground_truth", {})
+                    truth = json.loads(truth) if isinstance(truth, str) else truth
+                    if truth.get("benchmark") != "swe_rebench_v2" or truth.get("expected") != "all_official_tests_pass":
+                        raise ValueError("rebench audit requires swe_rebench_v2 reference tests")
+                    contract = dict(task.get("official_test_contract") or {
+                        "version": 1, "fail_to_pass": truth.get("fail_to_pass"), "pass_to_pass": truth.get("pass_to_pass")})
+                    validate_official_test_contract(contract)
+                    raw_path = audit_mapped_path(task["artifact_paths"]["raw_example"], mappings)
+                    raw_bytes = raw_path.read_bytes()
+                    raw = json.loads(raw_bytes)
+                    if raw.get("instance_id") != task["task_id"]:
+                        raise ValueError("raw example task identity mismatch")
+                    from recipe.swe_agent.test_results import rebench_label_issues
+                    contract.update(rebench_scoring_version=1,
+                                    log_parser=(raw.get("install_config") or {}).get("log_parser", "unknown"),
+                                    identity_scope="namespace" if (raw.get("install_config") or {}).get("log_parser") == "parse_log_lein"
+                                    else "suite" if contract["fail_to_pass"] == ["TestSuite"] and not contract["pass_to_pass"] else "test")
+                    task["official_test_contract"] = contract
+                    item["label_issues"] = rebench_label_issues(contract)
+                    item["artifacts"]["raw_example"] = {"path": str(raw_path), "sha256": hashlib.sha256(raw_bytes).hexdigest(), "bytes": len(raw_bytes)}
+                    item.update(language=raw.get("language", "unknown"),
+                                log_parser=(raw.get("install_config") or {}).get("log_parser", "unknown"),
+                                reference_contract_sha256=digest(contract),
+                                required_tests=len(contract["fail_to_pass"]) + len(contract["pass_to_pass"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                item["issues"].append("invalid_task:" + type(exc).__name__)
+            except OSError as exc:
+                item["issues"].append("unavailable_training_artifact:" + type(exc).__name__)
+            item["eligible"] = not item["issues"]
+            item["evaluator_sha256"] = digest({k: v for k, v in task.items() if k in {
+                "test_commands", "evaluator_test_commands", "verifier_setup_commands", "hidden_test_patch",
+                "trusted_hidden_test_patch", "verifier_files", "official_test_contract"}})
+            manifest["cases"].append(item)
+            cases.append({"inventory": item, "task": task, "gold": gold, "reference_contract": contract})
+            index += 1
+    manifest["counts"] = {"cases": len(cases), "eligible": sum(c["inventory"]["eligible"] for c in cases),
+                          "repos": dict(collections.Counter(c["inventory"].get("repo", "unknown") for c in cases))}
+    return manifest, cases
+
+
+def audit_pilot_selection(cases: list[dict], count: int, seed: int) -> tuple[list[dict], dict]:
+    """Cover language/parser strata, then allocate remaining slots proportionally."""
+    groups = collections.defaultdict(list)
+    for case in cases:
+        item = case["inventory"]
+        if item["eligible"]:
+            groups[(item.get("language", "unknown"), item.get("log_parser", "unknown"))].append(case)
+    if count < len(groups) or count > sum(map(len, groups.values())):
+        raise ValueError("pilot size must cover every language/parser stratum and fit the eligible inventory")
+    quotas = {key: 1 for key in groups}
+    while sum(quotas.values()) < count:
+        key = max((key for key in groups if quotas[key] < len(groups[key])),
+                  key=lambda key: (len(groups[key]) / (quotas[key] + 1), key))
+        quotas[key] += 1
+    selected = []
+    for key in sorted(groups):
+        ordered = sorted(groups[key], key=lambda c: (c["inventory"].get("required_tests", 0),
+                         c["inventory"]["artifacts"]["gold_patch"]["bytes"], digest([seed, c["inventory"]["id"]])))
+        # Prefer repository diversity within the smaller half of each stratum.
+        pool = ordered[:max(quotas[key], (len(ordered) + 1) // 2)]
+        repos, chosen = set(), []
+        for case in pool:
+            if case["inventory"].get("repo") not in repos:
+                chosen.append(case)
+                repos.add(case["inventory"].get("repo"))
+            if len(chosen) == quotas[key]:
+                break
+        chosen_ids = {c["inventory"]["id"] for c in chosen}
+        chosen.extend(c for c in ordered if c["inventory"]["id"] not in chosen_ids)
+        selected.extend(chosen[:quotas[key]])
+    def distribution(items):
+        return dict(sorted(collections.Counter(str(c["inventory"].get("language", "unknown")) + "/" +
+                    str(c["inventory"].get("log_parser", "unknown")) for c in items).items()))
+    selected.sort(key=lambda c: c["inventory"]["id"])
+    return selected, {"algorithm": "language-parser-small-diverse-v1", "seed": seed, "count": count,
+                      "population": distribution(cases), "pilot": distribution(selected),
+                      "selection_sha256": digest([c["inventory"]["id"] for c in selected])}
+
+
+def audit_rebench_task(task: dict, seconds: float) -> dict:
+    from recipe.swe_agent.task_payload import evaluator_command
+    payload = audit_task(task, seconds)
+    if not payload.get("evaluator_test_commands"):
+        # Run the original command in its own shell: the launch wrapper's set -e
+        # must not change shell control flow inside a historical test command.
+        from recipe.swe_agent.test_results import rebench_runner_command
+        specs = [{"prepare": [], "run": rebench_runner_command(command), "source_command": command}
+                 for command in task["test_commands"]]
+        payload["evaluator_test_commands"] = specs
+        payload["test_commands"] = [evaluator_command(spec) for spec in specs]
+    return payload
+
+
+def audit_rebench_outcomes(command: str, output: str, code: int, *, log_parser: str = "", identity_scope: str = "test") -> dict:
+    """Exact identities only; summary-only and unsupported output cannot certify data."""
+    from recipe.swe_agent.test_results import rebench_test_outcomes
+    return rebench_test_outcomes(command, output, exit_code=code, log_parser=log_parser, identity_scope=identity_scope)
+
+
+def audit_rebench_verify(arm: dict, case: dict, roots: list[str], output: Path, *, parser_policy: str = "strict") -> None:
+    import gzip
+    from scripts.diagnose_trajectories import collect_private_evaluator
+    metadata = arm.get("reward", {}).get("metadata", {})
+    arm["reference_evidence"] = {"complete": False, "reason": arm.get("classification", "runner_launch_unverified")}
+    if (arm.get("exception") or not arm.get("claim", {}).get("ok") or not audit_response_ok(arm.get("base", {}))
+            or (arm["mode"] == "gold" and not audit_response_ok(arm.get("patch", {})))
+            or metadata.get("terminal_reward_timeout") or metadata.get("operation_hard_timeout")
+            or metadata.get("hidden_failure_phase") not in {"none", "test_execution", "official_test_coverage"}
+            or not arm.get("reward", {}).get("ok") or metadata.get("hidden_runner_provenance") != "launch_marker_v1"
+            or not metadata.get("hidden_tests_started")):
+        return
+    collection = collect_private_evaluator({"task_id": case["inventory"]["task_id"], "reward_evidence": metadata}, roots, output)
+    arm["private_evaluator"] = collection
+    if collection.get("status") != "verified" or collection.get("logs_complete") is not True:
+        arm["reference_evidence"]["reason"] = "private_logs_unverified:" + collection.get("status", "unknown")
+        return
+    path = Path(collection["private_copy"])
+    phases = json.loads(path.read_text())["phases"]
+    def phase_output(name):
+        value = phases.get(name, {})
+        ref = value.get("full_log")
+        return gzip.decompress((path.parent / ref["file"]).read_bytes()).decode("utf-8") if ref else value.get("output", "")
+    phase = phases.get("test_commands", {})
+    ref = phase.get("full_log")
+    text = gzip.decompress((path.parent / ref["file"]).read_bytes()).decode("utf-8") if ref else phase.get("output", "")
+    # The service emits one random launch marker and one exit header per command.
+    chunks = re.split(r"(?m)^exit_code: (-?\d+)\ncommand: ", text)
+    specs = audit_rebench_task(case["task"], 1)["evaluator_test_commands"]
+    commands = [spec.get("source_command", spec["run"]) for spec in specs]
+    if len(chunks) != 1 + 2 * len(commands):
+        arm["reference_evidence"]["reason"] = "incomplete_command_logs"
+        return
+    evidence = []
+    native_evidence = []
+    primary_evidence = []
+    provenances, exit_codes, consistency_errors = [], [], []
+    source_failure_candidate = False
+    strict_failure = None
+    strict_failure_code, strict_failure_output = None, ""
+    contract = case["reference_contract"]
+    for i, command in enumerate(commands):
+        code, body = int(chunks[1 + 2 * i]), chunks[2 + 2 * i]
+        if i + 1 < len(commands):
+            if not body.endswith("\n\n"):
+                arm["reference_evidence"]["reason"] = "incomplete_command_logs"
+                return
+            body = body[:-2]  # Service separator, not runner output.
+        markers = re.findall(r"^SWE_RUNNER_LAUNCHED_[a-f0-9]+$", body, re.M)
+        if len(markers) != 1:
+            return
+        from recipe.swe_agent.test_results import runner_output_after_marker, rebench_runner_provenance
+        runner_output = runner_output_after_marker(body, markers[0])
+        exit_codes.append(code)
+        provenance = rebench_runner_provenance(contract, command, specs[i]["run"], runner_output, code)
+        provenances.append(provenance)
+        parsed = audit_rebench_outcomes(command, runner_output, code,
+            log_parser=contract.get("log_parser", ""), identity_scope=contract.get("identity_scope", "test"))
+        from recipe.swe_agent.test_results import native_rebench_test_outcomes
+        native_evidence.append(native_rebench_test_outcomes(
+            runner_output,
+            log_parser=contract.get("log_parser", ""),
+            exit_code=code,
+        ))
+        from recipe.swe_agent.test_results import rebench_primary_test_outcomes, rebench_source_failure
+        primary_evidence.append(rebench_primary_test_outcomes(
+            command, runner_output, exit_code=code, log_parser=contract.get("log_parser", ""),
+            identity_scope=contract.get("identity_scope", "test")))
+        if parser_policy == "native-guarded":
+            try:
+                retained = json.loads(phase_output(f"runner_evidence_{i}"))
+                if retained.get("provenance") != provenance or retained.get("evidence") != primary_evidence[-1]:
+                    consistency_errors.append(f"runner_{i}_input_or_evidence_mismatch")
+            except (ValueError, TypeError):
+                consistency_errors.append(f"runner_{i}_proof_missing")
+        source_failure_candidate |= rebench_source_failure(code, runner_output)
+        if not parsed["complete"]:
+            if strict_failure is None:
+                strict_failure = parsed
+                strict_failure_code, strict_failure_output = code, runner_output
+        else:
+            evidence.append(parsed)
+    from recipe.swe_agent.test_results import score_official_tests, native_rebench_candidate_score, rebench_label_issues
+    native_score = native_rebench_candidate_score(contract, native_evidence, len(commands))
+    native_details = {
+        "commit": native_evidence[0].get("parser_commit") if native_evidence else None,
+        "name": contract.get("log_parser"),
+        # Native records remain explicitly observational. Launch and private-log
+        # checks above establish command completeness; the parser supplies test
+        # identities and outcomes.
+        "expected_command_count": len(commands),
+        "observed_command_count": sum(item.get("reason") == "native_observed_only" for item in native_evidence),
+        "all_command_observations_available": (
+            len(native_evidence) == len(commands)
+            and all(item.get("reason") == "native_observed_only" for item in native_evidence)
+        ),
+        "complete_observations": len(native_evidence) == len(commands) and all(e.get("complete") for e in native_evidence),
+        "candidate": native_score,
+        "evidence": native_evidence,
+    }
+    if parser_policy == "native-guarded":
+        score = score_official_tests(contract, primary_evidence, len(commands), execution_exit_codes=exit_codes)
+        public_score = {key: value for key, value in score.items() if not key.startswith("_private_")}
+        try:
+            retained_score = json.loads(phase_output("official_tests"))
+            if retained_score.get("score") != public_score:
+                consistency_errors.append("official_score_mismatch")
+        except (ValueError, TypeError):
+            consistency_errors.append("official_score_proof_missing")
+        if any(metadata.get(key) != value for key, value in public_score.items()):
+            consistency_errors.append("reward_metadata_mismatch")
+        if arm["reward"].get("score") != float(score["official_tests_success"]):
+            consistency_errors.append("reward_value_mismatch")
+        first_failure = next((item["reason"] for item in primary_evidence if not item["complete"]), None)
+        arm["reference_evidence"] = {
+            "complete": score["official_tests_complete"], "reason": first_failure or score["official_tests_reason"],
+            "required": score["official_tests_required"], "missing": score["official_tests_missing"],
+            "fail_to_pass_failed": score["official_fail_to_pass_failed"],
+            "pass_to_pass_complete": score["official_pass_to_pass_complete"],
+            "all_required_passed": score["official_tests_success"], "label_issues": rebench_label_issues(contract),
+            "parser_policy": parser_policy, "strict_parser": "shadow", "native_parser": native_details,
+            "strict_shadow": strict_failure or {"complete": True, "reason": "complete"},
+            "parser_disagreement": any(item.get("shadow", {}).get("complete") and
+                item.get("shadow", {}).get("outcomes") != item.get("outcomes") for item in primary_evidence),
+            "baseline_source_failure_candidate": arm["mode"] == "baseline" and source_failure_candidate,
+            "service_consistency": {"version": 1, "matched": not consistency_errors, "errors": consistency_errors,
+                                    "runners": provenances, "score": public_score},
+        }
+        if consistency_errors:
+            arm["reference_evidence"].update(complete=False, all_required_passed=False,
+                baseline_source_failure_candidate=False, reason="audit_service_scoring_mismatch")
+        return
+    if strict_failure is not None:
+        arm["reference_evidence"] = {"complete": False, "reason": strict_failure["reason"],
+            "parser_policy": parser_policy, "strict_parser": "current", "native_parser": native_details,
+            "parser_disagreement": native_score.get("candidate_all_required_passed") is True}
+        arm["reference_evidence"]["baseline_source_failure_candidate"] = (
+                arm["mode"] == "baseline" and strict_failure_code in {1, 2, 101} and not contract["pass_to_pass"] and
+                re.search(r"(?im)(undefined:|unknown field |has no field|no field `|no function or associated item named|cannot import name|error\[E\d+\])", strict_failure_output) is not None
+                and re.search(r"(?im)(command not found|no such host|no space left|structuredClone is not defined|no module named)", strict_failure_output) is None)
+        return
+    score = score_official_tests(contract, evidence, len(commands))
+    arm["reference_evidence"] = {"complete": score["official_tests_complete"], "reason": score["official_tests_reason"],
+        "required": score["official_tests_required"], "missing": score["official_tests_missing"],
+        "fail_to_pass_failed": score["official_fail_to_pass_failed"],
+        "pass_to_pass_complete": score["official_pass_to_pass_complete"],
+        "all_required_passed": score["official_tests_success"], "label_issues": rebench_label_issues(contract),
+        "parser_policy": parser_policy, "strict_parser": "current"}
+    arm["reference_evidence"].update({
+        "native_parser": native_details,
+        "parser_disagreement": native_score.get("candidate_all_required_passed") != score["official_tests_success"],
+    })
+
+
+def audit_rebench_status(result: dict) -> str:
+    if not result.get("complete"):
+        return "blocked:cleanup_unverified"
+    if result.get("data_issues") or result.get("image_unavailable") or result.get("endpoint_quarantined"):
+        return audit_result_status(result)
+    arms = result.get("arms", {})
+    if set(arms) != {"baseline", "gold"} or any(not a.get("cleanup", {}).get("verified") for a in arms.values()):
+        return "review:incomplete_or_unclean_execution"
+    baseline, gold = arms["baseline"], arms["gold"]
+    if any(a.get("reference_evidence", {}).get("service_consistency", {}).get("matched") is False
+           for a in arms.values()):
+        return "review:audit_service_scoring_mismatch"
+    if (gold.get("reference_evidence", {}).get("complete") and gold["reference_evidence"].get("all_required_passed")
+            and gold["reward"].get("score") == 1 and not baseline.get("reference_evidence", {}).get("complete")
+            and baseline.get("reference_evidence", {}).get("baseline_source_failure_candidate")):
+        return "review:gold_verified_baseline_source_failure"
+    for mode in ("gold", "baseline"):
+        arm = arms[mode]
+        evidence = arm.get("reference_evidence", {})
+        if not evidence.get("complete"):
+            return "review:" + mode + ":" + evidence.get("reason", arm.get("classification", "unknown"))
+    baseline, gold = arms["baseline"], arms["gold"]
+    if gold["reward"].get("score") != 1 or not gold["reference_evidence"]["all_required_passed"]:
+        return "review:reference_tests_failed_or_reward_conflict"
+    if baseline["reward"].get("score") == 1:
+        return "baseline_passed_review"
+    evidence = baseline["reference_evidence"]
+    if baseline["reward"].get("score") == 0 and evidence["fail_to_pass_failed"] > 0 and evidence["pass_to_pass_complete"]:
+        return "reference_verified"
+    return "baseline_required_tests_review"
+
+
+def native_reference_candidate(result: dict) -> dict:
+    """Report a native-parser candidate without granting it certification authority."""
+    report = {
+        "authority": "audit_only_native_observed",
+        "eligible": False,
+        "reason": "unknown",
+        "parser": None,
+    }
+    if result.get("complete") is not True:
+        report["reason"] = "audit_incomplete"
+        return report
+    arms = result.get("arms") or {}
+    if set(arms) != {"baseline", "gold"}:
+        report["reason"] = "missing_audit_arms"
+        return report
+    if any(arm.get("cleanup", {}).get("verified") is not True for arm in arms.values()):
+        report["reason"] = "cleanup_unverified"
+        return report
+    evidence = {mode: arms[mode].get("reference_evidence") or {} for mode in arms}
+    native = {mode: evidence[mode].get("native_parser") or {} for mode in arms}
+    report["parser"] = native["gold"].get("name") or native["baseline"].get("name")
+    for mode in ("baseline", "gold"):
+        if native[mode].get("all_command_observations_available") is not True:
+            report["reason"] = mode + "_native_observations_incomplete"
+            return report
+        if native[mode].get("candidate", {}).get("authority") != "native_observed_only":
+            report["reason"] = mode + "_native_authority_missing"
+            return report
+        metadata = arms[mode].get("reward", {}).get("metadata") or {}
+        if (metadata.get("hidden_runner_provenance") != "launch_marker_v1"
+                or metadata.get("hidden_tests_started") is not True):
+            report["reason"] = mode + "_runner_unverified"
+            return report
+        # Native output can name a test while the runner itself failed before
+        # that test's outcome was established. Keep these out of candidates;
+        # unsupported syntax/identity handling remains reportable below.
+        if evidence[mode].get("reason") in {
+            "ambiguous_errors", "test_setup_or_collection_error", "incomplete_tests",
+            "execution_error", "incomplete_command_logs",
+        } and evidence[mode].get("parser_policy") != "native-guarded":
+            report["reason"] = mode + "_strict_execution_ambiguous"
+            return report
+    gold_score = native["gold"]["candidate"]
+    baseline_score = native["baseline"]["candidate"]
+    if gold_score.get("candidate_all_required_passed") is not True:
+        report["reason"] = "gold_native_required_tests_not_all_passed"
+    elif baseline_score.get("official_tests_complete") is not True:
+        report["reason"] = "baseline_native_required_tests_incomplete"
+    elif baseline_score.get("official_fail_to_pass_failed", 0) <= 0:
+        report["reason"] = "baseline_native_fail_to_pass_not_failed"
+    elif baseline_score.get("official_pass_to_pass_complete") is not True:
+        report["reason"] = "baseline_native_pass_to_pass_incomplete"
+    else:
+        report.update(eligible=True, reason="native_reference_transition_observed")
+    return report
+
+
+def native_reference_candidate_summary(results: list[dict]) -> dict:
+    """Aggregate audit-only native evidence for a report, never for filtering."""
+    candidates = [result.get("native_reference_candidate") or native_reference_candidate(result) for result in results]
+    strict_vs_native = collections.Counter()
+    parser_counts = collections.Counter()
+    for result, candidate in zip(results, candidates):
+        arms = result.get("arms") or {}
+        gold_reason = (arms.get("gold", {}).get("reference_evidence") or {}).get("reason", "missing_gold_evidence")
+        strict_vs_native[(gold_reason, candidate.get("reason", "unknown"))] += 1
+        parser_counts[str(candidate.get("parser") or "unknown")] += 1
+    return {
+        "version": 1,
+        "authority": "audit_only_native_observed",
+        "case_count": len(results),
+        "candidate_count": sum(candidate.get("eligible") is True for candidate in candidates),
+        "by_parser": dict(sorted(parser_counts.items())),
+        "strict_gold_reason_vs_native_candidate": {
+            strict_reason + "|" + candidate_reason: count
+            for (strict_reason, candidate_reason), count in sorted(strict_vs_native.items())
+        },
+    }
+
+
+def audit_task(task: dict, deadline_seconds: float) -> dict:
+    from recipe.swe_agent.task_payload import reward_task_payload
+    task = reward_task_payload(task, hard_timeout_seconds=deadline_seconds)
+    # Never pull/build images during an environment audit.
+    task["docker_pull"] = False
+    if task.get("dockerfile") or task.get("docker_build") or task.get("docker_build_spec"):
+        raise ValueError("image builds are not allowed in the reference audit")
+    image = task["docker_image"]
+    task["case_image"] = image
+    task["environment"] = {**(task.get("environment") or {}), "base_image": image, "case_image": image}
+    return task
+
+
+def audit_response_ok(response: dict) -> bool:
+    return response.get("ok") is True and re.match(r"^exit_code: 0(?:\n|$)", response.get("text", "")) is not None
+
+
+def audit_classify(arm: dict) -> str:
+    if arm.get("exception"):
+        if "Committed case image is missing from this Docker daemon:" in arm["exception"]:
+            return "image_unavailable"
+        return arm.get("failure_kind", "inconclusive")
+    if not arm.get("claim", {}).get("ok"):
+        return "admission_or_transport_failure"
+    if not audit_response_ok(arm.get("base", {})):
+        return "base_revision_or_workspace_mismatch"
+    if arm["mode"] == "gold" and not audit_response_ok(arm.get("patch", {})):
+        return "reference_patch_mismatch"
+    reward = arm.get("reward", {})
+    metadata = reward.get("metadata") or {}
+    if metadata.get("terminal_reward_timeout") or metadata.get("operation_hard_timeout") or metadata.get("failure_reason") == "silent_command_timeout":
+        return "evaluation_timeout"
+    if not reward.get("ok"):
+        return "reward_transport_or_service_failure"
+    phase = metadata.get("hidden_failure_phase")
+    if phase in {"workspace_prepare", "verifier_staging", "verifier_setup", "patch_check", "patch_apply", "evaluator_preparation"}:
+        return phase + "_failure"
+    if not metadata.get("hidden_tests_started") or metadata.get("hidden_runner_provenance") != "launch_marker_v1":
+        return "runner_launch_unverified"
+    if arm.get("official_test_contract_required") and metadata.get("official_test_scoring_version") != 1:
+        return "official_scoring_unavailable"
+    if metadata.get("official_test_scoring_version"):
+        if metadata.get("official_tests_complete") is not True:
+            return "official_test_coverage_unknown"
+        if metadata.get("official_tests_success") is True and reward.get("score") == 1.0:
+            return "tests_passed"
+        if metadata.get("official_tests_failed", 0) > 0 and reward.get("score") == 0.0:
+            return "required_tests_failed"
+        return "scoring_evidence_conflict"
+    if metadata.get("hidden_test_counts_complete") is not True or metadata.get("hidden_tests_total_count", -1) <= 0:
+        return "test_coverage_unknown"
+    if reward.get("score") == 1.0:
+        return "tests_passed"
+    return "tests_failed_or_collection_error"
+
+
+def audit_arm(client: Any, url: str, task: dict, gold: str, mode: str, seconds: float, checkpoint) -> dict:
+    from recipe.swe_agent.task_payload import rollout_task_payload
+    request = "reference-audit-" + uuid.uuid4().hex
+    public = rollout_task_payload(task, hard_timeout_seconds=seconds)
+    payload = {"request_id": request, "instance_id": request, "task": public}
+    arm = {"mode": mode, "request_id": request, "endpoint": url, "phase": "created",
+           "official_test_contract_required": task.get("official_test_contract") is not None}
+    deadline = time.monotonic() + seconds
+    def record(name, value):
+        arm[name], arm["phase"] = value, name
+        checkpoint(arm)
+        return value
+    try:
+        checkpoint(arm)
+        claim = record("claim", client.post(url, "/claim", payload, deadline))
+        if claim.get("ok"):
+            # Confirm HEAD and a clean checkout before any reference mutation.
+            command = ("expected=" + shlex.quote(str(task["base_sha"])) + '\nswe_git_error=$(mktemp)\n'
+                       'trap \'rm -f "$swe_git_error"\' EXIT\n'
+                       'actual=$(git rev-parse HEAD 2>>"$swe_git_error"); a=$?\n'
+                       'resolved=$(git rev-parse "$expected^{commit}" 2>>"$swe_git_error"); b=$?\n'
+                       'tracked=$(git status --porcelain --untracked-files=no 2>>"$swe_git_error"); c=$?\n'
+                       'untracked=$(git ls-files --others --exclude-standard 2>>"$swe_git_error"); d=$?\n'
+                       'printf "SWE_BASE_CWD\\n%s\\nSWE_BASE_EXPECTED\\n%s\\nSWE_BASE_RESOLVED\\n%s\\nSWE_BASE_ACTUAL\\n%s\\n" "$PWD" "$expected" "$resolved" "$actual"\n'
+                       'printf "SWE_BASE_TRACKED\\n%s\\nSWE_BASE_UNTRACKED\\n%s\\nSWE_BASE_GIT_ERRORS\\n" "$tracked" "$untracked"\n'
+                       'cat "$swe_git_error"\nprintf "SWE_BASE_END\\n"\n'
+                       'test "$a$b$c$d" = 0000 && test "$actual" = "$resolved" && test -z "$tracked" || exit 1\n'
+                       'printf "BASE_OK %s\\n" "$actual"')
+            base = record("base", client.post(url, "/execute", {**payload, "tool": "Bash", "parameters": {"command": command}}, deadline))
+            arm["workspace_diagnostics"] = {m[1].lower(): m[2].strip() for m in re.finditer(
+                r"^SWE_BASE_(CWD|EXPECTED|RESOLVED|ACTUAL|TRACKED|UNTRACKED|GIT_ERRORS)\n(.*?)(?=^SWE_BASE_)",
+                base.get("text", ""), re.M | re.S)}
+            checkpoint(arm)
+            if audit_response_ok(base):
+                patched = mode == "baseline"
+                if mode == "gold":
+                    encoded = base64.b64encode(gold.encode()).decode()
+                    command = ("set -e\np=$(mktemp /tmp/swe-reference-XXXXXX.patch)\ntrap 'rm -f \"$p\"' EXIT\n"
+                               + "printf %s " + shlex.quote(encoded) + ' | base64 -d > "$p"\n'
+                               + 'git apply --check "$p"\ngit apply --index "$p"\ngit diff --cached --quiet && exit 42\n'
+                               + 'git diff --cached --stat\nprintf "REFERENCE_APPLIED\\n"')
+                    patch = record("patch", client.post(url, "/execute", {**payload, "tool": "Bash", "parameters": {"command": command}}, deadline))
+                    patched = audit_response_ok(patch)
+                if patched:
+                    record("reward", client.post(url, "/reward", {**payload, "task": task}, deadline))
+    except Exception as exc:
+        arm["exception"] = f"{type(exc).__name__}: {exc}"[:2000]
+        arm["failure_kind"] = "transport_failure" if isinstance(exc, (ConnectionError, urllib.error.URLError)) else "inconclusive"
+    finally:
+        try:
+            release = record("release", client.post(url, "/release", {**payload, "force": True}, time.monotonic() + 45))
+            metadata = {**(arm.get("claim", {}).get("metadata") or {}), **(arm.get("base", {}).get("metadata") or {})}
+            query = {"key": request + ":" + task["task_id"], "workspace_path": metadata.get("workspace", ""),
+                     "cleanup_path": release.get("workspace_cleanup_path") or "",
+                     "container_name": metadata.get("container_name", "")}
+            cleanup_deadline = time.monotonic() + 15
+            while True:
+                state = client.get(url, "/tool_contract_info?" + urllib.parse.urlencode(query))
+                sessions, filesystem = state.get("session_state"), state.get("cleanup_state") or {}
+                verified = isinstance(sessions, dict) and not any(sessions.values()) and filesystem.get("complete") is True
+                if verified or time.monotonic() >= cleanup_deadline:
+                    break
+                time.sleep(.25)
+            record("cleanup", {"verified": bool(verified), "sessions": sessions, "filesystem": filesystem})
+        except Exception as exc:
+            arm["cleanup"] = {"verified": False, "error": f"{type(exc).__name__}: {exc}"[:1000]}
+        arm["classification"] = audit_classify(arm)
+        arm["phase"] = "complete"
+        checkpoint(arm)
+    return arm
+
+
+def audit_result_status(result: dict) -> str:
+    if result.get("image_unavailable"):
+        return "image_unavailable"
+    if result.get("endpoint_quarantined"):
+        return "endpoint_quarantined"
+    if result.get("data_issues"):
+        return "unavailable_data"
+    arms = result.get("arms") or {}
+    if not all(arm.get("cleanup", {}).get("verified") for arm in arms.values()):
+        return "cleanup_unverified"
+    if set(arms) != {"baseline", "gold"}:
+        return "interrupted"
+    gold = arms["gold"]["classification"]
+    baseline = arms["baseline"]["classification"]
+    if gold == "tests_passed" and baseline == "tests_passed":
+        return "baseline_passed_review"
+    if gold == "tests_passed" and baseline == "tests_failed_or_collection_error":
+        return "reference_verified"
+    if gold == "tests_passed" and baseline == "required_tests_failed":
+        metadata = arms["baseline"]["reward"]["metadata"]
+        if metadata.get("official_fail_to_pass_failed", 0) > 0 and metadata.get("official_pass_to_pass_complete") is True:
+            return "reference_verified"
+        return "baseline_required_tests_review"
+    if gold == "tests_passed":
+        return "baseline_evidence_review:" + baseline
+    return "review:" + gold
+
+
+def reference_audit(datasets: list[Path], urls: list[str], output: Path, *, mappings: list[str] | None = None,
+                    task_ids: list[str] | None = None, limit: int = 0, seconds: float = 900,
+                    resume: bool = False, client: Any = None, workers_per_endpoint: int | None = None,
+                    profile: str = "validation", pilot_size: int = 0, seed: int = 0,
+                    evaluator_roots: list[str] | None = None, image_policy: str = "cache-only",
+                    image_prepare_seconds: float = 1800, image_prepare_parallelism: int = 1,
+                    parser_policy: str = "strict", transport_retries: int = 1) -> dict:
+    output.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (output / ".audit.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("another audit is using this output directory") from exc
+        return _reference_audit(datasets, urls, output, mappings=mappings, task_ids=task_ids,
+                                limit=limit, seconds=seconds, resume=resume, client=client,
+                                workers_per_endpoint=workers_per_endpoint, profile=profile,
+                                pilot_size=pilot_size, seed=seed, evaluator_roots=evaluator_roots,
+                                image_policy=image_policy, image_prepare_seconds=image_prepare_seconds,
+                                image_prepare_parallelism=image_prepare_parallelism, parser_policy=parser_policy,
+                                transport_retries=transport_retries)
+
+
+def audit_write_json(path: Path, value: dict) -> None:
+    """An interrupted write must not destroy a resumable audit checkpoint."""
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def audit_recover_arm(client: Any, task: dict, arm: dict, *, preserve_completed: bool = False) -> dict:
+    """Cleanup only; never replay an uncertain remote test or patch command."""
+    completed = preserve_completed and arm.get("phase") == "complete"
+    recovered = {**arm, **({"recovered_cleanup": True} if completed else {"recovered_interruption": True})}
+    url, request = arm["endpoint"], arm["request_id"]
+    try:
+        from recipe.swe_agent.task_payload import rollout_task_payload
+        release = client.post(url, "/release", {"request_id": request, "instance_id": request,
+            "task": rollout_task_payload(task), "force": True}, time.monotonic() + 45)
+        if not release.get("workspace_cleanup_path") and arm.get("release", {}).get("workspace_cleanup_path"):
+            release = {**release, "workspace_cleanup_path": arm["release"]["workspace_cleanup_path"]}
+        metadata = {**(arm.get("claim", {}).get("metadata") or {}), **(arm.get("base", {}).get("metadata") or {})}
+        query = {"key": request + ":" + task["task_id"], "workspace_path": metadata.get("workspace", ""),
+                 "cleanup_path": release.get("workspace_cleanup_path") or "", "container_name": metadata.get("container_name", "")}
+        deadline = time.monotonic() + 15
+        while True:
+            state = client.get(url, "/tool_contract_info?" + urllib.parse.urlencode(query))
+            sessions, filesystem = state.get("session_state"), state.get("cleanup_state") or {}
+            verified = isinstance(sessions, dict) and not any(sessions.values()) and filesystem.get("complete") is True
+            if verified or time.monotonic() >= deadline:
+                break
+            time.sleep(.25)
+        recovered.update(release=release, cleanup={"verified": verified, "sessions": sessions, "filesystem": filesystem})
+    except Exception as exc:
+        recovered["cleanup"] = {"verified": False, "error": f"{type(exc).__name__}: {exc}"[:1000]}
+    if recovered["cleanup"]["verified"] and not completed:
+        recovered.update(phase="complete", classification="interrupted_recovered")
+    return recovered
+
+
+def audit_result_record(item: dict, result: dict, signature: str, source_match: bool,
+                        audit_source: dict | None = None) -> dict:
+    arms = result.get("arms", {})
+    return {"version": "swe-reference-results-v1", "id": item["id"], "dataset_sha256": item["dataset_sha256"],
+            "row": item["row"], "task_id": item.get("task_id"), "repo": item.get("repo"),
+            "signature": signature, "source_match": source_match, "complete": result.get("complete", False),
+            "status": result.get("status", "not_audited"), "data_issues": result.get("data_issues", []),
+            "image_preparation": result.get("image_preparation"),
+            "verification_context": {**(audit_source or {}),
+                "task_sha256": item.get("task_sha256"),
+                "evaluator_sha256": item.get("evaluator_sha256"),
+                "reference_contract_sha256": item.get("reference_contract_sha256"),
+                "artifact_sha256": {name: artifact["sha256"] for name, artifact in item.get("artifacts", {}).items()},
+                "image_id": result.get("cached_image_id")},
+            "image_availability_scope": "local_docker_cache" if result.get("image_unavailable") else None,
+            "native_reference_candidate": result.get("native_reference_candidate"),
+            "arms": {mode: {"classification": arm.get("classification"), "score": arm.get("reward", {}).get("score"),
+                      "cleanup_verified": arm.get("cleanup", {}).get("verified", False),
+                      "reference_evidence": arm.get("reference_evidence", {}),
+                      "private_evaluator": arm.get("private_evaluator", {}), "endpoint": arm.get("endpoint"),
+                      "timings": {name: arm.get("reward", {}).get("metadata", {})[name]
+                          for name in ("operation_queue_wait_seconds", "operation_end_to_end_seconds")
+                          if name in arm.get("reward", {}).get("metadata", {})},
+                      "request_id": arm.get("request_id")} for mode, arm in arms.items()}}
+
+
+class AuditProgress:
+    def __init__(self, output: Path, cases: list[dict], signature: str, source_match: bool):
+        from tqdm import tqdm
+        self.output, self.signature, self.source_match = output, signature, source_match
+        self.audit_source = {
+            "service_source_sha256": importlib.import_module("recipe.swe_agent.tool_contract_info").source_fingerprint()["sha256"],
+            "audit_code_sha256": file_sha256(Path(__file__)),
+        }
+        self.items = {c["inventory"]["id"]: c["inventory"] for c in cases}
+        self.records, self.running = {}, 0
+        self.lock = threading.Lock()
+        for identity in self.items:
+            path = output / "cases" / identity / "result.json"
+            if path.exists():
+                result = json.loads(path.read_text())
+                self.records[identity] = audit_result_record(self.items[identity], result, signature, source_match, self.audit_source)
+        # Rebuild from authoritative atomic checkpoints, repairing a crash between
+        # result persistence and ledger append (or a truncated final JSONL line).
+        ledger = output / "results.jsonl"
+        with tempfile.NamedTemporaryFile(mode="w", dir=output, delete=False) as stream:
+            temporary = Path(stream.name)
+            try:
+                for record in self.records.values():
+                    stream.write(json.dumps(record, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+                os.replace(temporary, ledger)
+            finally:
+                temporary.unlink(missing_ok=True)
+        completed = sum(r["complete"] for r in self.records.values())
+        self.bar = tqdm(total=len(cases), initial=completed, desc="Reference audit", unit="case", file=sys.stderr)
+        self.publish()
+
+    def publish(self):
+        completed = sum(r["complete"] for r in self.records.values())
+        verified = sum(r["complete"] and r["status"] == "reference_verified" for r in self.records.values())
+        review = sum(r["complete"] and (r["status"].startswith("review:") or "review" in r["status"]) for r in self.records.values())
+        snapshot = {"total": len(self.items), "completed": completed, "remaining": len(self.items) - completed,
+                    "running": self.running, "verified": verified, "failed": completed - verified,
+                    "review": review, "blocked": sum(not r["complete"] for r in self.records.values()),
+                    "signature": self.signature, "updated_at_unix": time.time()}
+        audit_write_json(self.output / "progress.json", snapshot)
+        self.bar.n = completed
+        self.bar.set_postfix({k: snapshot[k] for k in ("completed", "remaining", "running", "failed", "review", "blocked")})
+
+    def start(self):
+        with self.lock:
+            self.running += 1
+            self.publish()
+
+    def finish(self, result: dict):
+        with self.lock:
+            record = audit_result_record(self.items[result["id"]], result, self.signature, self.source_match, self.audit_source)
+            self.records[result["id"]] = record
+            with (self.output / "results.jsonl").open("a") as stream:
+                stream.write(json.dumps(record, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.running -= 1
+            self.publish()
+
+    def close(self):
+        self.bar.close()
+
+
+def _reference_audit(datasets: list[Path], urls: list[str], output: Path, *, mappings: list[str] | None = None,
+                     task_ids: list[str] | None = None, limit: int = 0, seconds: float = 900,
+                     resume: bool = False, client: Any = None, workers_per_endpoint: int | None = None,
+                     profile: str = "validation", pilot_size: int = 0, seed: int = 0,
+                     evaluator_roots: list[str] | None = None, image_policy: str = "cache-only",
+                     image_prepare_seconds: float = 1800, image_prepare_parallelism: int = 1,
+                     parser_policy: str = "strict", transport_retries: int = 1) -> dict:
+    from recipe.swe_agent.image_archives import canonical_image_reference
+    client = client or Client()
+    if type(transport_retries) is not int or transport_retries not in (0, 1):
+        raise ValueError("transport_retries must be 0 or 1")
+    if workers_per_endpoint is None:
+        workers_per_endpoint = int(os.environ.get("SWE_AGENT_REFERENCE_AUDIT_WORKERS_PER_ENDPOINT", "2"))
+    if type(workers_per_endpoint) is not int or workers_per_endpoint < 1:
+        raise ValueError("workers_per_endpoint must be a positive integer")
+    if not urls or len(urls) != len(set(urls)) or seconds <= 0 or limit < 0:
+        raise ValueError("unique endpoints and positive deadline required")
+    if profile not in {"validation", "rebench"} or pilot_size < 0:
+        raise ValueError("invalid audit profile or pilot size")
+    if parser_policy not in {"strict", "native-first-shadow", "native-guarded"}:
+        raise ValueError("unsupported ReBench parser policy")
+    if (image_policy not in {"cache-only", "archive-or-pull"}
+            or not 0 < image_prepare_seconds <= 7200 or type(image_prepare_parallelism) is not int
+            or image_prepare_parallelism < 1 or (profile != "rebench" and image_policy != "cache-only")):
+        raise ValueError("invalid image preparation settings; provisioning requires rebench profile")
+    if pilot_size and (profile != "rebench" or task_ids or limit):
+        raise ValueError("--pilot-size requires rebench profile and cannot combine with --limit or --task-id")
+    if profile == "rebench" and not evaluator_roots:
+        raise ValueError("rebench profile requires explicit --evaluator-root SERVICE_ROOT=LOCAL_ROOT")
+    for mapping in evaluator_roots or []:
+        source, separator, destination = mapping.partition("=")
+        if not separator or not Path(source).is_absolute() or not Path(destination).is_absolute():
+            raise ValueError("evaluator roots must be ABSOLUTE_SERVICE_ROOT=ABSOLUTE_LOCAL_ROOT")
+    manifest, cases = audit_inventory(datasets, mappings, profile=profile)
+    if profile == "rebench" and parser_policy == "native-guarded":
+        from recipe.swe_agent.test_results import rebench_contract_fields, official_evidence_sha256
+        for case in cases:
+            contract = case.get("reference_contract")
+            if contract is None:
+                continue
+            contract.update(rebench_contract_fields(contract["log_parser"], contract["fail_to_pass"], contract["pass_to_pass"]))
+            case["task"]["official_test_contract"] = contract
+            case["inventory"]["reference_contract_sha256"] = official_evidence_sha256(contract)
+            case["inventory"]["task_sha256"] = digest(case["task"])
+            case["inventory"]["evaluator_sha256"] = digest({k: v for k, v in case["task"].items() if k in {
+                "test_commands", "evaluator_test_commands", "verifier_setup_commands", "hidden_test_patch",
+                "trusted_hidden_test_patch", "verifier_files", "official_test_contract"}})
+    selection = None
+    if pilot_size:
+        cases, selection = audit_pilot_selection(cases, pilot_size, seed)
+    if task_ids:
+        missing = set(task_ids) - {c["inventory"].get("task_id") for c in cases}
+        if missing:
+            raise ValueError("task IDs not in datasets: " + ",".join(sorted(missing)))
+        cases = [c for c in cases if c["inventory"].get("task_id") in task_ids]
+    if limit:
+        cases = cases[:limit]
+    local = importlib.import_module("recipe.swe_agent.tool_contract_info").source_fingerprint()
+    services = [{"url": url, "health": client.get(url, "/health"), "deployment": client.get(url, "/tool_contract_info")} for url in urls]
+    source_match = all(s["deployment"].get("source_fingerprint", {}).get("sha256") == local["sha256"] for s in services)
+    if profile == "rebench" and (not source_match or any(s["health"].get("ok") is not True for s in services)):
+        raise ValueError("training audit requires healthy services with matching deployed sources")
+    cached = {s["url"]: {i["tag"]: i["id"] for i in s["deployment"].get("cached_images", [])} for s in services}
+    for cache in cached.values():
+        equivalents = {canonical_image_reference(tag): image_id for tag, image_id in cache.items()}
+        for case in cases:
+            image = case["inventory"].get("docker_image")
+            if image and canonical_image_reference(image) in equivalents:
+                cache[image] = equivalents[canonical_image_reference(image)]
+    selected_images = {c["inventory"].get("docker_image") for c in cases}
+    availability = {s["url"]: {} for s in services}
+    for service in services:
+        url = service["url"]
+        for image in sorted(selected_images - {None}):
+            if image in cached[url]:
+                availability[url][image] = True
+            elif service["deployment"].get("image_inventory_complete") is True:
+                availability[url][image] = False
+            elif profile == "rebench":
+                # ReBench prepares an assigned image remotely. An incomplete
+                # cache listing is a scheduling hint, never a reason to inspect
+                # the full dataset on every daemon before dispatching work.
+                availability[url][image] = None
+            else:
+                probe = client.get(url, "/tool_contract_info?" + urllib.parse.urlencode({"image": image})).get("image_probe", {})
+                known = probe.get("available") if probe.get("tag") == image else None
+                availability[url][image] = known if type(known) is bool else None
+                if known is True and probe.get("id"):
+                    cached[url][image] = probe["id"]
+    identity = {"manifest": manifest, "selection": [c["inventory"]["id"] for c in cases], "seconds": seconds,
+                "workers_per_endpoint": workers_per_endpoint,
+                "services": [{"url": s["url"], "source": s["deployment"].get("source_fingerprint"),
+                              "images": {tag: image_id for tag, image_id in cached[s["url"]].items() if tag in selected_images},
+                              "image_availability": availability[s["url"]]}
+                             for s in services],
+                "source": local, "audit_code_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "path_maps": mappings or []}
+    if profile == "rebench":
+        identity.pop("workers_per_endpoint")
+        # Cache contents change during pulls and between restarts; they are evidence,
+        # not immutable resume inputs. Image names remain in the dataset manifest.
+        for service in identity["services"]:
+            service.pop("images")
+            service.pop("image_availability")
+        identity.update(profile=profile, pilot=selection, evaluator_roots=evaluator_roots, parser_policy=parser_policy,
+                        image_policy=image_policy, image_prepare_seconds=image_prepare_seconds)
+    if transport_retries != 1:
+        identity["transport_retries"] = transport_retries
+    signature = digest(identity)
+    output.mkdir(parents=True, exist_ok=True, mode=0o700)
+    manifest_path = output / "manifest.json"
+    if manifest_path.exists():
+        if not resume:
+            raise ValueError("audit directory already exists; use --resume")
+        if json.loads(manifest_path.read_text())["signature"] != signature:
+            raise ValueError("resume signature differs: inputs, code, settings or deployed services changed")
+    else:
+        audit_write_json(manifest_path, {"version": AUDIT_VERSION, "signature": signature, "identity": identity, "services": services})
+    pending = []
+    quarantined = set()
+    scheduling_lock = threading.Lock()
+    preparation_slots = {url: threading.BoundedSemaphore(image_prepare_parallelism) for url in urls}
+    preparation_results = {}
+    for case in cases:
+        image = case["inventory"].get("docker_image")
+        candidates = [url for url in urls if image in cached[url]]
+        if not candidates:
+            candidates = [url for url in urls if availability[url].get(image) is not False]
+        if not candidates and image_policy == "archive-or-pull":
+            candidates = urls
+        case["image_unavailable"] = not candidates
+        case["candidates"] = candidates or urls
+        # Inspect ALL checkpoints before admitting any new sessions. A late
+        # checkpoint must not allow earlier queue items onto an unsafe endpoint.
+        case_dir = output / "cases" / case["inventory"]["id"]
+        checkpoints = list(case_dir.glob("*/*.json"))
+        result_path = case_dir / "result.json"
+        previous_result = json.loads(result_path.read_text()) if result_path.exists() else {}
+        if profile == "rebench" and not previous_result.get("complete"):
+            for path in checkpoints:
+                arm = json.loads(path.read_text())
+                if arm.get("phase") != "complete" or not arm.get("cleanup", {}).get("verified"):
+                    arm = audit_recover_arm(client, case["task"], arm)
+                    audit_write_json(path, arm)
+        arms = [json.loads(p.read_text()) for p in checkpoints]
+        if profile == "validation" or previous_result.get("complete"):
+            arms += list(previous_result.get("arms", {}).values())
+        for arm in arms:
+            if arm.get("phase") != "complete" or not arm.get("cleanup", {}).get("verified"):
+                quarantined.update([arm["endpoint"]] if arm.get("endpoint") in urls else urls)
+        if profile == "validation" and any(issue.startswith("interrupted_attempt_requires_cleanup_review:") for issue in previous_result.get("data_issues", [])):
+            quarantined.update(urls)
+        if not previous_result.get("complete"):
+            pending.append(case)
+    pending.sort(key=lambda case: len(case["candidates"]))
+    progress = AuditProgress(output, cases, signature, source_match) if profile == "rebench" else None
+
+    def process(case, url):
+        if progress:
+            progress.start()
+        inventory = case["inventory"]
+        case_dir = output / "cases" / inventory["id"]
+        case_dir.mkdir(parents=True, exist_ok=True)
+        result_path = case_dir / "result.json"
+        result = {"id": inventory["id"], "task_id": inventory.get("task_id"), "signature": signature, "arms": {},
+                  "cached_image_id": cached[url].get(inventory.get("docker_image"))}
+        if inventory["issues"]:
+            result["data_issues"] = inventory["issues"]
+        elif case["image_unavailable"]:
+            result["image_unavailable"] = True
+        elif url in quarantined and not any(
+            (a.get("phase") != "complete" or not a.get("cleanup", {}).get("verified"))
+            for a in [json.loads(p.read_text()) for p in case_dir.glob("*/*.json")]
+        ):
+            result["endpoint_quarantined"] = True
+        else:
+            try:
+                if image_policy == "archive-or-pull":
+                    image = inventory["docker_image"]
+                    with preparation_slots[url]:
+                        key = (url, canonical_image_reference(image))
+                        prepared = preparation_results.get(key)
+                        if prepared is None or not prepared.get("ok"):
+                            prepared = client.post(url, "/audit_prepare_image",
+                                {"image": image, "timeout_seconds": image_prepare_seconds},
+                                time.monotonic() + image_prepare_seconds + 10)
+                            preparation_results[key] = prepared
+                        result["image_preparation"] = prepared
+                        audit_write_json(case_dir / "image_preparation.json", prepared)
+                    if prepared.get("ok") is not True or not prepared.get("id"):
+                        result["image_preparation_failed"] = True
+                        result["status"] = "review:image:" + prepared.get("failure_kind", "image_preparation_unknown")
+                        result["complete"] = True
+                        audit_write_json(result_path, result)
+                        if progress:
+                            progress.finish(result)
+                        return
+                    result["cached_image_id"] = prepared["id"]
+                task = audit_rebench_task(case["task"], seconds) if profile == "rebench" else audit_task(case["task"], seconds)
+                for mode in ("baseline", "gold"):
+                    # Persist each attempt independently, including interrupted attempts.
+                    attempts = case_dir / mode
+                    attempts.mkdir(exist_ok=True)
+                    previous = sorted(attempts.glob("*.json"), key=lambda p: int(p.stem))
+                    latest = json.loads(previous[-1].read_text()) if previous else None
+                    if latest and latest.get("phase") == "complete" and not latest.get("recovered_interruption"):
+                        result["arms"][mode] = latest
+                        if profile == "rebench" and latest.get("cleanup", {}).get("verified") and "reference_evidence" not in latest:
+                            audit_rebench_verify(latest, case, evaluator_roots, case_dir / mode, parser_policy=parser_policy)
+                            audit_write_json(previous[-1], latest)
+                        if not latest.get("cleanup", {}).get("verified"):
+                            with scheduling_lock:
+                                quarantined.add(latest.get("endpoint", url))
+                            break
+                        continue
+                    if previous and not (profile == "rebench" and latest.get("recovered_interruption") and latest.get("cleanup", {}).get("verified")):
+                        result["data_issues"] = ["interrupted_attempt_requires_cleanup_review:" + mode]
+                        with scheduling_lock:
+                            quarantined.add(url)
+                        break
+                    with scheduling_lock:
+                        blocked = url in quarantined
+                    if blocked:
+                        result["endpoint_quarantined"] = True
+                        break
+                    for retry in range(transport_retries + 1):
+                        with scheduling_lock:
+                            blocked = url in quarantined
+                        if blocked:
+                            result["endpoint_quarantined"] = True
+                            break
+                        attempt_path = attempts / (str((int(previous[-1].stem) + 1 if previous else 0) + retry) + ".json")
+                        def save(arm):
+                            audit_write_json(attempt_path, arm)
+                        arm = audit_arm(client, url, task, case["gold"], mode, seconds, save)
+                        if profile == "rebench":
+                            audit_rebench_verify(arm, case, evaluator_roots, attempts, parser_policy=parser_policy)
+                            save(arm)
+                        result["arms"][mode] = arm
+                        # Fresh-session retry only for positively identified transport errors,
+                        # after verified cleanup. Never replay an uncertain command.
+                        if not (retry < transport_retries and arm["classification"] == "transport_failure" and arm["cleanup"]["verified"]):
+                            break
+                    if mode in result["arms"] and not result["arms"][mode].get("cleanup", {}).get("verified"):
+                        with scheduling_lock:
+                            quarantined.add(url)
+                        break
+            except Exception as exc:
+                result["data_issues"] = ["audit_configuration_error:" + f"{type(exc).__name__}: {exc}"[:1000]]
+        result["status"] = audit_result_status(result)
+        result["complete"] = True
+        if profile == "rebench":
+            if result.get("endpoint_quarantined") or any(not a.get("cleanup", {}).get("verified") for a in result["arms"].values()) or any(
+                    issue.startswith("interrupted_attempt_requires_cleanup_review:") for issue in result.get("data_issues", [])):
+                result["complete"] = False
+            result["status"] = audit_rebench_status(result)
+            result["native_reference_candidate"] = native_reference_candidate(result)
+        audit_write_json(result_path, result)
+        if progress:
+            progress.finish(result)
+        print(json.dumps({"audit_task": result["task_id"], "status": result["status"], "endpoint": url}), flush=True)
+
+    def worker(url):
+        while True:
+            with scheduling_lock:
+                if url in quarantined:
+                    return
+                index = next((i for i, case in enumerate(pending) if url in case["candidates"]), None)
+                if index is None:
+                    return
+                case = pending.pop(index)
+            process(case, url)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(urls) * workers_per_endpoint) as pool:
+            futures = [pool.submit(worker, url) for _ in range(workers_per_endpoint) for url in urls]
+            for future in futures:
+                future.result()
+    except BaseException:
+        if progress:
+            progress.close()
+        raise
+    # Only cases blocked by endpoint quarantine can remain unclaimed.
+    for case in pending:
+        process(case, case["candidates"][0])
+    if progress:
+        progress.close()
+    results = [json.loads((output / "cases" / c["inventory"]["id"] / "result.json").read_text()) for c in cases]
+    source_match = all(s["deployment"].get("source_fingerprint", {}).get("sha256") == local["sha256"] for s in services)
+    report = {"version": AUDIT_VERSION, "signature": signature, "manifest": str(manifest_path), "results": results,
+              "source_match": source_match, "counts": dict(collections.Counter(r["status"] for r in results)),
+              "workers_per_endpoint": workers_per_endpoint, "quarantined_endpoints": sorted(quarantined),
+              "regression_pass": bool(results) and source_match and not quarantined and all(r["status"] == "reference_verified" for r in results)}
+    if profile == "rebench":
+        for result in results:
+            result.setdefault("native_reference_candidate", native_reference_candidate(result))
+        report.update(profile=profile, pilot=selection, complete=all(r.get("complete") for r in results),
+                      results_jsonl=str(output / "results.jsonl"),
+                      native_parser_summary=native_reference_candidate_summary(results))
+    audit_write_json(output / "report.json", report)
+    if profile == "rebench":
+        (output / "reference_verified_task_ids.txt").write_text("".join(
+            result["task_id"] + "\n" for result in results
+            if result.get("complete") and result["status"] == "reference_verified"))
+    return report
+
+
+def audit_export(report_path: Path, output: Path) -> dict:
+    """Explicit opt-in export; ambiguous and failed cases remain quarantined."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    report = json.loads(report_path.read_text())
+    if report.get("profile") == "rebench":
+        raise ValueError("training audits require --results and --dataset; pilot exports also require --pilot-only")
+    manifest = json.loads(Path(report["manifest"]).read_text())
+    if report["signature"] != manifest["signature"] or not report.get("source_match") or report.get("quarantined_endpoints"):
+        raise ValueError("export requires matching manifest and deployed sources")
+    if output.exists():
+        raise ValueError("refusing to overwrite dataset")
+    records = {r["id"]: r for r in report["results"]}
+    selected, schemas, quarantined = [], [], []
+    inventory = manifest["identity"]["manifest"]
+    for dataset in inventory["datasets"]:
+        path = Path(dataset["path"])
+        if hashlib.sha256(path.read_bytes()).hexdigest() != dataset["sha256"]:
+            raise ValueError("source dataset checksum changed")
+        table = pq.read_table(path)
+        schemas.append(table.schema)
+        for item in inventory["cases"]:
+            if item["dataset"] != dataset["path"]:
+                continue
+            result = records.get(item["id"], {})
+            if result.get("status") == "reference_verified":
+                selected.append(table.slice(item["row"], 1))
+            else:
+                quarantined.append({"id": item["id"], "task_id": item.get("task_id"), "reason": result.get("status", "not_audited")})
+    if not selected:
+        raise ValueError("no reference-verified cases to export")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.concat_tables(selected), output)
+    receipt = {"source_report": str(report_path), "signature": report["signature"], "rows": len(selected),
+               "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "quarantined": quarantined}
+    write_json(output.with_suffix(output.suffix + ".audit.json"), receipt)
+    return receipt
+
+
+def audit_export_results(dataset: Path, results_path: Path, output: Path, *, pilot_only: bool = False,
+                         reviewed_baseline_source_failures: list[str] | None = None,
+                         require_repeat: bool = False) -> dict:
+    """Filter the untouched source using only the portable per-row result ledger."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    receipt_path = output.with_suffix(output.suffix + ".audit.json")
+    if output.exists() or receipt_path.exists() or output.resolve() == dataset.resolve():
+        raise ValueError("refusing to overwrite dataset or receipt")
+    source_sha = file_sha256(dataset)
+    results_sha = file_sha256(results_path)
+    parquet = pq.ParquetFile(dataset)
+    source_rows = parquet.metadata.num_rows
+    reviewed = set(reviewed_baseline_source_failures or [])
+    records, signatures = {}, set()
+    for line in results_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        row = record.get("row")
+        if record.get("version") != "swe-reference-results-v1" or record.get("dataset_sha256") != source_sha:
+            raise ValueError("result ledger belongs to another dataset or version")
+        if type(row) is not int or not 0 <= row < source_rows or record.get("id") != digest([source_sha, row]):
+            raise ValueError("result row identity mismatch")
+        if row in records and records[row].get("complete"):
+            raise ValueError("duplicate completed result row")
+        if record.get("source_match") is not True or not record.get("signature"):
+            raise ValueError("results require verified deployed sources and an audit signature")
+        records[row] = record
+        signatures.add(record["signature"])
+    if not records or len(signatures) != 1:
+        raise ValueError("result ledger must contain one nonempty audit")
+    if any(record.get("complete") is not True for record in records.values()):
+        raise ValueError("audit contains incomplete or blocked cases")
+    if not pilot_only and len(records) != source_rows:
+        raise ValueError("full export requires every dataset row; use --pilot-only for an explicit pilot export")
+    if reviewed - {record.get("task_id") for record in records.values()}:
+        raise ValueError("reviewed baseline task IDs must appear in the audit ledger")
+    # Read only task identity metadata during validation, never the full 22 GiB table.
+    task_ids = []
+    for batch in parquet.iter_batches(batch_size=128, columns=["extra_info"]):
+        for item in batch.to_pylist():
+            task = json.loads(item["extra_info"]["tools_kwargs"]["__swe_task_json__"])
+            task_ids.append(task.get("task_id"))
+    selected, excluded = [], []
+    for row, record in sorted(records.items()):
+        if record.get("task_id") != task_ids[row]:
+            raise ValueError("result task identity mismatch")
+        reviewed_source = record.get("task_id") in reviewed
+        if reviewed_source and record["status"] != "review:gold_verified_baseline_source_failure":
+            raise ValueError("reviewed task is not a gold-verified baseline source failure")
+        if record["status"] == "reference_verified" or reviewed_source:
+            if require_repeat:
+                from scripts.swe_reference_reliability import validate_repeat_qualification
+                if reviewed_source:
+                    raise ValueError("repeat-qualified export cannot include baseline source-failure reviews")
+                validate_repeat_qualification(record)
+            arms = record.get("arms", {})
+            baseline, gold = arms.get("baseline", {}), arms.get("gold", {})
+            before, after = baseline.get("reference_evidence", {}), gold.get("reference_evidence", {})
+            if any(e.get("parser_policy") == "native-guarded" and
+                   e.get("service_consistency", {}).get("matched") is not True for e in (before, after)):
+                raise ValueError("native-guarded export requires matching audit and service scoring")
+            baseline_valid = (
+                before.get("baseline_source_failure_candidate") and not before.get("complete")
+                if reviewed_source else before.get("complete") and before.get("fail_to_pass_failed", 0) > 0
+                and before.get("pass_to_pass_complete")
+            )
+            if (set(arms) != {"baseline", "gold"} or not all(a.get("cleanup_verified") is True for a in arms.values())
+                    or not baseline_valid or not after.get("complete") or gold.get("score") != 1
+                    or baseline.get("score") != 0 or not after.get("all_required_passed")):
+                raise ValueError("reference_verified row lacks consistent verification evidence")
+            selected.append(row)
+        else:
+            excluded.append({"row": row, "task_id": record.get("task_id"), "reason": record["status"]})
+    if not selected:
+        raise ValueError("no reference-verified cases to export")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=output.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        selected_set = set(selected)
+        row_offset = 0
+        with pq.ParquetWriter(temporary, parquet.schema_arrow) as writer:
+            for batch in parquet.iter_batches(batch_size=64):
+                keep = [i for i in range(batch.num_rows) if row_offset + i in selected_set]
+                row_offset += batch.num_rows
+                if keep:
+                    writer.write_table(pa.Table.from_batches([batch]).take(pa.array(keep, type=pa.int64())))
+        exported = pq.ParquetFile(temporary)
+        if exported.metadata.num_rows != len(selected) or not exported.schema_arrow.equals(parquet.schema_arrow, check_metadata=True):
+            raise ValueError("dataset roundtrip changed retained schema or row count")
+        if file_sha256(dataset) != source_sha or file_sha256(results_path) != results_sha:
+            raise ValueError("source dataset or result ledger changed during export")
+        os.link(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    receipt = {"version": "swe-training-audit-filter-v1", "source": str(dataset.resolve()), "source_sha256": source_sha,
+               "source_rows": source_rows, "source_results": str(results_path.resolve()), "results_sha256": results_sha,
+               "signature": next(iter(signatures)), "rows": len(selected), "retained_row_indices": selected,
+               "pilot_only": pilot_only, "not_audited_rows": source_rows - len(records), "quarantined": excluded,
+               "retained_rows_unchanged": True, "output_sha256": file_sha256(output), "repeat_required": require_repeat}
+    receipt["reviewed_baseline_source_failures"] = sorted(reviewed)
+    audit_write_json(receipt_path, receipt)
+    return receipt
+
+
+def retained_audit_phases(arm: dict, output_dir: Path) -> tuple[dict, str]:
+    import gzip
+    from scripts.diagnose_trajectories import collect_private_evaluator
+    private = arm.get("private_evaluator", {})
+    if private.get("status") != "verified":
+        raise ValueError("missing_contract_or_private_evidence")
+    path = Path(private["private_copy"]).resolve()
+    checked = collect_private_evaluator({"task_id": arm["task_id"], "reward_evidence": {
+        "private_evaluator_artifact_path": str(path), "private_evaluator_artifact_sha256": private["sha256"],
+        "private_evaluator_service_id": private.get("service_id")}},
+        [str(path.parent) + "=" + str(path.parent)], output_dir)
+    if checked.get("status") != "verified" or checked.get("logs_complete") is not True:
+        raise ValueError("unverified_or_incomplete_private_logs")
+    if arm.get("runner_provenance") != "launch_marker_v1":
+        raise ValueError("runner_launch_unverified")
+    path = Path(checked["private_copy"])
+    phases = json.loads(path.read_text())["phases"]
+    return {name: (gzip.decompress((path.parent / phase["full_log"]["file"]).read_bytes()).decode("utf-8")
+                   if phase.get("full_log") else phase.get("output", ""))
+            for name, phase in phases.items()}, private["sha256"]
+
+
+def replay_runner_evidence(task: dict, phases: dict) -> tuple[list[dict], str]:
+    from recipe.swe_agent.test_results import official_test_outcomes
+    specs = task.get("evaluator_test_commands", [])
+    if specs and all(f"runner_evidence_{i}" in phases for i in range(len(specs))):
+        evidence = []
+        for i, spec in enumerate(specs):
+            retained = json.loads(phases[f"runner_evidence_{i}"])
+            if retained["command"] != spec["run"] or retained["evidence"].get("reason") == "runner_launch_unverified":
+                raise ValueError("runner_launch_unverified")
+            if retained.get("junit_requested"):
+                if f"junit_xml_{i}" not in phases:
+                    raise ValueError("missing_raw_junit")
+                evidence.append(official_test_outcomes(spec["run"], "", exit_code=retained["exit_code"],
+                                                       junit_xml=phases[f"junit_xml_{i}"]))
+            else:
+                evidence.append(retained["evidence"])
+        return evidence, "raw_junit_or_runner_evidence"
+    full_output = phases.get("test_commands", "")
+    markers = re.findall(r"^SWE_RUNNER_LAUNCHED_[a-f0-9]+$", full_output, re.M)
+    if len(specs) == 1 and len(markers) == 1:
+        from recipe.swe_agent.test_results import runner_output_after_marker
+        output = runner_output_after_marker(full_output, markers[0])
+        exits = re.findall(r"^exit_code: (-?\d+)$", full_output, re.M)
+        evidence = official_test_outcomes(specs[0]["run"], output, exit_code=int(exits[0]) if len(exits) == 1 else -1)
+        if evidence["reason"] != "unsupported_runner":
+            return [evidence], "native_parser_replay"
+    else:
+        raise ValueError("runner_launch_unverified")
+    if "official_tests" in phases:
+        evidence = json.loads(phases["official_tests"])["evidence"]
+        if len(evidence) != len(specs):
+            raise ValueError("incomplete_runner_evidence")
+        return evidence, "retained_structured_score_replay"
+    return [evidence], "native_parser_replay"
+
+
+def dataset_version(dataset: Path, output: Path, exclusions: list[str], diagnosis_path: Path | None = None,
+                    *, rebench_contract: bool = False) -> dict:
+    """Explicit immutable filtering, optionally pinning audit-proven test identities."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from recipe.swe_agent.test_results import pin_official_identity_aliases, score_official_tests
+    if output.exists() or output.with_suffix(output.suffix + ".audit.json").exists() or output.resolve() == dataset.resolve():
+        raise ValueError("refusing to overwrite dataset or receipt")
+    if len(exclusions) != len(set(exclusions)):
+        raise ValueError("duplicate exclusions")
+    original_sha = hashlib.sha256(dataset.read_bytes()).hexdigest()
+    table = pq.read_table(dataset)
+    if rebench_contract and diagnosis_path:
+        raise ValueError("rebench contract upgrade cannot combine with Verified identity pinning")
+    _, cases = audit_inventory([dataset], profile="rebench" if rebench_contract else "validation")
+    case_by_row = {case["inventory"]["row"]: case for case in cases}
+    ids = [case_by_row[i]["inventory"]["task_id"] for i in range(table.num_rows)]
+    if len(set(ids)) != len(ids) or not set(exclusions).issubset(ids):
+        raise ValueError("task identities must be unique and all exclusions present")
+    keep = [i for i, identity in enumerate(ids) if identity not in exclusions]
+    filtered = table.take(pa.array(keep, type=pa.int64()))
+    upgrades = {}
+    def update_tasks(node, contract):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in {"__swe_task_json__", "task_json"} and isinstance(value, str):
+                    embedded = json.loads(value)
+                    embedded["official_test_contract"] = contract
+                    node[key] = json.dumps(embedded, ensure_ascii=True)
+                elif isinstance(value, dict):
+                    update_tasks(value, contract)
+    if rebench_contract:
+        rows = filtered.to_pylist()
+        for row, index in zip(rows, keep):
+            case = case_by_row[index]
+            if case["inventory"]["issues"]:
+                raise ValueError("cannot version invalid rebench row: " + ids[index])
+            truth = row["reward_model"]["ground_truth"]
+            truth = json.loads(truth) if isinstance(truth, str) else dict(truth)
+            contract = case["reference_contract"]
+            from recipe.swe_agent.test_results import REBENCH_CONTRACT_FIELDS, rebench_contract_fields
+            contract.update(rebench_contract_fields(contract["log_parser"], contract["fail_to_pass"], contract["pass_to_pass"]))
+            truth.update({k: contract[k] for k in REBENCH_CONTRACT_FIELDS})
+            original_truth = row["reward_model"]["ground_truth"]
+            row["reward_model"]["ground_truth"] = json.dumps(truth) if isinstance(original_truth, str) else truth
+            update_tasks(row["extra_info"]["tools_kwargs"], contract)
+            upgrades[ids[index]] = {"rebench_scoring_version": 1, "label_issues": case["inventory"]["label_issues"]}
+        filtered = pa.Table.from_pylist(rows, schema=table.schema)
+    if diagnosis_path is not None:
+        arms = {}
+        diagnosis = json.loads(diagnosis_path.read_text())
+        for audit in diagnosis.get("reference_audits", []):
+            audit_path = Path(audit["path"])
+            if hashlib.sha256(audit_path.read_bytes()).hexdigest() != audit["sha256"]:
+                raise ValueError("diagnosed audit checksum changed")
+            source_report = json.loads(audit_path.read_text())
+            manifest = json.loads(Path(source_report["manifest"]).read_text())
+            if (not source_report.get("source_match") or source_report.get("quarantined_endpoints")
+                    or source_report["signature"] != manifest["signature"]
+                    or original_sha not in {d["sha256"] for d in manifest["identity"]["manifest"]["datasets"]}):
+                raise ValueError("identity pinning requires an audit of this exact source dataset")
+            source_arms = {(r["task_id"], mode): value for r in source_report["results"]
+                           for mode, value in r.get("arms", {}).items()}
+            for arm in audit["arms"]:
+                key = (arm["task_id"], arm["mode"])
+                if key in arms:
+                    raise ValueError("duplicate diagnosis arms; provide one reviewed audit")
+                metadata = source_arms.get(key, {}).get("reward", {}).get("metadata", {})
+                if arm.get("private_evaluator", {}).get("status") == "verified" and (
+                        metadata.get("private_evaluator_artifact_sha256") != arm["private_evaluator"]["sha256"]
+                        or metadata.get("hidden_runner_provenance") != "launch_marker_v1"):
+                    raise ValueError("diagnosis evidence disagrees with source audit")
+                arms[key] = arm
+        rows = filtered.to_pylist()
+        for row, index in zip(rows, keep):
+            case = case_by_row[index]
+            task = audit_task(case["task"], 900)
+            contract = task.get("official_test_contract")
+            identity = ids[index]
+            if not contract or not all((identity, mode) in arms for mode in ("baseline", "gold")):
+                continue
+            try:
+                retained = [retained_audit_phases(arms[(identity, mode)], output.parent) for mode in ("baseline", "gold")]
+                evidence = [replay_runner_evidence(task, phases)[0] for phases, _ in retained]
+            except ValueError:
+                continue
+            aliases = pin_official_identity_aliases(contract, *evidence)
+            if not aliases:
+                continue
+            upgraded = {**contract, "identity_alias_version": 1, "identity_aliases": aliases}
+            baseline, gold = [score_official_tests(upgraded, e, len(task["evaluator_test_commands"])) for e in evidence]
+            if (not baseline["official_tests_complete"] or not baseline["official_fail_to_pass_failed"]
+                    or not baseline["official_pass_to_pass_complete"] or not gold["official_tests_success"]):
+                continue
+            truth = json.loads(row["reward_model"]["ground_truth"])
+            truth.update(identity_alias_version=1, identity_aliases=aliases)
+            row["reward_model"]["ground_truth"] = json.dumps(truth, ensure_ascii=True)
+            update_tasks(row["extra_info"]["tools_kwargs"], upgraded)
+            upgrades[identity] = {"groups": len(aliases), "members": sum(map(len, aliases.values())),
+                                  "baseline_sha256": retained[0][1], "gold_sha256": retained[1][1]}
+        filtered = pa.Table.from_pylist(rows, schema=table.schema)
+    if hashlib.sha256(dataset.read_bytes()).hexdigest() != original_sha:
+        raise ValueError("source dataset changed during versioning")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=output.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        pq.write_table(filtered, temporary)
+        if not pq.read_table(temporary).equals(filtered, check_metadata=True):
+            raise ValueError("dataset roundtrip changed retained data")
+        os.link(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    receipt = {"version": "swe-dataset-version-v1", "source": str(dataset.resolve()), "source_sha256": original_sha,
+               "source_rows": table.num_rows, "rows": filtered.num_rows, "excluded_task_ids": sorted(exclusions),
+               "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "identity_upgrades": upgrades,
+               "diagnosis_sha256": hashlib.sha256(diagnosis_path.read_bytes()).hexdigest() if diagnosis_path else None,
+               "retained_rows_unchanged": not upgrades}
+    write_json(output.with_suffix(output.suffix + ".audit.json"), receipt)
+    return receipt
+
+
+def reference_replay(datasets: list[Path], diagnosis_path: Path, report_path: Path) -> dict:
+    """Replay retained evidence without executing tasks or certifying a service."""
+    from recipe.swe_agent.test_results import score_official_tests
+    diagnosis = json.loads(diagnosis_path.read_text())
+    if diagnosis.get("profile") == "rebench" and "results" in diagnosis:
+        _, cases = audit_inventory(datasets, profile="rebench")
+        by_id = {case["inventory"]["id"]: case for case in cases}
+        records, repairs = [], []
+        for original in diagnosis["results"]:
+            case = by_id.get(original["id"])
+            if case is None:
+                raise ValueError("replay report is not from the exact input dataset")
+            result = json.loads(json.dumps(original))
+            for mode, arm in result.get("arms", {}).items():
+                private = arm.get("private_evaluator", {})
+                private_path = private.get("private_copy")
+                if private_path:
+                    root = str(Path(private_path).resolve().parent)
+                    metadata = arm["reward"]["metadata"]
+                    if metadata.get("private_evaluator_artifact_sha256") != private.get("sha256"):
+                        raise ValueError("retained evaluator disagrees with reward evidence")
+                    metadata["private_evaluator_artifact_path"] = str(Path(private_path).resolve())
+                    audit_rebench_verify(arm, case, [root + "=" + root],
+                        report_path.parent / "replay_private" / original["id"] / mode)
+                records.append({"task_id": original["task_id"], "mode": mode,
+                    "reason": arm.get("reference_evidence", {}).get("reason", arm.get("classification")),
+                    "evidence": arm.get("reference_evidence", {}), "previous_status": original["status"]})
+            status = audit_rebench_status(result)
+            for record in records:
+                if record["task_id"] == original["task_id"]:
+                    record["replayed_status"] = status
+            if case["inventory"].get("label_issues"):
+                repairs.append({"task_id": original["task_id"], "action": "quarantine_pending_review",
+                                "issues": case["inventory"]["label_issues"]})
+        report = {"version": "swe-reference-replay-v1", "profile": "rebench", "cases": records,
+                  "audit_sha256": hashlib.sha256(diagnosis_path.read_bytes()).hexdigest(),
+                  "reasons": dict(collections.Counter(r["reason"] for r in records)),
+                  "official_coverage": dict(collections.Counter(str(r["evidence"].get("complete")) for r in records)),
+                  "label_review_manifest": {"version": 1, "source_sha256": hashlib.sha256(diagnosis_path.read_bytes()).hexdigest(),
+                                            "cases": repairs},
+                  "limitation": "Offline replay cannot restore masked runner exits or certify service deployment; restart and rerun required."}
+        write_json(report_path, report)
+        return report
+    _, cases = audit_inventory(datasets)
+    tasks = {case["inventory"].get("task_id"): audit_task(case["task"], 900)
+             for case in cases if case["inventory"]["eligible"]}
+    diagnosis = json.loads(diagnosis_path.read_text())
+    records = []
+    for audit in diagnosis.get("reference_audits", []):
+        for arm in audit["arms"]:
+            if arm["task_id"] not in tasks:
+                continue
+            task = tasks.get(arm["task_id"], {})
+            record = {"task_id": arm["task_id"], "mode": arm["mode"], "reason": "missing_contract_or_private_evidence"}
+            records.append(record)
+            if not task.get("official_test_contract"):
+                continue
+            try:
+                phases, private_sha = retained_audit_phases(arm, report_path.parent)
+                evidence, replay_kind = replay_runner_evidence(task, phases)
+            except ValueError as exc:
+                record["reason"] = str(exc)
+                continue
+            score = score_official_tests(task["official_test_contract"], evidence, len(task["evaluator_test_commands"]))
+            score.pop("_private_official_results")
+            parser_reason = next((e.get("reason") for e in evidence if not e.get("complete")), None)
+            record.update(score, reason=parser_reason or score["official_tests_reason"], replay_kind=replay_kind, private_sha256=private_sha)
+    result = {"version": "swe-reference-replay-v1", "cases": records,
+              "reasons": dict(collections.Counter(r["reason"] for r in records)),
+              "official_coverage": dict(collections.Counter(str(r.get("official_tests_complete")) for r in records)),
+              "limitation": "Structured score replay does not reparse unavailable old XML. Restart and rerun are required to certify deployed scoring."}
+    write_json(report_path, result)
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    version_parser = sub.add_parser("dataset-version", help="exclude explicit task IDs in a new immutable dataset; optionally pin verified audit identities")
+    version_parser.add_argument("--dataset", type=Path, required=True)
+    version_parser.add_argument("--output", type=Path, required=True)
+    version_parser.add_argument("--exclude-task-id", action="append", default=[])
+    version_parser.add_argument("--diagnosis-report", type=Path)
+    version_parser.add_argument("--rebench-contract", action="store_true",
+                                help="opt in to versioned exact-identity ReBench reward scoring in a new dataset")
+    inventory_parser = sub.add_parser("audit-inventory", help="inventory reference/evaluator artifacts without service calls")
+    inventory_parser.add_argument("--dataset", action="append", type=Path, required=True)
+    inventory_parser.add_argument("--path-map", action="append", default=[])
+    inventory_parser.add_argument("--report", type=Path, required=True)
+    audit_parser = sub.add_parser("reference-audit", help="parallel fresh baseline/gold sessions with image-aware work sharing")
+    audit_parser.add_argument("--dataset", action="append", type=Path, required=True)
+    audit_parser.add_argument("--path-map", action="append", default=[])
+    audit_parser.add_argument("--task-id", action="append")
+    audit_parser.add_argument("--task-ids-file", type=Path,
+                              help="newline-delimited candidate task IDs; empty files are rejected")
+    audit_parser.add_argument("--limit", type=int, default=0)
+    audit_parser.add_argument("--profile", choices=("validation", "rebench"), default="validation")
+    audit_parser.add_argument("--pilot-size", type=int, default=0, help="deterministic small, diverse training pilot; 0 audits all rows")
+    audit_parser.add_argument("--seed", type=int, default=0)
+    audit_parser.add_argument("--evaluator-root", action="append", default=[], help="trusted private diagnostic SERVICE_ROOT=LOCAL_ROOT; required for rebench")
+    audit_parser.add_argument("--scenario-deadline", type=float, default=900)
+    audit_parser.add_argument("--image-policy", choices=("cache-only", "archive-or-pull"), default="cache-only")
+    audit_parser.add_argument("--image-prepare-deadline", type=float, default=1800)
+    audit_parser.add_argument("--image-prepare-parallelism", type=int, default=1,
+                              help="image preparations per endpoint, independently of case workers; service limit also applies")
+    audit_parser.add_argument("--urls", default=os.environ.get("SWE_AGENT_EXECUTION_URLS", ""))
+    audit_parser.add_argument("--output-dir", type=Path, required=True)
+    audit_parser.add_argument("--resume", action="store_true")
+    audit_parser.add_argument("--filter-exit-status", action="store_true",
+                              help="exit zero for a complete source-matched ReBench audit even with excluded rows")
+    audit_parser.add_argument("--workers-per-endpoint", type=int, default=None,
+                              help="concurrent cases per service; SWE_AGENT_REFERENCE_AUDIT_WORKERS_PER_ENDPOINT (default 2)")
+    audit_parser.add_argument("--rebench-parser-policy", choices=("strict", "native-first-shadow", "native-guarded"), default="strict",
+                              help="native-guarded shares versioned native adjudication with RL; other modes retain strict certification")
+    export_parser = sub.add_parser("audit-export", help="explicitly export only reference-verified cases to a new parquet")
+    export_source = export_parser.add_mutually_exclusive_group(required=True)
+    export_source.add_argument("--report", type=Path)
+    export_source.add_argument("--results", type=Path, help="portable training results.jsonl")
+    export_parser.add_argument("--dataset", type=Path)
+    export_parser.add_argument("--pilot-only", action="store_true")
+    export_parser.add_argument("--reviewed-baseline-source-failure", action="append", default=[], metavar="TASK_ID",
+                               help="Include a reviewed gold-verified baseline build/import failure; never fabricate failed test identities")
+    export_parser.add_argument("--require-repeat", action="store_true",
+                               help="require evidence from two independent guarded reference audits")
+    export_parser.add_argument("--output", type=Path, required=True)
+    repeat_parser = sub.add_parser("audit-qualify-repeats", help="qualify two clean guarded runs with optional transient retries")
+    repeat_parser.add_argument("--first-results", type=Path, required=True)
+    repeat_parser.add_argument("--repeat-results", type=Path, action="append", required=True)
+    repeat_parser.add_argument("--output-dir", type=Path, required=True)
+    replay_parser = sub.add_parser("reference-replay", help="offline replay of verified private evidence from the existing diagnosis pipeline")
+    replay_parser.add_argument("--dataset", action="append", type=Path, required=True)
+    replay_parser.add_argument("--diagnosis-report", type=Path, required=True)
+    replay_parser.add_argument("--report", type=Path, required=True)
     build_parser = sub.add_parser("build")
     build_parser.add_argument("--output-dir", type=Path, required=True)
     build_parser.add_argument("--trajectory-input", type=Path, help="reviewed v6 step-0 input; freeze full runner-response regression cases")
     build_parser.add_argument("--latest-trajectory-input", type=Path, help="reviewed v7 step-0 input; freeze exact command/response parser regressions")
     build_parser.add_argument("--sanity-trajectory-input", type=Path, help="reviewed 12-task v8 input; freeze public runner regressions")
+    build_parser.add_argument("--reference-dataset", action="append", type=Path)
+    build_parser.add_argument("--reference-audit-report", type=Path)
+    build_parser.add_argument("--reference-replay-report", type=Path, help="reviewed offline replay of the source audit")
     offline_parser = sub.add_parser("offline")
     offline_parser.add_argument("--benchmark-dir", type=Path, required=True)
     offline_parser.add_argument("--report", type=Path, required=True)
@@ -861,8 +2460,41 @@ def main() -> int:
     preflight_parser.add_argument("--report", type=Path, required=True)
     preflight_parser.add_argument("--urls", default=os.environ.get("SWE_AGENT_EXECUTION_URLS", ""))
     args = parser.parse_args()
+    if args.command == "dataset-version":
+        receipt = dataset_version(args.dataset, args.output, args.exclude_task_id, args.diagnosis_report,
+                                  rebench_contract=args.rebench_contract)
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "audit-inventory":
+        report, _ = audit_inventory(args.dataset, args.path_map)
+        write_json(args.report, report)
+        print(json.dumps({**report["counts"], "repos": len(report["counts"]["repos"])}, sort_keys=True))
+        return 0
+    if args.command == "audit-export":
+        if args.results:
+            if not args.dataset:
+                parser.error("--results requires --dataset")
+            report = audit_export_results(args.dataset, args.results, args.output, pilot_only=args.pilot_only,
+                                          reviewed_baseline_source_failures=args.reviewed_baseline_source_failure,
+                                          require_repeat=args.require_repeat)
+        else:
+            if args.dataset or args.pilot_only or args.reviewed_baseline_source_failure or args.require_repeat:
+                parser.error("--dataset, --pilot-only, and baseline reviews require --results")
+            report = audit_export(args.report, args.output)
+        print(json.dumps({"rows": report["rows"], "quarantined": len(report["quarantined"])}))
+        return 0
+    if args.command == "audit-qualify-repeats":
+        from scripts.swe_reference_reliability import qualify_repeats
+        print(json.dumps(qualify_repeats(args.first_results, args.repeat_results, args.output_dir), sort_keys=True))
+        return 0
+    if args.command == "reference-replay":
+        report = reference_replay(args.dataset, args.diagnosis_report, args.report)
+        print(json.dumps({"arms": len(report["cases"]), "reasons": report["reasons"], "official_coverage": report["official_coverage"]}, sort_keys=True))
+        return 0
     if args.command == "build":
-        print(json.dumps(build(args.output_dir, args.trajectory_input, args.latest_trajectory_input, args.sanity_trajectory_input), sort_keys=True))
+        print(json.dumps(build(args.output_dir, args.trajectory_input, args.latest_trajectory_input, args.sanity_trajectory_input,
+                         reference_datasets=args.reference_dataset, reference_audit_report=args.reference_audit_report,
+                         reference_replay_report=args.reference_replay_report), sort_keys=True))
         return 0
     if args.command == "offline":
         report = offline(args.benchmark_dir, args.report)
@@ -871,13 +2503,29 @@ def main() -> int:
     urls = [url.strip() for url in args.urls.split(",") if url.strip()]
     if not urls or getattr(args, "scenario_deadline", 1) <= 0:
         parser.error("positive scenario deadline and at least one URL required")
-    if args.command == "preflight":
+    if args.command == "reference-audit":
+        task_ids = args.task_id
+        if args.task_ids_file is not None:
+            file_ids = [line.strip() for line in args.task_ids_file.read_text().splitlines() if line.strip()]
+            if not file_ids:
+                parser.error("--task-ids-file must not be empty")
+            task_ids = list(dict.fromkeys([*(task_ids or []), *file_ids]))
+        report = reference_audit(args.dataset, urls, args.output_dir, mappings=args.path_map,
+                                 task_ids=task_ids, limit=args.limit, seconds=args.scenario_deadline, resume=args.resume,
+                                 workers_per_endpoint=args.workers_per_endpoint, profile=args.profile,
+                                 pilot_size=args.pilot_size, seed=args.seed, evaluator_roots=args.evaluator_root,
+                                 image_policy=args.image_policy, image_prepare_seconds=args.image_prepare_deadline,
+                                 image_prepare_parallelism=args.image_prepare_parallelism, parser_policy=args.rebench_parser_policy)
+    elif args.command == "preflight":
         report = preflight(urls, args.report)
     elif args.command == "diagnose":
         report = diagnose(urls, args.report, args.image, args.scenario_deadline)
     else:
         report = run(args.benchmark_dir, urls, args.report, args.image, args.scenario_deadline)
     print(json.dumps({"counts": report["counts"], "regression_pass": report["regression_pass"]}, sort_keys=True))
+    if args.command == "reference-audit" and args.filter_exit_status:
+        return 0 if (report.get("profile") == "rebench" and report.get("complete") is True
+                     and report.get("source_match") is True and not report.get("quarantined_endpoints")) else 1
     return 0 if report["regression_pass"] else 1
 
 

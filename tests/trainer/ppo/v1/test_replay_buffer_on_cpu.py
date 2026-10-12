@@ -108,6 +108,12 @@ def _make_rb(
     )
 
 
+def _configure_infrastructure_partition(rb: ReplayBuffer, partition_id: str, expected_count: int) -> None:
+    """Apply the train policy to a synthetic TransferQueue partition."""
+    rb.infrastructure_failure_ratio_thresholds[partition_id] = 0.25
+    rb.expected_rollout_counts[partition_id] = expected_count
+
+
 class FakeRefiller:
     """Produce fresh terminal prompts when the replay buffer requests replacements."""
 
@@ -531,6 +537,7 @@ def test_infrastructure_group_filter_uses_expected_sessions_and_strict_threshold
         expected_rollout_n=8,
         expected_validation_rollout_n=8,
     )
+    _configure_infrastructure_partition(rb, partition_id, 8)
     try:
         rb._sync_metadata_from_transfer_queue()
         discarded_uids, ratios = rb._infrastructure_filtered_uids(partition_id)
@@ -567,12 +574,37 @@ def test_infrastructure_group_filter_counts_only_final_output_per_session(
         )
     _set_prompt_status(partition_id, uid, "finished", global_steps=0)
     rb = _make_rb(refill_fn=lambda _n: None, expected_rollout_n=1, expected_validation_rollout_n=1)
+    _configure_infrastructure_partition(rb, partition_id, 1)
     try:
         rb._sync_metadata_from_transfer_queue()
         discarded_uids, ratios = rb._infrastructure_filtered_uids(partition_id)
 
         assert ratios[uid] == 0.0
         assert not discarded_uids
+    finally:
+        _clear_partition(partition_id)
+
+
+@pytest.mark.parametrize("threshold", [None, 0.25])
+def test_evaluator_group_exclusion_is_filtered_even_without_infrastructure_failure(
+    tq_init, partition_id: str, threshold
+) -> None:
+    uid = _uid()
+    tq.kv_put(
+        key=_trajectory_key(uid),
+        partition_id=partition_id,
+        fields={"input_ids": torch.tensor([1, 2, 3])},
+        tag={"is_prompt": False, "seq_len": 3, "global_steps": 0, "evaluator_group_excluded": True},
+    )
+    _set_prompt_status(partition_id, uid, "finished", global_steps=0)
+    rb = _make_rb(refill_fn=lambda _n: None, expected_rollout_n=1)
+    _configure_infrastructure_partition(rb, partition_id, 1)
+    rb.infrastructure_failure_ratio_thresholds[partition_id] = threshold
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        discarded_uids, ratios = rb._infrastructure_filtered_uids(partition_id)
+        assert discarded_uids == {uid}
+        assert ratios[uid] == (1.0 if threshold is None else 0.0)
     finally:
         _clear_partition(partition_id)
 
@@ -621,6 +653,8 @@ def test_infrastructure_groups_are_replaced_before_completion_cutoff(
         expected_rollout_n=4,
         expected_validation_rollout_n=4,
     )
+    _configure_infrastructure_partition(rb, partition_id, 4)
+    rb.completion_ratio_thresholds[partition_id] = 0.75
     try:
         batch, metrics = rb.sample(global_steps=0, partition_id=partition_id, batch_size=4)
 
@@ -673,6 +707,32 @@ def test_sync_metadata_classifies_keys(tq_init, partition_id):
             assert rb.partitions[partition_id][key] == {"is_prompt": False, "seq_len": 3, "global_steps": 0}
     finally:
         _clear_partition(partition_id)
+
+
+def test_infrastructure_discard_persists_aligned_evidence_before_deletion(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from verl.trainer.ppo.v1.replay_buffer import rollout_diagnostics
+    monkeypatch.setenv("SWE_AGENT_INFRA_DISCARD_AUDIT_DIR", str(tmp_path))
+    rb = _make_rb()
+    rb.partitions["train"] = {"drop_0_0": {"infrastructure_failure": 1}, "keep_0_0": {}}
+    monkeypatch.setattr(rb, "_infrastructure_filtered_uids", lambda pid: ({"drop"}, {"drop": 1.0}))
+    monkeypatch.setattr(tq, "kv_batch_get", lambda **kw: {"extra_fields": SimpleNamespace(tolist=lambda: [
+        {"reward_extra_info": {"evaluation_valid": False, "private_evaluator_artifact_path": "/private/evidence.json"},
+         "secret_token": "do not persist"}])})
+    def clear(pid, uids):
+        files = list((tmp_path / "infrastructure_discard").glob("*.json"))
+        assert len(files) == 1
+        evidence = json.loads(files[0].read_text())
+        assert evidence["diagnostic_coverage"] == "available"
+        assert evidence["trajectories"][0]["uid"] == "drop_0_0"
+        assert evidence["trajectories"][0]["evaluation_valid"] is False
+        assert evidence["trajectories"][0]["infrastructure_failure"] == 1
+        assert "secret_token" not in files[0].read_text()
+    monkeypatch.setattr(rb, "_clear_groups", clear)
+    _, metrics = rb._discard_infrastructure_groups("train")
+    assert metrics["training/infrastructure_group_filter/evidence_persisted"] == 1
+    assert rollout_diagnostics({"reward_extra_info": {"raw_score": 1}, "raw_score": 0})["raw_score"] == 0
 
 
 def test_sync_metadata_unknown_status_raises(tq_init, partition_id):

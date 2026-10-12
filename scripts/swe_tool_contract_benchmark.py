@@ -524,15 +524,15 @@ def _evaluate_tool_contracts() -> tuple[collections.Counter[str], list[dict[str,
         check("search_files_finds_name", True, "src/a.py" in search_utils.search_files(workspace, {"query": "a.py", "path": "src"}))
         check("search_text_finds_content", True, "needle = 1" in search_utils.search_text(workspace, {"pattern": "needle", "path": "src"}))
         missing = search_utils._StreamResult([], None, error="rg missing", backend_missing=True)
-        original_stream = search_utils._stream_command
-        def missing_rg(command, **kwargs):
-            return missing if command[0] == "rg" else original_stream(command, **kwargs)
-        with mock.patch.object(search_utils, "_stream_command", side_effect=missing_rg):
-            fallback = search_utils.search_text(workspace, {"pattern": "needle", "path": "src"})
-        check("search_missing_rg_has_fallback", True, "src/a.py:1:needle = 1" in fallback)
-        with mock.patch.object(search_utils, "_stream_command", side_effect=missing_rg):
-            fallback_files = search_utils.search_files(workspace, {"query": "a.py", "path": "src"})
-        check("file_search_missing_rg_has_fallback", True, "src/a.py" in fallback_files)
+        with mock.patch.object(search_utils, "_stream_command", return_value=missing):
+            unavailable = search_utils.search_text(workspace, {"pattern": "needle", "path": "src"})
+            unavailable_files = search_utils.search_files(workspace, {"query": "a.py", "path": "src"})
+            unavailable_glob = tools._glob_files(workspace, {"pattern": "*.py"})
+        check("search_missing_rg_is_unavailable", True, unavailable.startswith("Search unavailable:"))
+        check("file_search_missing_rg_is_unavailable", True, unavailable_files.startswith("Search unavailable:"))
+        check("glob_missing_rg_is_unavailable", True, unavailable_glob.startswith("Search unavailable:"))
+        check("read_integral_decimal", "needle = 1", tools._read_file(workspace, {"path": "src/a.py", "offset": 0.0, "limit": "1.0"}))
+        check("glob_brace_alternatives", "src/a.py", tools._glob_files(workspace, {"pattern": "**/*.{py,txt}"}))
     return counts, failures
 
 

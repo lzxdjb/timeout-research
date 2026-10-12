@@ -125,6 +125,12 @@ def test_v1_cutoff_mask_excludes_entire_uid_group_and_padding() -> None:
     ).tolist() == [True, True, True, False]
 
 
+def test_v1_evaluator_exclusion_masks_siblings_even_when_cutoff_is_admitted() -> None:
+    keys = ["uncertain_0_0", "uncertain_1_0", "valid_0_0"]
+    tags = [{"evaluator_group_excluded": True}, {}, {}]
+    assert _v1_train_sample_mask_from_tags(keys, tags, exclude_cutoff=False).tolist() == [False, False, True]
+
+
 def test_timeout_prediction_can_admit_completion_cutoff_rows():
     trainer = _StubTrainer.__new__(_StubTrainer)
     trainer.timeout_prediction_enabled = True
@@ -181,7 +187,9 @@ def test_rollout_debug_dump_keeps_sorted_row_alignment(tmp_path, persisted):
         fields = kwargs["select_fields"]
         if fields == ["extra_fields"]:
             return {"extra_fields": SimpleNamespace(tolist=lambda: [
-                {"reward_extra_info": {"acc": 1}, "trajectory_tool_dispatches": 5},
+                {"reward_extra_info": {"acc": 1, "evaluation_valid": False, "private_evaluator_artifact_path": "/private/z.json"},
+                 "trajectory_tool_dispatches": 5, "infrastructure_failure": 1, "secret_token": "never dump",
+                 "hidden_verifier_setup_ok": False, "oom_killed": 1, "hidden_reward_seconds": 2.5},
                 {"reward_extra_info": {"acc": 0}, "trajectory_tool_dispatches": 6},
                 {"reward_extra_info": {"acc": 0.5}, "trajectory_tool_dispatches": 7},
             ])}
@@ -209,6 +217,12 @@ def test_rollout_debug_dump_keeps_sorted_row_alignment(tmp_path, persisted):
     assert [row["response_tokens"] for row in rows] == [3, 2, 1]
     assert [row["trajectory_tool_dispatches"] for row in rows] == [7, 6, 5]
     assert [row["success_value"] for row in rows] == [0.5, 0, 1]
+    assert [row["infrastructure_failure"] for row in rows] == [None, None, 1]
+    assert rows[2]["evaluation_valid"] is False
+    assert rows[2]["private_evaluator_artifact_path"] == "/private/z.json"
+    assert rows[2]["hidden_verifier_setup_ok"] is False
+    assert rows[2]["oom_killed"] == 1 and rows[2]["hidden_reward_seconds"] == 2.5
+    assert all("secret_token" not in row for row in rows)
     assert [row["train_sample_mask"] for row in rows] == [False, False, True]
     assert rows[1]["train_exclusion_reason"] == (
         "completion_ratio_cutoff,infrastructure_filter" if persisted else "completion_ratio_cutoff"

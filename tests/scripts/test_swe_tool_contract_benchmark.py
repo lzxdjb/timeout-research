@@ -108,7 +108,7 @@ def test_evaluate_reports_unknown_historical_labels_without_passing_them(tmp_pat
     # The baseline currently has tool-contract failures, but this assertion
     # must also pass after those production defects are repaired.
     assert report["regression_pass"] == (not report["failures"])
-    assert report["counts"].get("tool_contract_checks", 0) == 10
+    assert report["counts"].get("tool_contract_checks", 0) == 13
     assert report["counts"].get("unknown_historical_labels", 0) >= 0
     assert json.loads(report_path.read_text(encoding="utf-8"))["version"] == benchmark.VERSION
 
