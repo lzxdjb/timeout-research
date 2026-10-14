@@ -104,13 +104,15 @@ def parse_transcript(output: str) -> tuple[list[dict], list[dict], list[str]]:
         if index + 1 < len(messages):
             responses = list(RESPONSE.finditer(messages[index + 1]["content"]))
         if len(responses) > len(calls):
-            return [], messages, ["more_responses_than_calls"]
+            issues.append("more_responses_than_calls")
+            break
         if len(calls) > len(responses):
             issues.append("undispatched_or_unobserved_calls")
         for block, response in zip(calls, responses):
             pairs = PARAMETER.findall(block[2])
             if len({key for key, _ in pairs}) != len(pairs):
-                return [], messages, ["duplicate_parameter"]
+                issues.append("duplicate_parameter")
+                return events, messages, sorted(set(issues))
             events.append({
                 "index": len(events), "batch": index, "name": block[1].strip(),
                 "arguments": dict(pairs), "response": response[1].strip(),
@@ -612,8 +614,43 @@ def two_level_metrics(rows: list[dict], key: str = "verdict") -> dict:
             "missed_positive_rate_including_deferral": ratio(counts["fn"] + counts["deferred_positive"], counts["positive"])}
 
 
+
+def replay_events(case: dict, policy) -> tuple[list[dict], str, str]:
+    """Prefer exact captured evidence; never invent state for historical text."""
+    pointer = case.get("repeat_reward_audit_path") or case.get("raw", {}).get("repeat_reward_audit_path")
+    if pointer:
+        path = Path(pointer)
+        expected = case.get("repeat_reward_audit_sha256") or case.get("raw", {}).get("repeat_reward_audit_sha256")
+        if not expected or file_digest(path) != expected:
+            raise ValueError("Captured judge artifact hash mismatch")
+        with gzip.open(path, "rt") as stream:
+            audit = json.load(stream)
+        events, transcript = audit["events"], audit["original_public_context"]
+        if audit.get("version") != policy.SERIALIZER_VERSION or audit["messages"] != policy.judge_messages(transcript, events):
+            raise ValueError("Captured request cannot be replayed by current serializer")
+        return events, transcript, "captured_exact"
+    if "public_events" in case:
+        return case["public_events"], case.get("public_context", ""), "captured_events"
+    events = []
+    for e in case["events"]:
+        response = e.get("response")
+        observation = policy.capture_observation(response)
+        # Only this exact harness suffix is recognized in legacy logs. Arbitrary
+        # occurrences of [tool feedback] inside source/output are preserved.
+        text = observation["observation"]
+        suffix = re.search(r"\n\[tool feedback\] This exact call returned the same observation \d+ times in the last 128 calls\. Inspect a different range, change the query or repair a precondition before retrying\. Repeated output alone does not establish unchanged external state\.$", text)
+        if suffix:
+            observation.update(result=text[:suffix.start()], feedback=text[suffix.start():], result_source="legacy_known_harness_suffix")
+        events.append({"id": e["index"] + 1, "name": e["name"], "arguments": e["arguments"],
+                      "observation_view": policy.public_observation_view(response), **observation,
+                      **policy.noop_edit_evidence(e["name"], e["arguments"], response),
+                      **policy.observation_fields(response),
+                      "serial": e.get("batch") is not None and sum(x.get("batch") == e.get("batch") for x in case["events"]) == 1,
+                      "evidence": e.get("repeat_read_evidence", {})})
+    return events, case["raw"]["input"] + case["raw"]["output"], "legacy_limited"
+
 async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *, online: bool = False,
-                             include_current_contracts: bool = False, audit_level2: bool = False) -> dict:
+                             include_current_contracts: bool = False, audit_level2: bool = False, case_concurrency: int = 1) -> dict:
     from recipe.swe_agent import repetition_reward as policy
     manifest_path = fixtures.parent / "manifest.json"
     if manifest_path.is_file():
@@ -647,32 +684,44 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
                           "raw": {"input": contract["context"], "output": json.dumps(events), "raw_score": 1}})
             indexed_labels[task_key] = {"expected": contract["expected"], "reason": contract["reason"]}
             contract_extensions.append({"id": task_key, "sha256": digest(contract)})
-    for case in cases:
+    async def process_case(case):
         if case["id"] not in indexed_labels:
-            continue
+            return
         label = indexed_labels.pop(case["id"])
-        if label["expected"] not in {"clean", "repetitive", "uncertain"} or not label.get("reason"):
+        if (label["expected"] not in {"clean", "repetitive", "uncertain", None}
+                or (label["expected"] is None and label.get("annotation_status") != "unadjudicated")
+                or not label.get("reason")):
             raise ValueError("Invalid independent label")
-        events = [{"id": e["index"] + 1, "name": e["name"], "arguments": e["arguments"],
-                   "observation_view": policy.public_observation_view(e.get("response")),
-                   **policy.noop_edit_evidence(e["name"], e["arguments"], e.get("response")),
-                   **policy.observation_fields(e.get("response")), "serial": e.get("batch") is not None and
-                   sum(x.get("batch") == e.get("batch") for x in case["events"]) == 1,
-                   "evidence": e.get("repeat_read_evidence", {})} for e in case["events"]]
-        verdict = policy.conservative_detect(events)
+        events, transcript, replay_source = replay_events(case, policy)
+        incomplete = bool(set(case.get("parse_issues", [])) - {"undispatched_or_unobserved_calls"})
+        verdict = policy.uncertain("ambiguous_legacy_event_alignment") if incomplete else policy.conservative_detect(events)
         l1 = verdict["verdict"]
         l2 = None
-        if online and (l1 != "repetitive" or audit_level2):
+        if online and not incomplete and (l1 != "repetitive" or audit_level2):
             # Diagnostic-only audit cannot override an L1 verdict in the production path.
-            l2 = await client.judge_consensus(case["raw"]["input"] + case["raw"]["output"], events)
+            l2 = await client.judge_consensus(transcript, events)
             if l1 != "repetitive":
                 verdict = l2
-        rows.append({"id": case["id"], "task_key": case["task_key"], "partition": case["partition"],
+        artifact = policy.save_audit(transcript, events, l2 or verdict, config)
+        rows.append({"replay_source": replay_source, "incomplete_evidence": incomplete, **artifact, "id": case["id"], "task_key": case["task_key"], "partition": case["partition"],
                      "expected": label["expected"], "label_reason": label["reason"],
                      "source_kind": "synthetic" if case["id"].startswith("synthetic:") else "historical",
                      "raw_success": case["raw"].get("raw_score") == 1,
                      "level1": l1, "candidate_spans": policy.candidate_spans(events),
                      "level2_audit": l2, **verdict})
+        write_json(report_path.with_suffix(".partial.json"), {"complete": False, "rows": rows, "provenance": client.provenance()})
+        if online:
+            print(json.dumps({"completed": len(rows), "id": case["id"], "verdict": verdict["verdict"],
+                              "expected": label["expected"], "errors": verdict.get("error_count", 0),
+                              "guard_blocked": verdict.get("guard_blocked", 0)}), flush=True)
+    import asyncio
+    if case_concurrency < 1:
+        raise ValueError("case_concurrency must be positive")
+    case_limit = asyncio.Semaphore(case_concurrency)
+    async def bounded_case(case):
+        async with case_limit:
+            await process_case(case)
+    await asyncio.gather(*(bounded_case(case) for case in cases))
     if indexed_labels:
         raise ValueError("Label IDs missing from frozen fixtures: " + str(sorted(indexed_labels)))
     # Same task is partitioned once, irrespective of checkpoint, outcome or run.
@@ -683,17 +732,23 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
         raise ValueError("Task leakage between partitions")
     audit_rows = [{**r, **r["level2_audit"]} for r in rows if r["level2_audit"] is not None]
     def matches(row):
+        if row["expected"] is None:
+            return True  # Coverage only; never gold.
         return (row["verdict"] == row["expected"] if row["expected"] != "uncertain"
                 else row["verdict"] != "repetitive")
-    report = {"policy_version": policy.POLICY_VERSION, "prompt_version": policy.PROMPT_VERSION,
+    report = {"serializer_version": policy.SERIALIZER_VERSION, "guard_version": policy.GUARD_VERSION,
+              "replay_sources": dict(collections.Counter(r["replay_source"] for r in rows)),
+              "incomplete_cases": sum(r["incomplete_evidence"] for r in rows),
+              "policy_version": policy.POLICY_VERSION, "prompt_version": policy.PROMPT_VERSION,
               "rule_version": policy.RULE_VERSION, "provenance": client.provenance(),
               "include_current_contracts": include_current_contracts, "audit_level2": audit_level2,
               "benchmark_source_sha256": file_digest(Path(__file__)),
               "contracts_source_sha256": file_digest(Path(__file__).with_name("swe_repeat_contracts.py")),
               "agent_loop_source_sha256": file_digest(Path(policy.__file__).with_name("agent_loop.py")),
               "level2_independent": two_level_metrics(audit_rows),
-              "level2_regression_pass": bool(online and audit_rows) and all(matches(r) and not r.get("error") for r in audit_rows),
-              "penalty_safety_pass": bool(online and rows) and all(r["verdict"] != "repetitive" for r in rows if r["expected"] != "repetitive"),
+              "level2_regression_pass": bool(online and audit_rows) and all(r["expected"] is not None for r in audit_rows)
+                  and all(matches(r) and not r.get("error") for r in audit_rows),
+              "penalty_safety_pass": bool(online and any(r["expected"] in {"clean", "uncertain"} for r in rows)) and all(r["verdict"] != "repetitive" for r in rows if r["expected"] in {"clean", "uncertain"}),
               "model_format_pass": bool(online and audit_rows) and not any(r.get("error") for r in audit_rows),
               "all_judge_vote_errors": sum(r.get("error_count", 0) for r in audit_rows),
               "vote_policy_version": policy.VOTE_POLICY_VERSION,
@@ -720,7 +775,8 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
               "latency_seconds": sum(r.get("latency_seconds", 0) for r in audit_rows),
               "prompt_tokens": sum(r.get("prompt_tokens", 0) for r in audit_rows),
               "completion_tokens": sum(r.get("completion_tokens", 0) for r in audit_rows),
-              "regression_pass": bool(online) and all(
+              "unadjudicated_cases": sum(r["expected"] is None for r in rows),
+              "regression_pass": bool(online) and all(r["expected"] is not None for r in rows) and all(
                   (r["verdict"] == r["expected"] if r["expected"] != "uncertain" else r["verdict"] != "repetitive")
                   and not r.get("error") for r in rows) and bool(rows)
                   and all(matches(r) and not r.get("error") for r in audit_rows),
@@ -749,6 +805,7 @@ def main() -> int:
     two.add_argument("--fixtures", type=Path, required=True)
     two.add_argument("--labels", type=Path, required=True)
     two.add_argument("--report", type=Path, required=True)
+    two.add_argument("--case-concurrency", type=int, default=1, help="Bound independent offline case replays")
     two.add_argument("--online", action="store_true", help="Call the launched judge; omit for conservative offline replay")
     two.add_argument("--include-current-contracts", action="store_true",
                      help="Append new versioned contract cases without changing frozen fixtures or labels")
@@ -768,7 +825,8 @@ def main() -> int:
     if args.command == "two-level-evaluate":
         import asyncio
         result = asyncio.run(evaluate_two_level(args.fixtures, args.labels, args.report, online=args.online,
-                                               include_current_contracts=args.include_current_contracts, audit_level2=args.audit_level2))
+                                               include_current_contracts=args.include_current_contracts, audit_level2=args.audit_level2,
+                                               case_concurrency=args.case_concurrency))
         print(json.dumps({k: result[k] for k in ("cases", "online", "judge_voting", "level1", "combined", "raw_success_subset",
             "judge_errors", "judge_vote_errors", "judge_repetitive_votes", "judge_clean_votes",
             "judge_error_stages", "judge_normalized_citations", "guard_blocked", "unsafe_control_flags",

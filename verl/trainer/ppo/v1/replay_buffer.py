@@ -63,7 +63,18 @@ def rollout_diagnostics(extra) -> dict:
         if value is None or isinstance(value, (bool, int, float)):
             result[key] = value
         elif isinstance(value, str):
-            result[key] = value[:2048]
+            if key == "repeat_reward_verdict_json" and len(value) > 2048:
+                # Older workers may still return complete vote JSON. Keep a valid
+                # compact summary; the full record belongs in the hashed artifact.
+                try:
+                    decoded = json.loads(value)
+                    keep = ("verdict", "category", "event_ids", "reason", "span_id", "vote_count",
+                            "vote_quorum", "repetitive_votes", "clean_votes", "uncertain_votes", "guard_blocked")
+                    result[key] = json.dumps({k: decoded[k] for k in keep if k in decoded}, ensure_ascii=False)
+                except (ValueError, TypeError):
+                    result[key] = json.dumps({"verdict": "uncertain", "reason": "invalid_legacy_diagnostic_json"})
+            else:
+                result[key] = value[:2048]
     return result
 
 

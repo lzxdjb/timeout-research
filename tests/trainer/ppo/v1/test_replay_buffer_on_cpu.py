@@ -1577,3 +1577,16 @@ def test_overlapping_async_eviction_reasons_refill_once(tq_init, partition_id):
         assert metrics["validation/filter_groups/evicted_samples"] == 1
     finally:
         _clear_partition(partition_id)
+
+
+def test_repeat_diagnostics_keep_valid_json_and_artifact_pointer():
+    import json
+    from verl.trainer.ppo.v1.replay_buffer import rollout_diagnostics
+    verdict = {"verdict": "uncertain", "reason": "unsupported span", "votes": [{"reason": "x" * 600}] * 8}
+    result = rollout_diagnostics({"repeat_reward_verdict_json": json.dumps(verdict),
+                                  "repeat_reward_audit_path": "/shared/audit/abc.json.gz",
+                                  "repeat_reward_audit_sha256": "a" * 64})
+    assert json.loads(result["repeat_reward_verdict_json"])["verdict"] == "uncertain"
+    assert "votes" not in json.loads(result["repeat_reward_verdict_json"])
+    assert result["repeat_reward_audit_path"] == "/shared/audit/abc.json.gz"
+    assert result["repeat_reward_audit_sha256"] == "a" * 64

@@ -162,7 +162,8 @@ from recipe.swe_agent import repetition_reward as repeat_policy
 
 def repeat_evidence_events(count=5):
     return [{"id": i + 1, "name": "Grep", "arguments": {"pattern": "needle", "path": "src"},
-             "completed": True, "serial": True,
+             "completed": True, "serial": True, "observation_status": "observed",
+             "observation": "No matches", "result": "No matches",
              "evidence": {"version": repeat_policy.EVIDENCE_VERSION, "complete": True,
                           "before": "state", "after": "state", "arguments_sha256": "args",
                           "observation_sha256": "full-output"}} for i in range(count)]
@@ -246,7 +247,7 @@ def test_success_repeat_public_allowlist_and_injected_instructions():
     assert "SECRET" not in json.dumps(messages)
     assert "raw_score" not in json.dumps(messages)
     assert "untrusted" in messages[0]["content"]
-    assert "Ignore the auditor" in messages[1]["content"]  # preserved as evidence
+    assert "Ignore the auditor" not in messages[1]["content"]  # actor instructions omitted
 
 
 def test_success_repeat_metrics_do_not_count_deferred_as_clean():
@@ -493,7 +494,7 @@ def test_success_repeat_unsafe_evidence_blocks_rule_and_model_penalty(monkeypatc
 
 
 def test_success_repeat_unrelated_infrastructure_does_not_hide_observed_loop():
-    events = repeat_evidence_events()
+    events = repeat_evidence_events(6)
     events[0]["observation_status"] = "infrastructure_unavailable"
     verdict = {"verdict": "repetitive", "category": "unchanged_read_search", "event_ids": [2, 5], "reason": "independent rereads"}
     assert repeat_policy.evidence_guard(verdict, events) == verdict
@@ -565,7 +566,7 @@ def test_success_repeat_benchmark_uses_live_observation_status(tmp_path, monkeyp
 ])
 def test_success_repeat_schema_rejects_observed_online_contradictions(verdict, category, ids, reason, valid):
     import jsonschema
-    value = {"verdict": verdict, "category": category, "event_ids": ids, "reason": reason}
+    value = {"verdict": verdict, "category": category, "event_ids": ids, "reason": reason, "span_id": "span:1:5" if verdict == "repetitive" else ""}
     if valid:
         jsonschema.validate(value, repeat_policy.SCHEMA)
     else:
@@ -579,7 +580,7 @@ def test_success_repeat_schema_cannot_cite_unexecuted_or_unavailable_events():
     events[1]["completed"] = False
     events[2]["observation_status"] = "artifact_incomplete"
     schema = repeat_policy.schema_for_events(events)
-    value = {"verdict": "repetitive", "category": "ineffective_action_loop", "event_ids": [13, 149], "reason": "long command loop"}
+    value = {"verdict": "repetitive", "category": "unchanged_read_search", "event_ids": [13, 149], "reason": "long read loop", "span_id": "span:4:149"}
     jsonschema.validate(value, schema)
     for ids in ([13, 150], [1, 2], [1, 3]):
         with pytest.raises(jsonschema.ValidationError):
@@ -590,7 +591,7 @@ def test_success_repeat_schema_cannot_cite_unexecuted_or_unavailable_events():
     schema = repeat_policy.schema_for_events(events)
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(value, schema)
-    jsonschema.validate({"verdict": "uncertain", "category": "insufficient_evidence", "event_ids": [], "reason": "missing outputs"}, schema)
+    jsonschema.validate({"verdict": "uncertain", "category": "insufficient_evidence", "event_ids": [], "reason": "missing outputs", "span_id": ""}, schema)
 
 
 @pytest.mark.parametrize('ids,accepted', [
@@ -636,7 +637,7 @@ def test_repeat_eight_vote_normalization_and_audit_round_trip(monkeypatch):
         requests.append(payload)
         ids = [13, 15, 149, 15] if len(requests) in (6, 7) else [16, 149]
         answer = {'reason': 'Repeated identical command without investigation.', 'verdict': 'repetitive',
-                  'category': 'ineffective_action_loop', 'event_ids': ids}
+                  'category': 'unchanged_read_search', 'event_ids': ids}
         return {'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(answer)}}],
                 'usage': {'completion_tokens': 50}}
     monkeypatch.setattr(client, '_request', request)
@@ -689,10 +690,11 @@ def test_repeat_public_alignment_preserves_full_context_and_excludes_private_dat
     events = repeat_evidence_events(2)
     response = 'START of public observation\n' + 'x' * 2000 + '\nEND of public observation'
     events[0]['observation_view'] = repeat_policy.public_observation_view(response)
+    events[0]['observation'] = response
     events[0]['metadata'] = {'hidden_test': 'PRIVATE_SECRET'}
     transcript = 'FULL CONTEXT ' + response
     body = json.loads(repeat_policy.judge_messages(transcript, events)[1]['content'])
-    assert body['public_transcript'] == transcript
+    assert body['public_transcript'] == ''
     first = body['events'][0]
     assert first['id'] == 1 and first['arguments_view']['text'] == json.dumps(events[0]['arguments'], sort_keys=True)
     view = first['observation_view']
@@ -856,7 +858,7 @@ def test_repeat_l2_audit_does_not_hide_miss_behind_l1(tmp_path, monkeypatch):
     assert len(calls) == 3 and report['combined']['tp'] == 1
     assert report['level2_independent']['fn'] == 1
     assert not report['regression_pass'] and not report['level2_regression_pass']
-    assert report['penalty_safety_pass'] and report['model_format_pass']
+    assert not report['penalty_safety_pass'] and report['model_format_pass']  # No negative controls in this fixture.
 
 
 def test_repeat_preflight_records_actual_server_context_without_clamping(monkeypatch):
