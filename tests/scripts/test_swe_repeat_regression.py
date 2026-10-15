@@ -166,7 +166,7 @@ def repeat_evidence_events(count=5):
              "observation": "No matches", "result": "No matches",
              "evidence": {"version": repeat_policy.EVIDENCE_VERSION, "complete": True,
                           "before": "state", "after": "state", "arguments_sha256": "args",
-                          "observation_sha256": "full-output"}} for i in range(count)]
+                          "observation_sha256": __import__("hashlib").sha256(b"No matches").hexdigest()}} for i in range(count)]
 
 
 def test_success_repeat_five_completed_identical_reads():
@@ -324,7 +324,9 @@ def test_success_repeat_quorum_is_majority_and_errors_do_not_vote(monkeypatch, r
     client = repeat_policy.JudgeClient(config)
     seeds = []
     answers = iter(results)
-    async def judge(transcript, events, *, seed=0):
+    async def judge(transcript, events, *, seed=0, review_claims=None):
+        if review_claims is not None:
+            return {**review_claims[0], "prompt_tokens": 0, "completion_tokens": 0, "latency_seconds": 0}
         seeds.append(seed)
         answer = next(answers)
         if answer == "error":
@@ -399,7 +401,7 @@ def test_success_repeat_benchmark_online_mock_and_public_projection(tmp_path, mo
     labels.write_text(json.dumps({"policy_version": repeat_policy.POLICY_VERSION, "cases": [{"id": "one", "expected": "repetitive", "reason": "Five no-op edits"}]}))
     async def ready(self):
         pass
-    async def judge(self, transcript, events, *, seed=0):
+    async def judge(self, transcript, events, *, seed=0, review_claims=None):
         assert "SECRET" not in transcript and "raw_score" not in json.dumps(events)
         return {"verdict": "repetitive", "category": "ineffective_action_loop", "event_ids": [1, 2], "reason": "Repeated no-op"}
     monkeypatch.setattr(repeat_policy.JudgeClient, "preflight", ready)
@@ -545,7 +547,7 @@ def test_success_repeat_benchmark_uses_live_observation_status(tmp_path, monkeyp
     seen = []
     async def preflight(self):
         pass
-    async def judge(self, transcript, events, *, seed=0):
+    async def judge(self, transcript, events, *, seed=0, review_claims=None):
         seen.append([(e["completed"], e["observation_status"]) for e in events])
         return repeat_policy.uncertain("projection only")
     monkeypatch.setattr(repeat_policy.JudgeClient, "preflight", preflight)
@@ -566,7 +568,7 @@ def test_success_repeat_benchmark_uses_live_observation_status(tmp_path, monkeyp
 ])
 def test_success_repeat_schema_rejects_observed_online_contradictions(verdict, category, ids, reason, valid):
     import jsonschema
-    value = {"verdict": verdict, "category": category, "event_ids": ids, "reason": reason, "span_id": "span:1:5" if verdict == "repetitive" else ""}
+    value = {"verdict": verdict, "category": category, "event_ids": ids, "reason": reason}
     if valid:
         jsonschema.validate(value, repeat_policy.SCHEMA)
     else:
@@ -580,7 +582,7 @@ def test_success_repeat_schema_cannot_cite_unexecuted_or_unavailable_events():
     events[1]["completed"] = False
     events[2]["observation_status"] = "artifact_incomplete"
     schema = repeat_policy.schema_for_events(events)
-    value = {"verdict": "repetitive", "category": "unchanged_read_search", "event_ids": [13, 149], "reason": "long read loop", "span_id": "span:4:149"}
+    value = {"verdict": "repetitive", "category": "unchanged_read_search", "event_ids": [13, 149], "reason": "long read loop"}
     jsonschema.validate(value, schema)
     for ids in ([13, 150], [1, 2], [1, 3]):
         with pytest.raises(jsonschema.ValidationError):
@@ -591,7 +593,7 @@ def test_success_repeat_schema_cannot_cite_unexecuted_or_unavailable_events():
     schema = repeat_policy.schema_for_events(events)
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(value, schema)
-    jsonschema.validate({"verdict": "uncertain", "category": "insufficient_evidence", "event_ids": [], "reason": "missing outputs", "span_id": ""}, schema)
+    jsonschema.validate({"verdict": "uncertain", "category": "insufficient_evidence", "event_ids": [], "reason": "missing outputs"}, schema)
 
 
 @pytest.mark.parametrize('ids,accepted', [
@@ -646,7 +648,7 @@ def test_repeat_eight_vote_normalization_and_audit_round_trip(monkeypatch):
     assert result['error_count'] == 0 and result['citation_normalized'] == 2
     assert len({v['seed'] for v in result['votes']}) == 8
     assert [v['vote_index'] for v in result['votes']] == list(range(1, 9))
-    assert [v['seed'] for v in result['votes']] == [req['seed'] for req in requests]
+    assert [v['seed'] for v in result['votes']] == [req['seed'] for req in requests[:8]]
     assert all(v['temperature'] == 0.2 for v in result['votes'])
     for index in (5, 6):
         vote = result['votes'][index]
@@ -671,7 +673,7 @@ def test_repeat_benchmark_reports_nested_errors_and_consensus_identity(tmp_path,
     async def preflight(self):
         pass
     calls = []
-    async def judge(self, transcript, events, *, seed=0):
+    async def judge(self, transcript, events, *, seed=0, review_claims=None):
         calls.append(seed)
         return {**repeat_policy.uncertain('invalid citation'), 'error': 1,
                 'failure_stage': 'verdict_validation'}
@@ -732,8 +734,10 @@ def test_repeat_eight_vote_fixed_denominator_with_invalid_replies(monkeypatch, r
     import asyncio
     client = repeat_policy.JudgeClient(repeat_policy.RepeatConfig(vote_count=8, vote_quorum=7))
     call_count = 0
-    async def judge(transcript, events, *, seed=0):
+    async def judge(transcript, events, *, seed=0, review_claims=None):
         nonlocal call_count
+        if review_claims is not None:
+            return review_claims[0]
         call_count += 1
         if call_count <= repetitive:
             return {'verdict': 'repetitive', 'category': 'ineffective_action_loop',
@@ -749,7 +753,7 @@ def test_repeat_consensus_cancellation_stops_remaining_votes(monkeypatch):
     import asyncio
     client = repeat_policy.JudgeClient(repeat_policy.RepeatConfig(vote_count=8, vote_quorum=7))
     calls = []
-    async def judge(transcript, events, *, seed=0):
+    async def judge(transcript, events, *, seed=0, review_claims=None):
         calls.append(seed)
         raise asyncio.CancelledError
     monkeypatch.setattr(client, 'judge', judge)
@@ -762,6 +766,7 @@ def noop_events(count=5):
     args = {'file_path': 'a.py', 'old_string': 'x=1', 'new_string': 'x=1'}
     return [{'id': i + 1, 'name': 'Edit', 'arguments': dict(args), 'serial': True,
              **repeat_policy.observation_fields(repeat_policy.NOOP_EDIT_RESULT),
+             **repeat_policy.capture_observation(repeat_policy.NOOP_EDIT_RESULT),
              **repeat_policy.noop_edit_evidence('Edit', args, repeat_policy.NOOP_EDIT_RESULT)} for i in range(count)]
 
 
@@ -817,7 +822,7 @@ def test_repeat_spans_do_not_merge_across_progress_or_count_undispatched_calls()
     assert all(s['all_explicit_noop_edits'] for s in spans)
     transcript = 'full public evidence'
     payload = json.loads(repeat_policy.judge_messages(transcript, events)[1]['content'])
-    assert payload['candidate_spans'] == spans and payload['public_transcript'] == transcript
+    assert 'candidate_spans' not in payload and payload['public_transcript'] == transcript
 
 
 def test_repeat_historical_noop_tail_frozen_replay(tmp_path):
@@ -847,7 +852,7 @@ def test_repeat_l2_audit_does_not_hide_miss_behind_l1(tmp_path, monkeypatch):
     async def preflight(self):
         pass
     calls = []
-    async def judge(self, transcript, events, *, seed=0):
+    async def judge(self, transcript, events, *, seed=0, review_claims=None):
         calls.append(seed)
         return {'verdict': 'clean', 'category': 'none', 'event_ids': [], 'reason': 'Wrong earlier-work justification'}
     monkeypatch.setattr(repeat_policy.JudgeClient, 'preflight', preflight)

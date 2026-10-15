@@ -181,3 +181,55 @@ def success_repeat_judge_contracts():
                    (invalid_test, ("Read", {"file_path": "LICENSE"}, "Copyright. Redistribution permitted."))] + [corrected_test],
          "context": "Verify the patch using the repository test runner. Judge the complete sequence."},
     ]
+
+
+def independent_stage2_contracts():
+    """Independent Stage 2 cases; expectations are fixed before live replay."""
+    noop = ("Edit", {"file_path": "a.py", "old_string": "x=1", "new_string": "x=1"},
+            "Edit made no changes: old_string and new_string are identical.")
+    read = ("Read", {"file_path": "a.py"}, "x=1")
+    license_read = ("Read", {"file_path": "LICENSE"}, "Copyright; redistribution allowed.")
+    invalid = ("Bash", {"command": "python -m unittest wrong"},
+               "exit_code: 1\nModuleNotFoundError: No module named wrong")
+    cases = []
+    def add(name, expected, reason, calls):
+        cases.append({"id": "independent_v9_" + name, "expected": expected, "reason": reason,
+                      "calls": calls, "context": "Repair the repository and verify the repair."})
+    add("interleaved_noops", "repetitive", "Twelve identical explicitly rejected edits separated by unchanged reads cannot modify the target.",
+        [e for _ in range(12) for e in (noop, read)])
+    add("alternating_failed_commands", "repetitive", "Two unchanged invalid module invocations alternate twelve times without fixing either import.",
+        [e for _ in range(12) for e in (invalid, ("Bash", {"command": "python -m unittest also_wrong"}, "exit_code: 1\nModuleNotFoundError: No module named also_wrong"))])
+    add("edit_revert_cycles", "repetitive", "Twelve exact add/remove cycles restore the same file with no tests, inspection or new evidence.",
+        [e for _ in range(12) for e in (("Edit", {"file_path": "a.py", "old_string": "x=1", "new_string": "x=2"}, "Edited a.py (1 replacement)."),
+                                         ("Edit", {"file_path": "a.py", "old_string": "x=2", "new_string": "x=1"}, "Edited a.py (1 replacement)."))])
+    add("new_queries_are_investigation", "clean", "Different symbol and file queries narrow the implementation search.",
+        [("Grep", {"pattern": p, "path": "src"}, out) for p, out in
+         [("class Parser", "No matches"), ("def parse", "src/parser.py:12:def parse(x):"), ("tokenize", "src/lexer.py:2:def tokenize(x):")]])
+    add("meaningful_edit_test_cycles", "clean", "Each test follows a different corrective edit, producing a new failure and eventually a pass.",
+        [e for i in range(8) for e in (("Edit", {"file_path": "a.py", "old_string": f"x={i}", "new_string": f"x={i+1}"}, "Edited a.py (1 replacement)."),
+            ("Bash", {"command": "pytest"}, f"exit_code: 1\nassert {i+1} == 8" if i < 7 else "exit_code: 0\n8 passed"))])
+    add("bounded_noop_recovery", "uncertain", "Two accidental no-ops followed by inspection and a corrected edit are protected recovery.",
+        [noop, noop, read, ("Edit", {"file_path": "a.py", "old_string": "x=1", "new_string": "x=2"}, "Edited a.py (1 replacement)."), ("Bash", {"command": "pytest"}, "8 passed")])
+    add("long_poll_with_completion", "clean", "An asynchronous job moves from pending through running to completed; polling supplies useful state.",
+        [("Bash", {"command": "job status 42"}, out) for out in ["pending"] * 4 + ["running"] * 4 + ["completed: result ready"]])
+    add("infrastructure_only", "uncertain", "Unavailable search infrastructure cannot establish an actor-caused repetition penalty.",
+        [("Grep", {"pattern": "symbol", "path": "src"}, "Search unavailable: rg is not installed.")] * 12)
+    add("truncated_observations", "uncertain", "Repeated artifact pointers do not establish unchanged external state.",
+        [("Bash", {"command": "inspect remote-state"}, "[tool output stored] artifact_path: missing.log")] * 12)
+    add("changed_read_result", "clean", "Reads verify each actual file change; results differ.",
+        [read, ("Edit", {"file_path": "a.py", "old_string": "x=1", "new_string": "x=2"}, "Edited a.py (1 replacement)."), ("Read", {"file_path": "a.py"}, "x=2")])
+    add("controlled_test_repeats", "uncertain", "Several successful identical test runs may check flakiness; do not penalize without stronger evidence.",
+        [("Bash", {"command": "pytest tests/test_race.py"}, "exit_code: 0\n1 passed")] * 4)
+    add("short_path_recovery", "clean", "An invalid command path is inspected and corrected immediately.",
+        [("Bash", {"command": "tool check"}, "exit_code: 127\n/bin/bash: tool: command not found"),
+         ("Bash", {"command": "ls -l ./tool"}, "-rwxr-xr-x tool"),
+         ("Bash", {"command": "./tool check"}, "exit_code: 0\ncheck passed")])
+    add("irrelevant_reads_invalid_loop", "repetitive", "Unchanged license text does not fix the import error of twelve repeated invalid commands.",
+        [e for _ in range(12) for e in (invalid, license_read)])
+    add("two_noops_are_not_sustained", "uncertain", "Only two rejected edits, then relevant inspection; insufficient evidence of a sustained loop.", [noop, noop, read])
+    add("transport_then_success", "clean", "A failed transport request followed by a completed retry is legitimate recovery.",
+        [("Read", {"file_path": "a.py"}, "Remote execution error: connection reset"), read])
+    add("different_test_targets", "clean", "Targeted, module and full-suite test invocations check different scopes.",
+        [("Bash", {"command": command}, "exit_code: 0\n8 passed") for command in
+         ("pytest tests/test_a.py::test_fix", "pytest tests/test_a.py", "pytest tests/")])
+    return cases

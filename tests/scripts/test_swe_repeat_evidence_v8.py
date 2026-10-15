@@ -29,13 +29,27 @@ CASES = json.loads(Path(__file__).with_name("fixtures").joinpath("repeat_unsuppo
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
-def test_real_different_successful_edit_citations_preserve_reward(case):
-    verdict = {key: case["verdict"][key] for key in policy.VERDICT_FIELDS}
-    verdict = policy.validate_verdict(verdict, case["events"])
-    guarded = policy.evidence_guard(verdict, case["events"])
-    assert guarded["verdict"] == "uncertain" and guarded["guard_blocked"] == 1
-    assert policy.compose_reward(policy.RepeatConfig(mode="apply"), validation=False,
-                                 valid=True, raw=1, existing=1, verdict=guarded["verdict"]) == 1
+def test_real_irrelevant_successful_edit_citations_need_semantic_confirmation(case, monkeypatch):
+    # Valid IDs are insufficient: even unanimous positive votes must survive the
+    # full-trace relevance audit. These historical reasons describe patch changes,
+    # not repetition. A failed confirmation must preserve the reward.
+    client = policy.JudgeClient(policy.RepeatConfig(mode="apply", vote_count=8, vote_quorum=7))
+    async def request(method, path, payload=None):
+        if path == "/v1/models":
+            return {"data": [{"id": client.config.model, "max_model_len": client.config.max_context}]}
+        if path == "/tokenize":
+            return {"count": 100}
+        body = json.loads(payload["messages"][1]["content"])
+        answer = (policy.uncertain("Cited edits implement different changes; no common loop established")
+                  if "evidence_review" in body else {k: case["verdict"][k] for k in policy.VERDICT_FIELDS})
+        return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(answer)}}]}
+    monkeypatch.setattr(client, "_request", request)
+    verdict = asyncio.run(client.judge_consensus("", case["events"]))
+    assert verdict["evidence_review_passed"] == 0
+    assert verdict["repetitive_votes"] == (0 if case["verdict"]["category"] == "unchanged_read_search" else 8)
+    assert verdict["verdict"] == "uncertain"
+    assert policy.compose_reward(client.config, validation=False, valid=True,
+                                 raw=1, existing=1, verdict=verdict["verdict"]) == 1
 
 
 def test_captured_input_and_vote_seeds_ignore_actor_control_tokens(monkeypatch):
@@ -74,8 +88,8 @@ def test_every_vote_is_guarded_before_quorum(monkeypatch):
     assert all(v["original_response"] and v["proposed_verdict"] for v in verdict["votes"])
 
 
-@pytest.mark.parametrize("change", ["edit", "arguments", "result", "missing_id", "poll", "short"])
-def test_span_cannot_cross_changes_or_support_polling(change):
+@pytest.mark.parametrize("change", ["edit", "arguments", "result", "missing_id", "short"])
+def test_stage2_evidence_is_not_gated_by_stage1_patterns(change):
     public = events()
     proposed = claim()
     if change == "edit":
@@ -86,14 +100,12 @@ def test_span_cannot_cross_changes_or_support_polling(change):
         public[4]["result"] = "Found new result"
     elif change == "missing_id":
         public.pop(4)
-    elif change == "poll":
-        for e in public:
-            e.update(name="Bash", arguments={"command": "job status 42"}, result="running")
-        proposed["category"] = "ineffective_action_loop"
     else:
         public = public[:3]
-        proposed = claim((1, 3), span="span:1:3")
-    assert policy.evidence_guard(proposed, public)["verdict"] == "uncertain"
+        proposed = claim((1, 3))
+    # These citations still need model judgment and positive review; a syntactic
+    # evidence check must not reimplement Stage 1's adjacency/identity rules.
+    assert policy.evidence_guard(proposed, public)["verdict"] == "repetitive"
 
 
 def test_sustained_read_and_failed_shell_loops_are_supported():
@@ -187,7 +199,9 @@ def test_unadjudicated_coverage_never_becomes_a_release_gate(tmp_path):
 ])
 def test_failed_polls_and_controlled_test_trials_are_not_invalid_command_loops(command, result):
     public = events("Bash", result=result, args={"command": command})
-    assert policy.evidence_guard(claim(category="ineffective_action_loop"), public)["verdict"] == "uncertain"
+    assert policy.conservative_detect(public)["verdict"] == "uncertain"
+    # Only semantic judgment can distinguish controlled trials/polls from loops.
+    assert policy.evidence_guard(claim(category="ineffective_action_loop"), public)["verdict"] == "repetitive"
 
 
 def test_audit_drops_private_event_metadata_and_never_loads_api_key(tmp_path, monkeypatch):
@@ -204,13 +218,13 @@ def test_audit_drops_private_event_metadata_and_never_loads_api_key(tmp_path, mo
     assert audit["messages"] == policy.judge_messages("public context", public)
 
 
-def test_schema_chooses_reason_before_branch_and_excludes_bounded_retries():
+def test_schema_preserves_independent_stage2_verdicts():
     schema = policy.schema_for_events(events())
     assert next(iter(schema["oneOf"][0]["properties"])) == "reason"
-    assert list(schema["oneOf"][0]["properties"])[-1] == "span_id"
-    assert schema["oneOf"][0]["properties"]["category"]["enum"] == ["unchanged_read_search"]
+    assert "span_id" not in schema["oneOf"][0]["properties"]
+    assert set(schema["oneOf"][0]["properties"]["category"]["enum"]) == {"unchanged_read_search", "ineffective_action_loop"}
     bounded = policy.schema_for_events(events("Bash", count=3, result="running", args={"command": "job status"}))
-    assert all(b["properties"]["verdict"]["const"] != "repetitive" for b in bounded["oneOf"])
+    assert any(b["properties"]["verdict"]["const"] == "repetitive" for b in bounded["oneOf"])
 
 
 def test_level1_cannot_bridge_missing_dispatches():
@@ -224,7 +238,8 @@ def test_unchanged_output_does_not_hide_changed_scope_between_reads():
     public = events()
     for i, e in enumerate(public):
         e['evidence'] = {'before': 'A' if i < 5 else 'B', 'after': 'A' if i < 5 else 'B'}
-    assert policy.evidence_guard(claim(), public)['verdict'] == 'uncertain'
+    assert policy.conservative_detect(public)['verdict'] == 'uncertain'
+    assert policy.evidence_guard(claim(), public)['verdict'] == 'repetitive'
 
 
 def test_provenance_tracks_loaded_policy_when_file_changes(monkeypatch):

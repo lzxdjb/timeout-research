@@ -626,7 +626,8 @@ def replay_events(case: dict, policy) -> tuple[list[dict], str, str]:
         with gzip.open(path, "rt") as stream:
             audit = json.load(stream)
         events, transcript = audit["events"], audit["original_public_context"]
-        if audit.get("version") != policy.SERIALIZER_VERSION or audit["messages"] != policy.judge_messages(transcript, events):
+        encoding = audit.get("verdict", {}).get("encoding_version", policy.SERIALIZER_VERSION)
+        if audit.get("version") != policy.SERIALIZER_VERSION or audit["messages"] != policy.judge_messages(transcript, events, encoding=encoding):
             raise ValueError("Captured request cannot be replayed by current serializer")
         return events, transcript, "captured_exact"
     if "public_events" in case:
