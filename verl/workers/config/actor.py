@@ -205,6 +205,10 @@ class ActorConfig(BaseConfig):
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
     timeout_prediction: TimeoutPredictionConfig = field(default_factory=TimeoutPredictionConfig)
+    tool_failure_penalty_enabled: bool = False
+    tool_failure_penalty_cost: float = 0.02
+    tool_failure_penalty_cap: float = 0.10
+    tool_failure_penalty_warmup_steps: int = 10
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -217,6 +221,14 @@ class ActorConfig(BaseConfig):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING
         assert self.rollout_n != MISSING
+        if self.tool_failure_penalty_enabled:
+            import math
+            if (not all(math.isfinite(x) and x >= 0 for x in
+                        (self.tool_failure_penalty_cost, self.tool_failure_penalty_cap))
+                    or self.tool_failure_penalty_warmup_steps < 0):
+                raise ValueError("Invalid tool-failure cost, cap, or warmup")
+            if self.policy_loss.get("loss_mode", "vanilla") != "vanilla":
+                raise ValueError("Tool-failure penalty currently supports vanilla PPO only")
         if not self.use_dynamic_bsz:
             if self.ppo_micro_batch_size is not None and self.ppo_micro_batch_size_per_gpu is not None:
                 raise ValueError(

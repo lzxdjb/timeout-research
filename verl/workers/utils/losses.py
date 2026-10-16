@@ -83,7 +83,17 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics = {}
 
     # select fields and convert to padded tensor
+    tool_failure_enabled = getattr(config, "tool_failure_penalty_enabled", False)
+    active_global_count = None
+    if tool_failure_enabled:
+        if config.policy_loss.get("loss_mode", "vanilla") != "vanilla":
+            raise ValueError("Tool-failure penalty currently supports vanilla PPO only")
+        active_global_count = tu.get_non_tensor_data(data, "tool_failure_active_global_count", default=None)
+        if active_global_count is None or "tool_failure_weights" not in data:
+            raise ValueError("Enabled tool-failure penalty requires V1 minibatch cost fields")
     fields = ["response_mask", "old_log_probs", "advantages"]
+    if tool_failure_enabled:
+        fields.append("tool_failure_weights")
     if "train_sample_mask" in data:
         fields.append("train_sample_mask")
     if "rollout_is_weights" in data:
@@ -123,6 +133,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics.update(pg_metrics)
     metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
     policy_loss = pg_loss
+    if tool_failure_enabled:
+        from verl.utils.swe_tool_failure import local_ppo_loss
+        tool_loss = local_ppo_loss(
+            log_prob, old_log_prob, data["tool_failure_weights"], response_mask, config,
+            active_global_count=active_global_count,
+            dp_size=config.global_batch_info["dp_size"], rollout_is_weights=rollout_is_weights,
+        )
+        policy_loss = policy_loss + tool_loss
+        metrics["actor/tool_failure_loss"] = Metric(value=tool_loss, aggregation=AggregationType.SUM)
 
     # add entropy loss
     if entropy is not None:

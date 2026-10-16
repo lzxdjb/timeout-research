@@ -551,7 +551,11 @@ class ToolAgentLoop(AgentLoopBase):
             available = list(active_tools.keys())
             msg = f"Unknown function '{tool_name}'. Available tools: {available}"
             logger.warning(msg)
-            return ToolResponse(text=msg), 0.0, {}
+            metadata = {}
+            if getattr(agent_data, "_swe_tool_failure_enabled", False):
+                from verl.utils.swe_tool_failure import rejection_metadata
+                metadata = rejection_metadata("unknown_tool")
+            return ToolResponse(text=msg), 0.0, metadata
 
         # Validate tool arguments
         try:
@@ -559,7 +563,11 @@ class ToolAgentLoop(AgentLoopBase):
         except (json.JSONDecodeError, TypeError) as e:
             msg = f"Invalid JSON in arguments for '{tool_name}': {e}"
             logger.warning(msg)
-            return ToolResponse(text=msg), 0.0, {}
+            metadata = {}
+            if getattr(agent_data, "_swe_tool_failure_enabled", False):
+                from verl.utils.swe_tool_failure import rejection_metadata
+                metadata = rejection_metadata("invalid_json")
+            return ToolResponse(text=msg), 0.0, metadata
 
         # Execute tool
         tool, instance_id = None, None

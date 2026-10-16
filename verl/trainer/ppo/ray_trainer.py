@@ -1430,12 +1430,13 @@ class RayPPOTrainer:
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+        from verl.trainer.ppo.metric_utils import valid_evaluation_diagnostics
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         core_sources, core_uids, core_infos, coverage = usable_validation_metrics(
             data_sources, sample_uids, reward_extra_infos_dict
         )
         core_metrics = process_validation_metrics(core_sources, core_uids, core_infos) if core_sources else {}
-        metric_dict = {}
+        metric_dict = valid_evaluation_diagnostics(data_sources, reward_extra_infos_dict)
         for data_source, counts in coverage.items():
             for name, value in counts.items():
                 metric_dict[f"val-aux/{data_source}/infrastructure_filter/{name}"] = value

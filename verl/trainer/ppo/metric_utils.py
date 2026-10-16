@@ -1102,6 +1102,22 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
+def valid_evaluation_diagnostics(data_sources, infos_dict):
+    """Add explicit valid-only denominators without changing binary/core metrics."""
+    valid = infos_dict.get("evaluation_valid", [])
+    rewards = infos_dict.get("reward", [])
+    result = {}
+    for source in sorted(set(data_sources)):
+        indices = [i for i, value in enumerate(data_sources) if value == source]
+        selected = [i for i in indices if i < len(valid) and valid[i] in (True, 1)]
+        prefix = f"val-aux/{source}/valid_evaluation_only"
+        result[f"{prefix}/valid_count"] = len(selected)
+        result[f"{prefix}/total_count"] = len(indices)
+        if selected and all(i < len(rewards) for i in selected):
+            result[f"{prefix}/reward_mean"] = sum(float(rewards[i]) for i in selected) / len(selected)
+    return result
+
+
 def usable_validation_metrics(data_sources, sample_uids, infos_dict, *,
                               unverified_threshold=None, expected_rollout_count=None):
     """Retain confirmed validation siblings only within the configured ratio."""

@@ -23,7 +23,7 @@ def body(messages):
 
 def canonical(full):
     full = copy.deepcopy(full)
-    for event in full["events"]:
+    for event in full["trajectory"]:
         event.pop("arguments_sha256", None)
         event.pop("arguments_view", None)
         if "observation" in event:
@@ -40,7 +40,7 @@ def test_all_eight_historical_overflows_roundtrip_exactly(suffix):
     full = body(policy.judge_messages(transcript, public))
     compact = body(policy.judge_messages(transcript, public, encoding=policy.COMPACT_ENCODING_VERSION))
     assert policy.decode_compact_body(compact) == canonical(full)
-    assert [e["id"] for e in compact["events"]] == [e["id"] for e in public]
+    assert [e["id"] for e in compact["trajectory"]] == [e["id"] for e in public]
     assert len(json.dumps(compact)) < len(json.dumps(full))
 
 
@@ -54,8 +54,8 @@ def test_reference_shaped_untrusted_data_is_terminal_and_control_tokens_escaped(
     messages = policy.judge_messages("", public, encoding=policy.COMPACT_ENCODING_VERSION)
     assert "<|" not in messages[1]["content"]
     compact = body(messages)
-    assert "concat_refs" in compact["events"][0]["observation"]
-    assert "value_ref" in compact["events"][1]["observation"]
+    assert "concat_refs" in compact["trajectory"][0]["observation"]
+    assert "value_ref" in compact["trajectory"][1]["observation"]
     assert policy.decode_compact_body(compact) == canonical(body(policy.judge_messages("", public)))
 
 
@@ -69,19 +69,19 @@ def test_legacy_missing_observation_and_fallback_statuses_are_preserved():
     decoded = policy.decode_compact_body(compact)
     assert decoded == canonical(body(policy.judge_messages("FULL LEGACY TRANSCRIPT", public)))
     assert decoded["public_transcript"] == "FULL LEGACY TRANSCRIPT" and not decoded["evidence_complete"]
-    assert "observation" not in decoded["events"][0]
-    assert decoded["events"][0]["observation_view"]["omitted"] is True
+    assert "observation" not in decoded["trajectory"][0]
+    assert decoded["trajectory"][0]["observation_view"]["omitted"] is True
 
 
 @pytest.mark.parametrize("mutation", ["missing", "ambiguous", "nonstring_concat", "unknown_version"])
 def test_decoder_rejects_corrupt_references(mutation):
     compact = body(policy.judge_messages("", events(), encoding=policy.COMPACT_ENCODING_VERSION))
     if mutation == "missing":
-        compact["events"][0]["arguments"] = {"value_ref": "missing"}
+        compact["trajectory"][0]["arguments"] = {"value_ref": "missing"}
     elif mutation == "ambiguous":
-        compact["events"][0]["arguments"]["extra"] = 1
+        compact["trajectory"][0]["arguments"]["extra"] = 1
     elif mutation == "nonstring_concat":
-        compact["events"][0]["observation"] = {"concat_refs": [compact["events"][0]["arguments"]["value_ref"]]}
+        compact["trajectory"][0]["observation"] = {"concat_refs": [compact["trajectory"][0]["arguments"]["value_ref"]]}
     else:
         compact["encoding_version"] = "future-unknown"
     with pytest.raises(ValueError):

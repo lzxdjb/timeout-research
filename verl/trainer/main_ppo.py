@@ -42,6 +42,14 @@ def run_ppo(config, task_runner_class) -> None:
     """
     # Propagate determinism env vars from config before ray.init() so
     # get_ppo_ray_runtime_env() forwards them to all Ray actors.
+    if config.actor_rollout_ref.actor.get("tool_failure_penalty_enabled", False):
+        if not config.trainer.get("use_v1", False):
+            raise ValueError("Tool-failure penalty requires trainer.use_v1=True")
+        if config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") != "vanilla":
+            raise ValueError("Tool-failure penalty currently supports vanilla PPO only")
+        correction = config.algorithm.get("rollout_correction")
+        if correction and correction.get("bypass_mode", False):
+            raise ValueError("Tool-failure penalty requires recomputed old log probabilities (no bypass mode)")
     rollout_cfg = config.actor_rollout_ref.rollout
     rm_rollout_cfg = config.reward.reward_model.rollout
     if rollout_cfg.full_determinism or (config.reward.reward_model.enable and rm_rollout_cfg.full_determinism):

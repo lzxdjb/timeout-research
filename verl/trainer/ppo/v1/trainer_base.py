@@ -2343,6 +2343,8 @@ class PPOTrainer(ABC):
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
+        tool_config = self.config.actor_rollout_ref.get("actor", {})
+        tool_failure_enabled = tool_config.get("tool_failure_penalty_enabled", False)
         fields = [
             "uid",
             "response_mask",
@@ -2353,11 +2355,13 @@ class PPOTrainer(ABC):
             "values",
             "extra_fields",
         ]
+        if tool_failure_enabled:
+            fields.append("responses")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         extra_fields = data.pop("extra_fields").tolist()
         direct_fields = {}
-        if _task_filter_enabled() or self.timeout_prediction_enabled:
+        if _task_filter_enabled() or self.timeout_prediction_enabled or tool_failure_enabled:
             for field in (
                 "observed_infrastructure_failure",
                 "observed_infrastructure_failure_code",
@@ -2467,8 +2471,40 @@ class PPOTrainer(ABC):
         )
         metrics.update(data.meta_info.get("grpo_metrics", {}))
 
+        # Apply only after GRPO's session-level scalar broadcasting. Keep the
+        # terminal task reward intact, including valid missing-submission -0.1.
+        if tool_failure_enabled:
+            from verl.utils.swe_tool_failure import build_cost_weights, gate_positive_credit, trajectory_normalizer
+            active = exclusion_codes.eq(0) & data.batch["response_mask"].bool().any(-1)
+            if "train_sample_mask" in data.batch:
+                active &= data.batch["train_sample_mask"].bool()
+            infrastructure, _ = self._extract_v1_infrastructure_metadata(extra_fields, direct_fields)
+            for i, value in enumerate(infrastructure):
+                if (isinstance(value, (bool, np.bool_)) and bool(value)
+                        or isinstance(value, (int, float, np.number)) and np.isfinite(value) and value > 0):
+                    active[i] = False
+            trajectory_ids = [key.rsplit("_", 1)[0] for key in batch.keys]
+            normalizer = trajectory_normalizer(active, trajectory_ids)
+            weights, counts = build_cost_weights(
+                data.batch["responses"], data.batch["response_mask"], extra_fields, active,
+                cost=tool_config.tool_failure_penalty_cost,
+                cap=tool_config.tool_failure_penalty_cap,
+                warmup_steps=tool_config.tool_failure_penalty_warmup_steps,
+                step=self.global_steps,
+                trajectory_ids=trajectory_ids,
+            )
+            data.batch["tool_failure_weights"] = weights
+            data.batch["tool_failure_active"] = active
+            data.batch["tool_failure_normalizer"] = normalizer
+            data.batch["advantages"] = gate_positive_credit(data.batch["advantages"], weights)
+            counts["active"] = round(float(normalizer.sum()))
+            metrics.update({f"tool_failure/{key}": value for key, value in counts.items()})
+            metrics["tool_failure/mean_cost"] = counts["cost"] / max(1, counts["active"])
+
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]
+        if tool_failure_enabled:
+            fields.append("tool_failure_weights")
         if self.config.algorithm.use_kl_in_reward:
             fields.append("token_level_rewards")
         if rollout_correction:
@@ -2477,6 +2513,9 @@ class PPOTrainer(ABC):
                 fields.append("rollout_is_weights")
 
         output = {"train_exclusion_code": exclusion_codes}
+        if tool_failure_enabled:
+            output["tool_failure_active"] = data.batch["tool_failure_active"]
+            output["tool_failure_normalizer"] = data.batch["tool_failure_normalizer"]
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
         if self.timeout_prediction_enabled or _task_filter_enabled() or "train_sample_mask" in data.batch:

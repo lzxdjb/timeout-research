@@ -320,6 +320,12 @@ profiler:
       strict: ${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}
 
 # Router replay configuration for MoE models
+tool_failure_penalty_enabled: false
+tool_failure_penalty_cost: 0.02
+tool_failure_penalty_cap: 0.10
+tool_failure_penalty_warmup_steps: 10
+
+# Router replay configuration for MoE models
 router_replay:
 
   # Target dataclass for this configuration

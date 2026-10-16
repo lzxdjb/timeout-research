@@ -607,7 +607,14 @@ def two_level_metrics(rows: list[dict], key: str = "verdict") -> dict:
         else:
             counts["fn" if expected == "repetitive" else "tn"] += 1
     ratio = lambda a, b: a / b if b else None
-    return {**counts, "precision": ratio(counts["tp"], counts["tp"] + counts["fp"]),
+    protected = [row for row in rows if row["expected"] in {"clean", "uncertain"}]
+    violations = sum(row[key] == "repetitive" for row in protected)
+    positives = sum(row[key] == "repetitive" and row["expected"] == "repetitive" for row in rows)
+    return {**counts, "protected_controls": len(protected), "protected_control_penalties": violations,
+            "protected_control_penalty_rate": ratio(violations, len(protected)),
+            "supported_accepted_penalty_fraction": ratio(positives, positives + violations),
+            "unadjudicated_positive_flags": sum(row[key] == "repetitive" and row["expected"] is None for row in rows),
+            "precision": ratio(counts["tp"], counts["tp"] + counts["fp"]),
             "recall": ratio(counts["tp"], counts["positive"]),
             "false_positive_rate": ratio(counts["fp"], counts["negative"]),
             "false_negative_rate": ratio(counts["fn"], counts["positive"]),
@@ -615,7 +622,7 @@ def two_level_metrics(rows: list[dict], key: str = "verdict") -> dict:
 
 
 
-def replay_events(case: dict, policy) -> tuple[list[dict], str, str]:
+def replay_evidence(case: dict, policy) -> tuple[list[dict], str, str, list[dict] | None]:
     """Prefer exact captured evidence; never invent state for historical text."""
     pointer = case.get("repeat_reward_audit_path") or case.get("raw", {}).get("repeat_reward_audit_path")
     if pointer:
@@ -626,12 +633,32 @@ def replay_events(case: dict, policy) -> tuple[list[dict], str, str]:
         with gzip.open(path, "rt") as stream:
             audit = json.load(stream)
         events, transcript = audit["events"], audit["original_public_context"]
-        encoding = audit.get("verdict", {}).get("encoding_version", policy.SERIALIZER_VERSION)
-        if audit.get("version") != policy.SERIALIZER_VERSION or audit["messages"] != policy.judge_messages(transcript, events, encoding=encoding):
+        if audit.get("version") == policy.SERIALIZER_VERSION:
+            serializer = policy
+            actor_kwargs = {"actor_segments": audit.get("actor_segments")}
+            source = "captured_exact"
+        elif audit.get("version") == "repeat-public-events-v3":
+            # Validate the historical literal request using its frozen serializer,
+            # THEN build a new v4 request. Never relabel old requests as current.
+            from recipe.swe_agent import repeat_legacy_v3 as serializer
+            actor_kwargs, source = {}, "captured_v3_migrated"
+        elif audit.get("version") == "repeat-public-trajectory-v4":
+            from recipe.swe_agent import repeat_legacy_v12 as serializer
+            actor_kwargs = {"actor_segments": audit.get("actor_segments")}
+            source = "captured_v12_migrated"
+        elif audit.get("version") == "repeat-public-trajectory-v5":
+            from recipe.swe_agent import repeat_legacy_v13 as serializer
+            actor_kwargs = {"actor_segments": audit.get("actor_segments")}
+            source = "captured_v13_migrated"
+        else:
+            raise ValueError("Unsupported captured serializer version")
+        encoding = audit.get("verdict", {}).get("encoding_version", serializer.SERIALIZER_VERSION)
+        if audit["messages"] != serializer.judge_messages(transcript, events, encoding=encoding, **actor_kwargs):
             raise ValueError("Captured request cannot be replayed by current serializer")
-        return events, transcript, "captured_exact"
+        segments = case.get("actor_segments", audit.get("actor_segments"))
+        return events, transcript, source, segments
     if "public_events" in case:
-        return case["public_events"], case.get("public_context", ""), "captured_events"
+        return case["public_events"], case.get("public_context", ""), "captured_events", case.get("actor_segments")
     events = []
     for e in case["events"]:
         response = e.get("response")
@@ -648,7 +675,13 @@ def replay_events(case: dict, policy) -> tuple[list[dict], str, str]:
                       **policy.observation_fields(response),
                       "serial": e.get("batch") is not None and sum(x.get("batch") == e.get("batch") for x in case["events"]) == 1,
                       "evidence": e.get("repeat_read_evidence", {})})
-    return events, case["raw"]["input"] + case["raw"]["output"], "legacy_limited"
+    return events, case["raw"]["input"] + case["raw"]["output"], "legacy_limited", case.get("actor_segments")
+
+
+def replay_events(case: dict, policy) -> tuple[list[dict], str, str]:
+    """Compatibility tool-only view; evaluation uses replay_evidence including text."""
+    events, transcript, source, _ = replay_evidence(case, policy)
+    return events, transcript, source
 
 async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *, online: bool = False,
                              include_current_contracts: bool = False, audit_level2: bool = False, case_concurrency: int = 1) -> dict:
@@ -693,22 +726,27 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
                 or (label["expected"] is None and label.get("annotation_status") != "unadjudicated")
                 or not label.get("reason")):
             raise ValueError("Invalid independent label")
-        events, transcript, replay_source = replay_events(case, policy)
+        events, transcript, replay_source, actor_segments = replay_evidence(case, policy)
+        actor_kwargs = {"actor_segments": actor_segments} if actor_segments is not None else {}
         incomplete = bool(set(case.get("parse_issues", [])) - {"undispatched_or_unobserved_calls"})
-        verdict = policy.uncertain("ambiguous_legacy_event_alignment") if incomplete else policy.conservative_detect(events)
+        verdict = policy.uncertain("ambiguous_legacy_event_alignment") if incomplete else policy.conservative_detect(events, actor_segments=actor_segments, config=config)
+        l1_detail = verdict.copy()
         l1 = verdict["verdict"]
         l2 = None
         if online and not incomplete and (l1 != "repetitive" or audit_level2):
             # Diagnostic-only audit cannot override an L1 verdict in the production path.
-            l2 = await client.judge_consensus(transcript, events)
+            l2 = await client.judge_consensus(transcript, events, **actor_kwargs)
             if l1 != "repetitive":
                 verdict = l2
-        artifact = policy.save_audit(transcript, events, l2 or verdict, config)
+        artifact = policy.save_audit(transcript, events, l2 or verdict, config, **actor_kwargs)
         rows.append({"replay_source": replay_source, "incomplete_evidence": incomplete, **artifact, "id": case["id"], "task_key": case["task_key"], "partition": case["partition"],
                      "expected": label["expected"], "label_reason": label["reason"],
+                     "label_scope": label.get("scope", "legacy_tool_evidence"),
+                     "actor_text_available": actor_segments is not None, "actor_segment_count": len(actor_segments or []),
                      "source_kind": "synthetic" if case["id"].startswith("synthetic:") else "historical",
                      "raw_success": case["raw"].get("raw_score") == 1,
-                     "level1": l1, "candidate_spans": policy.candidate_spans(events),
+                     "level1": l1, "level1_detail": l1_detail, "rule_diagnostics": policy.stage1_diagnostics(events),
+                     "candidate_spans": policy.candidate_spans(events),
                      "level2_audit": l2, **verdict})
         write_json(report_path.with_suffix(".partial.json"), {"complete": False, "rows": rows, "provenance": client.provenance()})
         if online:
@@ -732,6 +770,13 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
     if any(len(value) > 1 for value in partitions.values()):
         raise ValueError("Task leakage between partitions")
     audit_rows = [{**r, **r["level2_audit"]} for r in rows if r["level2_audit"] is not None]
+    without_review = [{**row, "verdict": "repetitive" if row["level1"] == "repetitive" else
+                       (row.get("level2_audit") or {}).get("without_reviewer_verdict", row["verdict"])} for row in rows]
+    requests = [(stage, vote) for row in audit_rows for stage, votes in
+                (("primary", row.get("votes", [])), ("reviewer", [row["evidence_review"]] if row.get("evidence_review") else []))
+                for vote in votes]
+    attempts = [(stage, attempt) for stage, vote in requests for attempt in vote.get("attempts", [vote])]
+    review_votes = [vote for stage, vote in requests if stage == "reviewer"]
     def matches(row):
         if row["expected"] is None:
             return True  # Coverage only; never gold.
@@ -762,21 +807,49 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
               "residual_level2": two_level_metrics([r for r in rows if r["level1"] != "repetitive"]),
               "raw_success_subset": two_level_metrics([r for r in rows if r["raw_success"] and r["source_kind"] == "historical"]),
               "by_source_kind": {kind: two_level_metrics([r for r in rows if r["source_kind"] == kind]) for kind in ("historical", "synthetic")},
+              "by_label_scope": {scope: two_level_metrics([r for r in rows if r["label_scope"] == scope])
+                                 for scope in sorted({r["label_scope"] for r in rows})},
               "by_partition": {p: two_level_metrics([r for r in rows if r["partition"] == p]) for p in sorted({r["partition"] for r in rows})},
               "judge_errors": sum(r.get("error", 0) for r in audit_rows),
               "judge_vote_errors": sum(r.get("error_count", 0) for r in audit_rows),
               "judge_repetitive_votes": sum(r.get("repetitive_votes", 0) for r in audit_rows),
               "judge_clean_votes": sum(r.get("clean_votes", 0) for r in audit_rows),
-              "judge_error_stages": dict(collections.Counter(
-                  v.get("failure_stage") or "unknown" for r in audit_rows for v in r.get("votes", [r]) if v.get("error"))),
+              "judge_error_stages": dict(collections.Counter(v.get("failure_stage") or "unknown"
+                  for _, v in requests if v.get("error"))),
+              "request_attempt_error_stages": dict(collections.Counter(f"{stage}:{v.get('failure_stage') or 'unknown'}"
+                  for stage, v in attempts if v.get("error"))),
+              "request_attempt_errors": sum(bool(v.get("error")) for _, v in attempts),
+              "request_attempts": len(attempts),
+              "without_reviewer": two_level_metrics(without_review),
+              "reviewer": {"enabled": config.reviewer_enabled, "calls": len(review_votes),
+                  "confirmed": sum(v["verdict"] == "repetitive" for v in review_votes),
+                  "semantic_vetoes": sum(v["verdict"] != "repetitive" and not v.get("error") for v in review_votes),
+                  "error_deferrals": sum(bool(v.get("error")) for v in review_votes)},
+              "stage1_rule_matches": dict(collections.Counter(r["level1_detail"].get("rule_id", "unknown")
+                  for r in rows if r["level1"] == "repetitive")),
+              "stage1_diagnostics": {key: sum(r["rule_diagnostics"].get(key, 0) for r in rows)
+                  for key in ("read_events", "proven_reads", "missing_read_proofs", "shell_loop_candidates")},
+              "stage1_level2_disagreements": sum(r["level1"] == "repetitive" and r["level2_audit"] is not None
+                  and r["level2_audit"]["verdict"] != "repetitive" for r in rows),
+              "thinking_observed": {stage: sum(bool(v.get("reasoning_observed")) for st, v in requests if st == stage)
+                  for stage in ("primary", "reviewer")},
+              "judge_timings": {key: sum(v.get(key, 0) for _, v in requests)
+                  for key in ("queue_seconds", "service_seconds", "tokenize_seconds", "completion_seconds", "reasoning_tokens")},
+              "quorum_potentially_lost_to_errors": sum(r["verdict"] == "uncertain" and
+                  r.get("repetitive_votes", 0) < config.vote_quorum <= r.get("repetitive_votes", 0) +
+                  sum(bool(v.get("error")) for v in r.get("votes", [])) for r in audit_rows),
               "judge_normalized_citations": sum(r.get("citation_normalized", 0) for r in audit_rows),
               "guard_blocked": sum(r.get("guard_blocked", 0) for r in audit_rows),
-              "unsafe_control_flags": sum(r["expected"] == "uncertain" and r["verdict"] == "repetitive" for r in rows),
+              "unsafe_control_flags": sum(r["expected"] in {"clean", "uncertain"} and r["verdict"] == "repetitive" for r in rows),
               "uncertain": sum(r["verdict"] == "uncertain" for r in rows),
               "latency_seconds": sum(r.get("latency_seconds", 0) for r in audit_rows),
               "prompt_tokens": sum(r.get("prompt_tokens", 0) for r in audit_rows),
               "completion_tokens": sum(r.get("completion_tokens", 0) for r in audit_rows),
               "unadjudicated_cases": sum(r["expected"] is None for r in rows),
+              "adjudicated_cases": sum(r["expected"] is not None for r in rows),
+              "labelled_regression_pass": bool(online and any(r["expected"] is not None for r in rows))
+                  and all(matches(r) and not r.get("error") for r in rows if r["expected"] is not None)
+                  and all(matches(r) and not r.get("error") for r in audit_rows if r["expected"] is not None),
               "regression_pass": bool(online) and all(r["expected"] is not None for r in rows) and all(
                   (r["verdict"] == r["expected"] if r["expected"] != "uncertain" else r["verdict"] != "repetitive")
                   and not r.get("error") for r in rows) and bool(rows)

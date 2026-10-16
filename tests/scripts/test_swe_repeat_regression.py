@@ -697,7 +697,7 @@ def test_repeat_public_alignment_preserves_full_context_and_excludes_private_dat
     transcript = 'FULL CONTEXT ' + response
     body = json.loads(repeat_policy.judge_messages(transcript, events)[1]['content'])
     assert body['public_transcript'] == ''
-    first = body['events'][0]
+    first = body['trajectory'][0]
     assert first['id'] == 1 and first['arguments_view']['text'] == json.dumps(events[0]['arguments'], sort_keys=True)
     view = first['observation_view']
     assert view['omitted'] and view['source_chars'] == len(response)

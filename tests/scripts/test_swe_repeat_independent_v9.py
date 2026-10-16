@@ -33,7 +33,7 @@ def test_evidence_review_is_independent_and_not_primed_by_vote_reasons():
     body = json.loads(messages[1]["content"])
     assert body["evidence_review"] == [{"category": "ineffective_action_loop", "event_ids": [1, 3]}]
     assert claims[0]["reason"] not in messages[1]["content"]
-    assert body["events"] == json.loads(policy.judge_messages("", [event(1), event(3)])[1]["content"])["events"]
+    assert body["trajectory"] == json.loads(policy.judge_messages("", [event(1), event(3)])[1]["content"])["trajectory"]
 
 
 def test_nonconsecutive_repetition_is_available_and_judged_without_stage1(monkeypatch):
@@ -50,7 +50,7 @@ def test_nonconsecutive_repetition_is_available_and_judged_without_stage1(monkey
             return {"count": 100}
         body = json.loads(payload["messages"][1]["content"])
         assert "candidate_spans" not in body
-        assert len(body["events"]) == 3
+        assert len(body["trajectory"]) == 3
         requests.append(payload)
         return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(positive())}}]}
     monkeypatch.setattr(client, "_request", request)
@@ -145,7 +145,7 @@ def test_positive_reason_rejecting_its_own_loop_is_downgraded(reason, expected):
         assert result["event_ids"] == [] and result["proposed_verdict"] == verdict
 
 
-@pytest.mark.parametrize("confirmation", ["uncertain", "clean", "error", "different_loop"])
+@pytest.mark.parametrize("confirmation", ["uncertain", "clean", "error"])
 def test_positive_evidence_review_can_veto_unanimous_votes(monkeypatch, confirmation):
     client = policy.JudgeClient(policy.RepeatConfig(vote_count=8, vote_quorum=7))
     async def judge(transcript, events, *, seed=0, review_claims=None):
@@ -154,8 +154,6 @@ def test_positive_evidence_review_can_veto_unanimous_votes(monkeypatch, confirma
         assert len(review_claims) == 8
         if confirmation == "error":
             return {**policy.uncertain("judge_error"), "error": 1, "failure_stage": "completion"}
-        if confirmation == "different_loop":
-            return positive((20, 22))
         if confirmation == "clean":
             return {"verdict": "clean", "category": "none", "event_ids": [], "reason": "Relevant recovery"}
         return policy.uncertain("Cited events do not demonstrate the asserted loop")
@@ -165,16 +163,19 @@ def test_positive_evidence_review_can_veto_unanimous_votes(monkeypatch, confirma
     assert result["evidence_review_passed"] == 0
 
 
-def test_votes_for_disjoint_loops_do_not_reach_a_common_quorum(monkeypatch):
+def test_disjoint_valid_votes_reach_trajectory_quorum_and_reviewer_uses_own_evidence(monkeypatch):
     client = policy.JudgeClient(policy.RepeatConfig(vote_count=8, vote_quorum=7))
     ids = iter([(1, 3)] * 4 + [(20, 22)] * 4)
     async def judge(transcript, events, *, seed=0, review_claims=None):
-        assert review_claims is None
+        if review_claims is not None:
+            assert len(review_claims) == 8
+            return positive((50, 52))
         return positive(next(ids))
     monkeypatch.setattr(client, "judge", judge)
     result = asyncio.run(client.judge_consensus("", []))
-    assert result["repetitive_votes"] == 8 and result["aligned_repetitive_votes"] == 4
-    assert result["verdict"] == "uncertain" and result["evidence_review_called"] == 0
+    assert result["trajectory_repetitive_votes"] == 8
+    assert result["verdict"] == "repetitive" and result["evidence_review_passed"] == 1
+    assert result["event_ids"] == [50, 52]
 
 
 def test_new_contracts_cover_interleaving_and_protected_recovery():

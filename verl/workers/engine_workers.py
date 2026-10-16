@@ -309,6 +309,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 maybe_fix_3d_position_ids(mini_batch_td)
+                if "tool_failure_weights" in mini_batch_td:
+                    # Compute once per actual minibatch, before dynamic
+                    # microbatching. Include active rows with no rejected call.
+                    active_count = float(mini_batch_td["tool_failure_normalizer"].sum().item())
+                    counts = [None] * torch.distributed.get_world_size(self.engine.get_data_parallel_group())
+                    torch.distributed.all_gather_object(counts, active_count, self.engine.get_data_parallel_group())
+                    tu.assign_non_tensor(mini_batch_td, tool_failure_active_global_count=sum(counts))
                 # add global token num
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
