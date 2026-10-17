@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 _SWE_REPO_ROOT = Path(__file__).resolve().parents[2] / "stock-rl-reflect"
+_VERL_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_VERL_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_VERL_REPO_ROOT))
 if str(_SWE_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_SWE_REPO_ROOT))
 from recipe.swe_agent.repeated_tool import classify_tool_outcome, is_verification_tool, replay_tool_calls
@@ -437,6 +440,7 @@ def _base_rejection(
     repeated_tool_read_window: int,
     repeated_tool_exec_window: int,
     require_swe_mutation: bool,
+    quality_mode: bool = False,
 ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], list[dict[str, str]]]:
     if row.get("is_padding"):
         raise DataReject("padding")
@@ -454,12 +458,26 @@ def _base_rejection(
         raise DataReject("terminal_tool_failure")
     if row.get("trajectory_budget_reached"):
         raise DataReject("budget_reached")
+    if quality_mode:
+        for field in ("infrastructure_failure", "evaluator_failure_excluded", "evaluator_group_excluded"):
+            if _as_optional_bool(row.get(field)) is True:
+                raise DataReject(field)
+        for field in ("evaluation_valid", "reward_eligible", "hidden_pass"):
+            if _as_optional_bool(row.get(field)) is False:
+                raise DataReject(field + "_false")
 
     benchmark, task_id, repository, base_commit = _gts_fields(row)
     input_text = str(row.get("input") or "")
     output_text = str(row.get("output") or "")
     system, user = _parse_input(input_text)
-    output_messages = _parse_output(output_text)
+    if quality_mode:
+        from scripts.swe_repeat_regression import parse_transcript
+
+        _, output_messages, issues = parse_transcript(output_text)
+        if issues:
+            raise DataReject("ambiguous_output", ",".join(issues))
+    else:
+        output_messages = _parse_output(output_text)
     submission_seen = row.get("submission_signal_seen")
     if submission_seen is None:
         submission_seen = row.get("repeated_tool_submission_seen")
@@ -467,7 +485,12 @@ def _base_rejection(
     if submission_seen is False:
         raise DataReject("missing_submission")
     submission_check = "explicit" if submission_seen is not None else "inferred_final_assistant"
-    if require_path_policy and not _path_policy_ok(input_text):
+    current_mount_policy = quality_mode and (
+        "directory arguments accept repository-relative paths." in system
+        and "declared Docker mount prefix is also accepted" in system
+        and "Do not use other absolute paths, host paths" in system
+    )
+    if require_path_policy and not (_path_policy_ok(input_text) or current_mount_policy):
         raise DataReject("old_or_missing_path_policy")
     if _has_path_rejection(output_text):
         raise DataReject("path_violation")
@@ -503,6 +526,8 @@ def _base_rejection(
     mutation_evidence = bool(metrics["mutation_evidence"])
     if require_swe_mutation and _is_swe_benchmark(benchmark):
         patch_empty = row.get("final_patch_empty")
+        if quality_mode:
+            patch_empty = _as_optional_bool(patch_empty)
         if patch_empty is not None and bool(patch_empty):
             raise DataReject("empty_swe_patch")
         if patch_empty is None and not mutation_evidence:
@@ -548,6 +573,7 @@ def _candidate(
     repeated_tool_read_window: int,
     repeated_tool_exec_window: int,
     require_swe_mutation: bool,
+    quality_mode: bool = False,
 ) -> Candidate:
     metadata, prompt, metrics, output_messages = _base_rejection(
         row,
@@ -559,6 +585,7 @@ def _candidate(
         repeated_tool_read_window=repeated_tool_read_window,
         repeated_tool_exec_window=repeated_tool_exec_window,
         require_swe_mutation=require_swe_mutation,
+        quality_mode=quality_mode,
     )
     output_text = str(row.get("output") or "")
     messages = [{"role": "system", "content": prompt["system"]}, {"role": "user", "content": prompt["user"]}]
@@ -910,11 +937,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Require the current repository-relative path policy in the prompt.",
     )
+    from scripts.swe_sft_quality import add_arguments
+
+    add_arguments(parser)
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.quality_filter == "off" and (args.prepare_only or args.pilot_cases or args.source_manifest):
+        raise SystemExit("--prepare-only/--pilot-cases/--source-manifest require --quality-filter sft-judge")
+    if args.pilot_cases < 0:
+        raise SystemExit("--pilot-cases must be non-negative")
     if not 0.0 <= args.val_fraction < 1.0:
         raise SystemExit("--val-fraction must be in [0, 1)")
     for name in (
@@ -939,26 +973,41 @@ def main() -> int:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    core, relaxed, rejected, stats = _candidate_sets(
-        args.rollout_root,
-        runs,
-        require_path_policy=args.require_path_policy,
-        max_response_tokens=args.max_response_tokens,
-        max_tool_dispatches=args.max_tool_dispatches,
-        max_penalized_repeated_tool_calls=args.max_penalized_repeated_tool_calls,
-        relaxed_max_tool_dispatches=args.relaxed_max_tool_dispatches,
-        relaxed_max_penalized_repeated_tool_calls=args.relaxed_max_penalized_repeated_tool_calls,
-        repeated_tool_detection_mode=args.repeated_tool_detection_mode,
-        repeated_tool_read_window=args.repeated_tool_read_window,
-        repeated_tool_exec_window=args.repeated_tool_exec_window,
-        require_swe_mutation=args.require_swe_mutation,
-    )
+    if args.quality_filter == "sft-judge":
+        from scripts.swe_sft_quality import build_candidates
+
+        result = build_candidates(args)
+        if result is None:
+            return 0
+        core, relaxed, rejected, stats = result
+        from scripts.swe_sft_quality import resolved_runs
+
+        runs = resolved_runs(args)
+    else:
+        core, relaxed, rejected, stats = _candidate_sets(
+            args.rollout_root,
+            runs,
+            require_path_policy=args.require_path_policy,
+            max_response_tokens=args.max_response_tokens,
+            max_tool_dispatches=args.max_tool_dispatches,
+            max_penalized_repeated_tool_calls=args.max_penalized_repeated_tool_calls,
+            relaxed_max_tool_dispatches=args.relaxed_max_tool_dispatches,
+            relaxed_max_penalized_repeated_tool_calls=args.relaxed_max_penalized_repeated_tool_calls,
+            repeated_tool_detection_mode=args.repeated_tool_detection_mode,
+            repeated_tool_read_window=args.repeated_tool_read_window,
+            repeated_tool_exec_window=args.repeated_tool_exec_window,
+            require_swe_mutation=args.require_swe_mutation,
+        )
 
     counts = {}
     counts.update(_write_dataset_splits(output_dir, core, "core", args.val_fraction))
     counts.update(_write_dataset_splits(output_dir, relaxed, "relaxed", args.val_fraction))
     gold = {key: candidate for key, candidate in core.items() if candidate.has_verification}
     counts.update(_write_dataset_splits(output_dir, gold, "gold", args.val_fraction))
+
+    from scripts.swe_sft_quality import write_exclusions
+
+    write_exclusions(args, {"core": core, "relaxed": relaxed, "gold": gold})
 
     _write_jsonl(output_dir / "rejected.jsonl", rejected)
     selected = []

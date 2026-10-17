@@ -745,6 +745,8 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
                      "actor_text_available": actor_segments is not None, "actor_segment_count": len(actor_segments or []),
                      "source_kind": "synthetic" if case["id"].startswith("synthetic:") else "historical",
                      "raw_success": case["raw"].get("raw_score") == 1,
+                     "raw_outcome": "success" if case["raw"].get("raw_score") == 1 else
+                                    "failure" if case["raw"].get("raw_score") == 0 else "unknown",
                      "level1": l1, "level1_detail": l1_detail, "rule_diagnostics": policy.stage1_diagnostics(events),
                      "candidate_spans": policy.candidate_spans(events),
                      "level2_audit": l2, **verdict})
@@ -806,6 +808,8 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
               "level1": two_level_metrics(rows, "level1"), "combined": two_level_metrics(rows),
               "residual_level2": two_level_metrics([r for r in rows if r["level1"] != "repetitive"]),
               "raw_success_subset": two_level_metrics([r for r in rows if r["raw_success"] and r["source_kind"] == "historical"]),
+              "by_raw_outcome": {outcome: two_level_metrics([r for r in rows if r["raw_outcome"] == outcome])
+                                 for outcome in ("success", "failure", "unknown")},
               "by_source_kind": {kind: two_level_metrics([r for r in rows if r["source_kind"] == kind]) for kind in ("historical", "synthetic")},
               "by_label_scope": {scope: two_level_metrics([r for r in rows if r["label_scope"] == scope])
                                  for scope in sorted({r["label_scope"] for r in rows})},

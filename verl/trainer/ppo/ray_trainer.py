@@ -1079,6 +1079,10 @@ class RayPPOTrainer:
                     "uid",
                     batch.non_tensor_batch["uid"].tolist(),
                 )
+            if "sft_tool_contract_outcomes" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump["sft_tool_contract_outcomes"] = (
+                    batch.non_tensor_batch["sft_tool_contract_outcomes"].tolist()
+                )
 
             self._dump_generations(
                 inputs=inputs,
