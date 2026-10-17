@@ -18,7 +18,9 @@
 import asyncio
 import logging
 import os
+import time
 from typing import Any
+from uuid import uuid4
 
 import ray
 import torch
@@ -31,6 +33,7 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from verl.trainer.ppo.v1.repeat_judge_queue import RepeatQueueError
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
@@ -72,8 +75,36 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         tq.init()
+        self.repeat_coordinator = None
+        self.repeat_finalizers = {}
+        self.repeat_generation_sessions = {}
         self.background_tasks = set()
         self.prompt_tasks: dict[str, dict[str, asyncio.Task[Any]]] = {"train": {}, "val": {}}
+
+    async def configure_repeat_coordinator(self, coordinator):
+        self.repeat_coordinator = coordinator
+
+    async def _finalize_repeat(self, ref, job_id, output, validate, kwargs):
+        from verl.trainer.ppo.v1.repeat_judge_queue import finalize_output
+
+        result_id, score, metadata = await ref
+        if result_id != job_id:
+            raise RuntimeError("Repeat result trajectory identity mismatch")
+        finalize_output(output, score, metadata)
+        await self._agent_loop_postprocess(output, validate, **kwargs)
+
+    async def _join_repeat(self, partition_id, uid):
+        tasks = self.repeat_finalizers.get((partition_id, uid), [])
+        if not tasks:
+            return
+        started = time.monotonic()
+        # Shield retained judgments from generation-cutoff cancellation. Publication
+        # must settle before ReplayBuffer is allowed to materialize or clear a group.
+        errors = await asyncio.shield(_settle_session_tasks(tasks))
+        logger.info("Repeat reward barrier partition=%s uid=%s jobs=%d wait_seconds=%.3f",
+                    partition_id, uid, len(tasks), time.monotonic() - started)
+        if errors:
+            raise RepeatQueueError("Deferred repeat reward failed: " + str(errors[0])) from errors[0]
 
     def _discard_prompt_task(self, partition_id: str, uid: str, task: asyncio.Task[Any]) -> None:
         if self.prompt_tasks[partition_id].get(uid) is task:
@@ -162,10 +193,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
     async def cancel_sequences(self, uids: list[str], validate: bool = False) -> int:
         """Cancel prompt groups and wait until their sessions release resources."""
         partition_id = "val" if validate else "train"
+        items = (tq.kv_list(partition_id) or {}).get(partition_id, {}) if self.repeat_coordinator is not None else {}
         tasks_by_uid = {
             uid: self.prompt_tasks[partition_id][uid]
             for uid in uids
             if uid in self.prompt_tasks[partition_id] and not self.prompt_tasks[partition_id][uid].done()
+            and items.get(uid, {}).get("status") != "reward_pending"
+            and not items.get(uid, {}).get("generation_complete", False)
         }
         for task in tasks_by_uid.values():
             task.cancel()
@@ -205,11 +239,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
         tasks = []
+        self.repeat_finalizers[(partition_id, str(uid))] = []
         try:
             # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
             config = self.config.actor_rollout_ref.rollout
             n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
             do_sample = prompt.pop("__do_sample__", True)
+            self.repeat_generation_sessions[(partition_id, str(uid))] = (n, set())
 
             run_sampling_params = dict(sampling_params)
             if not trajectory["validate"] and not do_sample:
@@ -219,7 +255,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             for i in range(n):
                 task = asyncio.create_task(
                     self._run_agent_loop(
-                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
+                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i,
+                        **({"_swe_repeat_deferred_supported": True} if self.repeat_coordinator is not None else {}),
+                        **prompt
                     )
                 )
                 tasks.append(task)
@@ -227,6 +265,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # Publish a terminal status only after every session settles, so no sibling can write after
             # ReplayBuffer clears a failed group.
             session_errors = await _settle_session_tasks(tasks)
+            queue_error = next((error for error in session_errors if isinstance(error, RepeatQueueError)), None)
+            if queue_error is not None:
+                raise queue_error
+            if self.repeat_coordinator is not None:
+                await tq.async_kv_put(key=uid, partition_id=partition_id,
+                                      tag={"status": "reward_pending", "generation_complete": True})
+                await self._join_repeat(partition_id, str(uid))
             if session_errors:
                 for error in session_errors:
                     logger.error(
@@ -243,6 +288,18 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             if tasks:
                 await _settle_session_tasks(tasks)
 
+            try:
+                await self._join_repeat(partition_id, str(uid))
+            except Exception as error:
+                await tq.async_kv_put(key=uid, partition_id=partition_id,
+                                      tag={"status": "reward_error", "repeat_error": str(error)[:1000]})
+                raise
+            progress = self.repeat_generation_sessions.get((partition_id, str(uid)))
+            if self.repeat_coordinator is not None and progress and len(progress[1]) == progress[0]:
+                # Cutoff raced the final generation completion. Every rollout was
+                # complete before cancellation; preserve the fully finalized group.
+                await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
+                return
             items = (tq.kv_list(partition_id) or {}).get(partition_id, {})
             trajectory_keys = [key for key in items if key.startswith(f"{uid}_")]
             trajectory_keys = self._ready_trajectory_keys(partition_id, trajectory_keys)
@@ -267,14 +324,66 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logger.exception(f"Error in _run_prompt: {e}")
             if tasks:
                 await _settle_session_tasks(tasks)
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+            try:
+                await self._join_repeat(partition_id, str(uid))
+            except Exception as reward_error:
+                e = reward_error
+            status = "reward_error" if isinstance(e, RepeatQueueError) else "failure"
+            tag = {"status": status}
+            if status == "reward_error":
+                tag["repeat_error"] = str(e)[:1000]
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag=tag)
+        finally:
+            self.repeat_finalizers.pop((partition_id, str(uid)), None)
+            self.repeat_generation_sessions.pop((partition_id, str(uid)), None)
 
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
         """Put agent loop outputs into TransferQueue."""
+        kwargs.pop("_swe_repeat_deferred_supported", None)
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
+        if outputs and self.repeat_coordinator is not None and not outputs[-1].extra_fields.get("_swe_repeat_finalized"):
+            partition_id = "val" if validate else "train"
+            expected, completed = self.repeat_generation_sessions[(partition_id, str(uid))]
+            completed.add(session_id)
+            if len(completed) == expected:
+                # Mark completion before bounded admission: a full queue is not a
+                # generation straggler and must not bias completion-ratio cutoff.
+                await tq.async_kv_put(key=uid, partition_id=partition_id,
+                                      tag={"status": "running", "generation_complete": True})
+        jobs = [o.extra_fields.get("_swe_repeat_job") for o in outputs]
+        if any(job is not None for job in jobs):
+            if len(outputs) != 1 or self.repeat_coordinator is None:
+                raise RepeatQueueError("Deferred repeat rewards require a configured coordinator and one SWE output")
+            job = outputs[0].extra_fields.pop("_swe_repeat_job")
+            job_id = f"{kwargs['global_steps']}:{'val' if validate else 'train'}:{uid}:{session_id}:{uuid4().hex}"
+            # Shield admission so cancellation cannot leak a reservation. If cutoff
+            # arrives during backpressure, finish handoff and retain this completed output.
+            reservation = asyncio.ensure_future(self.repeat_coordinator.reserve.remote(job_id))
+            cancelled = False
+            try:
+                try:
+                    admission = await asyncio.shield(reservation)
+                except asyncio.CancelledError:
+                    admission = await reservation
+                    cancelled = True
+            except Exception as error:
+                raise RepeatQueueError("Repeat queue admission failed") from error
+            try:
+                ref = self.repeat_coordinator.evaluate.remote(job_id, job, admission)
+            except Exception as error:
+                try:
+                    await self.repeat_coordinator.abandon.remote(job_id)
+                except Exception:
+                    logger.exception("Failed to release repeat reservation %s", job_id)
+                raise RepeatQueueError("Repeat queue handoff failed") from error
+            task = asyncio.create_task(self._finalize_repeat(ref, job_id, outputs[0], validate, kwargs))
+            self.repeat_finalizers[("val" if validate else "train", str(uid))].append(task)
+            if cancelled:
+                raise asyncio.CancelledError
+            return
         if not outputs:
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
@@ -399,7 +508,27 @@ class AgentLoopManagerTQ(AgentLoopManager):
     async def create(cls, *args, **kwargs):
         """Create agent loop manager."""
         instance = cls(*args, **kwargs)
-        await instance._init_agent_loop_workers()
+        from verl.trainer.ppo.v1.repeat_judge_queue import (
+            RepeatJudgeCoordinatorActor, deferred_enabled, validate_deferred_config,
+        )
+        instance.repeat_coordinator = None
+        if deferred_enabled():
+            from recipe.swe_agent.repetition_reward import RepeatConfig
+            validate_deferred_config(instance.config)
+            instance.repeat_coordinator = RepeatJudgeCoordinatorActor.remote(RepeatConfig.from_env())
+            try:
+                await instance.repeat_coordinator.ready.remote()
+            except BaseException:
+                ray.kill(instance.repeat_coordinator)
+                raise
+        try:
+            await instance._init_agent_loop_workers()
+            if instance.repeat_coordinator is not None:
+                await asyncio.gather(*[worker.configure_repeat_coordinator.remote(instance.repeat_coordinator)
+                                       for worker in instance.agent_loop_workers])
+        except BaseException:
+            instance.close_repeat_coordinator()
+            raise
         return instance
 
     def generate_sequences(self, prompts: TensorDict) -> None:
@@ -430,3 +559,8 @@ class AgentLoopManagerTQ(AgentLoopManager):
                 ]
             )
         )
+
+    def close_repeat_coordinator(self):
+        if self.repeat_coordinator is not None:
+            ray.kill(self.repeat_coordinator)
+            self.repeat_coordinator = None

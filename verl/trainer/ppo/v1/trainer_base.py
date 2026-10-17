@@ -2360,6 +2360,14 @@ class PPOTrainer(ABC):
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         extra_fields = data.pop("extra_fields").tolist()
+        for field in ("admission_seconds", "wall_seconds", "request_queue_seconds", "service_seconds"):
+            key = "repeat_reward_deferred_" + field
+            durations = [extra["reward_extra_info"].get(key) for extra in extra_fields
+                         if isinstance(extra, dict) and isinstance(extra.get("reward_extra_info"), dict)]
+            durations = [float(value) for value in durations if value is not None]
+            if durations:
+                metrics[f"repeat_queue/{field}_mean"] = float(np.mean(durations))
+                metrics[f"repeat_queue/{field}_max"] = max(durations)
         direct_fields = {}
         if _task_filter_enabled() or self.timeout_prediction_enabled or tool_failure_enabled:
             for field in (

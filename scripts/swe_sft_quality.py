@@ -149,6 +149,7 @@ class SFTJudgeClient(repeat.JudgeClient):
             or not 1 <= len(value["reason"].strip()) <= 600
         ):
             raise ValueError("Invalid SFT checklist/reason")
+        normalized = {}
         for key, kind, available in (
             ("event_ids", int, {e["id"] for e in events}),
             ("text_ids", str, {s["id"] for s in actor_segments or []}),
@@ -158,10 +159,12 @@ class SFTJudgeClient(repeat.JudgeClient):
                 not isinstance(ids, list)
                 or len(ids) > 4
                 or any(type(i) is not kind for i in ids)
-                or len(set(ids)) != len(ids)
                 or not set(ids) <= available
             ):
                 raise ValueError("Invalid SFT citations")
+            normalized[key] = list(dict.fromkeys(ids))
+        if any(normalized[key] != value[key] for key in normalized):
+            return {**value, **normalized, "citation_normalized": 1}
         return value
 
     def guard(self, value, events, actor_segments):
@@ -232,11 +235,76 @@ class SFTJudgeClient(repeat.JudgeClient):
             elif any(v["verdict"] == "bad" for v in votes):
                 result["verdict"] = "bad"
             calls = votes + ([result["reviewer"]] if result["reviewer_called"] else [])
-            for field in ("prompt_tokens", "completion_tokens", "attempt_errors", "error", "guard_blocked"):
+            for field in (
+                "prompt_tokens",
+                "completion_tokens",
+                "attempt_errors",
+                "error",
+                "guard_blocked",
+                "citation_normalized",
+            ):
                 result[field] = sum(v.get(field, 0) for v in calls)
+            result.update(call_metrics(calls))
             return result
         finally:
             repeat._PREPARED_INPUTS.reset(token)
+
+
+def call_metrics(calls):
+    """Count votes/reviews separately from failed HTTP attempts and recovered retries."""
+    metrics = collections.Counter(judge_calls=len(calls))
+    for call in calls:
+        attempts = call.get("attempts") or [call]
+        failed = sum(bool(a.get("error")) for a in attempts)
+        unresolved = bool(call.get("error"))
+        metrics["judge_attempts"] += len(attempts)
+        metrics["failed_attempts"] += failed
+        metrics["unresolved_error_calls"] += unresolved
+        metrics["recovered_error_calls"] += bool(failed and not unresolved)
+        metrics["citation_normalized_calls"] += bool(call.get("citation_normalized"))
+        if unresolved:
+            metrics["failure_stage:" + str(call.get("failure_stage", "unknown"))] += 1
+    return dict(metrics)
+
+
+def execution_metrics(result):
+    calls = result.get("votes", []) + ([result["reviewer"]] if result.get("reviewer_called") else [])
+    metrics = collections.Counter(call_metrics(calls))
+    metrics["error_cases"] = int(bool(result.get("error")))
+    metrics["unresolved_error_cases"] = int(bool(metrics["unresolved_error_calls"]))
+    metrics["recovered_error_cases"] = int(bool(metrics["recovered_error_calls"]))
+    metrics["any_error_cases"] = int(bool(metrics["failed_attempts"]))
+    metrics["primary_quorum_cases"] = int(bool(result.get("reviewer_called")))
+    if result.get("reviewer_called"):
+        verdict = result["reviewer"]["verdict"]
+        metrics["reviewer_" + verdict] += 1
+        metrics["primary_reviewer_disagreements"] += int(verdict != "good")
+    return metrics
+
+
+def audit_readiness(*, cases, error_cases, model_cases):
+    reasons = []
+    if cases < 50:
+        reasons.append("fewer_than_50_cases")
+    if error_cases:
+        reasons.append("unresolved_model_errors")
+    if not model_cases:
+        reasons.append("no_model_judgments")
+    return {
+        "ready_for_independent_audit": not reasons,
+        "technical_blockers": reasons,
+        "full_filter_gate_satisfied": False,
+        "next_step": "resolve technical blockers and rerun" if reasons else "independently label cases, then run check",
+    }
+
+
+def write_run_status(args, status, **details):
+    path = args.output_dir / "run_status.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"status": status, "output_dir": str(args.output_dir.resolve()), **details}, indent=2) + "\n"
+    )
+    temporary.replace(path)
 
 
 def candidate_kwargs(args):
@@ -276,9 +344,23 @@ def prepare_pool(args):
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     paths = resolved_runs(args)
-    files = [p for path in paths for p in sorted(Path(path).glob("*.jsonl"))]
+    snapshot = None
+    if args.source_snapshot:
+        snapshot = json.loads(args.source_snapshot.read_text())["sources"]
+        if not snapshot or {str(Path(s["path"]).parent) for s in snapshot} != set(paths):
+            raise ValueError("Source snapshot directories differ from configured rollout sources")
+        files = [Path(s["path"]) for s in snapshot]
+        if len(set(files)) != len(files):
+            raise ValueError("Duplicate files in source snapshot")
+    else:
+        files = [p for path in paths for p in sorted(Path(path).glob("*.jsonl"))]
     # Freeze files before reading; active files changing mid-read are rejected.
     sources = [{"path": str(p), "size": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns} for p in files]
+    if snapshot and any(
+        any(current[k] != saved[k] for k in ("path", "size", "mtime_ns"))
+        for current, saved in zip(sources, snapshot, strict=True)
+    ):
+        raise ValueError("A file in the prepared source snapshot changed; prepare a new output root")
     fingerprint = repeat.digest(
         {
             "sources": sources,
@@ -293,7 +375,13 @@ def prepare_pool(args):
     previous = db.execute("SELECT value FROM meta WHERE key='fingerprint'").fetchone()
     if previous:
         if previous[0] != fingerprint:
-            raise ValueError("Source files or filters changed; use a new output directory")
+            db.close()
+            raise ValueError(
+                "Source files, filters or code changed since this pool was prepared. "
+                "To keep the same files, pass --source-snapshot pointing to its sources.json. "
+                "If recorded files, filters or code changed, set SWE_SFT_OUTPUT_ROOT to a new directory "
+                "and rerun prepare/pilot; keep that root for check and full."
+            )
         stats = collections.Counter(json.loads(db.execute("SELECT value FROM meta WHERE key='stats'").fetchone()[0]))
         return db, stats, fingerprint
     db.execute("DROP TABLE IF EXISTS candidates")
@@ -558,6 +646,8 @@ async def filter_pool(args, db, stats, fingerprint):
     # Pool counters are durable; execution counters are specific to this run.
     stats = collections.Counter({k: v for k, v in stats.items() if not k.startswith("quality_")})
     core, relaxed = {}, {}
+    execution = collections.Counter()
+    source_coverage = collections.defaultdict(collections.Counter)
     consecutive_errors = 0
     decisions_path = args.output_dir / "quality_decisions.jsonl"
     with decisions_path.open("w") as decisions:
@@ -646,6 +736,8 @@ async def filter_pool(args, db, stats, fingerprint):
                     stats["quality_cases"] += 1
                     stats["quality_" + result["verdict"]] += 1
                     stats["quality_stage_" + result["stage"]] += 1
+                    execution.update(execution_metrics(result))
+                    source_coverage[provenance["run_name"]][result["verdict"]] += 1
                     for key in ("prompt_tokens", "completion_tokens", "error"):
                         stats[key] += result.get(key, 0)
                     record = {
@@ -661,6 +753,10 @@ async def filter_pool(args, db, stats, fingerprint):
                         "reason": result["reason"],
                         "good_votes": result.get("good_votes", 0),
                         "vote_count": result.get("vote_count", 0),
+                        "reviewer_called": bool(result.get("reviewer_called")),
+                        "reviewer_verdict": result.get("reviewer", {}).get("verdict"),
+                        "unresolved_error_calls": result.get("error", 0),
+                        "citation_normalized_calls": result.get("citation_normalized_calls", 0),
                         "artifact_path": result.get("artifact_path"),
                         "artifact_sha256": result["artifact_sha256"],
                     }
@@ -690,28 +786,62 @@ async def filter_pool(args, db, stats, fingerprint):
         "pilot_cases": args.pilot_cases,
         "tasks_considered": len(tasks),
         "stats": dict(stats),
+        "execution": dict(execution),
+        "source_coverage": dict(source_coverage),
+        "audit_readiness": audit_readiness(
+            cases=stats["quality_cases"],
+            error_cases=execution["error_cases"],
+            model_cases=stats["quality_stage_model"],
+        ),
     }
+    if not args.pilot_cases:
+        report["audit_readiness"] = {
+            "full_filter_gate_satisfied": True,
+            "audited_pilot_dir": str(args.audited_pilot_dir),
+        }
     (args.output_dir / "quality_report.json").write_text(json.dumps(report, indent=2) + "\n")
+    write_run_status(
+        args, "pilot_complete" if args.pilot_cases else "filter_complete", audit_readiness=report["audit_readiness"]
+    )
     return core, relaxed, [], stats
 
 
 def build_candidates(args):
-    judge_config(args)  # Validate before scanning sources.
-    if not args.prepare_only and not args.pilot_cases and args.audited_pilot_dir is None:
-        raise ValueError("Full SFT filtering requires --audited-pilot-dir with >=50 audited pilot cases")
-    db, stats, fingerprint = prepare_pool(args)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_run_status(args, "preparing")
+    db = None
     try:
+        judge_config(args)  # Validate before scanning sources.
+        if not args.prepare_only and not args.pilot_cases and args.audited_pilot_dir is None:
+            raise ValueError("Full SFT filtering requires --audited-pilot-dir with >=50 audited pilot cases")
+        db, stats, fingerprint = prepare_pool(args)
         if args.prepare_only:
             print(json.dumps({"prepared_only": True, "fingerprint": fingerprint, "stats": dict(stats)}, indent=2))
+            write_run_status(args, "prepared", stats=dict(stats))
             return None
+        write_run_status(args, "pilot_running" if args.pilot_cases else "filter_running")
         return asyncio.run(filter_pool(args, db, stats, fingerprint))
+    except BaseException as exc:
+        write_run_status(
+            args,
+            "interrupted" if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else "failed",
+            error_type=type(exc).__name__,
+            error=str(exc)[:1000],
+        )
+        raise
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
 
 def add_arguments(parser):
     parser.add_argument("--quality-filter", choices=("off", "sft-judge"), default="off")
     parser.add_argument("--source-manifest", type=Path, help="JSON list of rollout run directory paths")
+    parser.add_argument(
+        "--source-snapshot",
+        type=Path,
+        help="Use exactly the files in a prepared sources.json; ignore newly added rollout files",
+    )
     parser.add_argument("--prepare-only", action="store_true", help="Freeze/scan candidates without model calls")
     parser.add_argument(
         "--pilot-cases", type=int, default=0, help="Judge one candidate for each of N deterministically sampled tasks"

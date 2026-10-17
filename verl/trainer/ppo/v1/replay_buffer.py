@@ -464,6 +464,9 @@ class ReplayBuffer:
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
         self.pending_keys: dict[str, set] = defaultdict(set)
         self.running_keys: dict[str, set] = defaultdict(set)
+        # Generation + hidden evaluation are complete; final repeat reward is not.
+        # Count as inflight for sampling/draining, but not for generation cutoff.
+        self.reward_pending_keys: dict[str, set] = defaultdict(set)
         self.finished_keys: dict[str, set] = defaultdict(set)
         self.failure_keys: dict[str, set] = defaultdict(set)
         self.completion_ratio_cutoff_keys: dict[str, set] = defaultdict(set)
@@ -733,6 +736,7 @@ class ReplayBuffer:
         self.partitions.clear()
         self.pending_keys.clear()
         self.running_keys.clear()
+        self.reward_pending_keys.clear()
         self.finished_keys.clear()
         self.failure_keys.clear()
         self.completion_ratio_cutoff_keys.clear()
@@ -753,6 +757,15 @@ class ReplayBuffer:
                             self.pending_keys[partition_id].add(key)
                         case "running":
                             self.running_keys[partition_id].add(key)
+                            if tag.get("generation_complete", False):
+                                self.reward_pending_keys[partition_id].add(key)
+                        case "reward_pending":
+                            if self.trainer_mode != "sync":
+                                raise RuntimeError("Deferred repeat rewards support only synchronous sampling")
+                            self.running_keys[partition_id].add(key)
+                            self.reward_pending_keys[partition_id].add(key)
+                        case "reward_error":
+                            raise RuntimeError(f"Deferred repeat reward failed for {key}: {tag.get('repeat_error', '')}")
                         case "finished":
                             self.finished_keys[partition_id].add(key)
                         case "failure":
@@ -793,6 +806,7 @@ class ReplayBuffer:
         for status_keys in (self.pending_keys, self.running_keys, self.finished_keys, self.failure_keys):
             status_keys[partition_id].difference_update(uids)
         self.completion_ratio_cutoff_keys[partition_id].difference_update(uids)
+        self.reward_pending_keys[partition_id].difference_update(uids)
         for uid in uids:
             self.prompt_global_steps[partition_id].pop(uid, None)
             self._dapo_classification_cache[partition_id].pop(uid, None)
@@ -1154,8 +1168,10 @@ class ReplayBuffer:
             return cutoff_requested, {}
 
         golden_uids = self._golden_prompt_uids(partition_id)
-        all_terminal_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
-        inflight_uids = (self.pending_keys[partition_id] | self.running_keys[partition_id]) - golden_uids
+        all_terminal_uids = (self.finished_keys[partition_id] | self.failure_keys[partition_id]
+                             | self.reward_pending_keys[partition_id])
+        inflight_uids = ((self.pending_keys[partition_id] | self.running_keys[partition_id])
+                         - golden_uids - self.reward_pending_keys[partition_id])
         golden_training_cutoff = self.golden_replay_enabled and partition_id == "train"
         if golden_training_cutoff:
             # Replayed groups already provide complete, usable trajectories for
@@ -1253,6 +1269,7 @@ class ReplayBuffer:
         draining = False
         max_inflight_prompts = 0
         cutoff_requested = False
+        reward_only_wait_seconds = 0.0
         if dapo_enabled:
             max_inflight_prompts = self.max_inflight_gen_batches * self.train_batch_size
 
@@ -1325,6 +1342,7 @@ class ReplayBuffer:
             can_select = (
                 (has_enough_samples or (cutoff_requested and bool(sampleable_keys)))
                 and (not dapo_enabled or inflight_count == 0)
+                and (not cutoff_requested or not self.reward_pending_keys[partition_id])
             )
             if can_select:
                 selected_prompt_uids, partition_snapshot, _prompt_global_steps_snapshot = self._select_prompt_uids(
@@ -1340,8 +1358,19 @@ class ReplayBuffer:
                         eviction_metrics[key] = eviction_metrics.get(key, 0) + len(surplus_uids)
                 break
 
+            reward_only = bool(self.reward_pending_keys[partition_id]) and not (
+                (self.pending_keys[partition_id] | self.running_keys[partition_id])
+                - self.reward_pending_keys[partition_id]
+            )
+            wait_started = time.monotonic()
             last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
+            if reward_only:
+                reward_only_wait_seconds += time.monotonic() - wait_started
 
+        if reward_only_wait_seconds:
+            eviction_metrics[f"{self._metrics_prefix(partition_id)}/repeat_queue/reward_only_wait_seconds"] = (
+                reward_only_wait_seconds
+            )
         selected_uids = set(selected_prompt_uids)
         if partition_id != "val" and not any(key.split("_")[0] in selected_uids for key in partition_snapshot):
             message = "Sync replay buffer selected terminal groups with no materializable trajectories."

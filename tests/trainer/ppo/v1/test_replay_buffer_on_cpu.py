@@ -1590,3 +1590,49 @@ def test_repeat_diagnostics_keep_valid_json_and_artifact_pointer():
     assert "votes" not in json.loads(result["repeat_reward_verdict_json"])
     assert result["repeat_reward_audit_path"] == "/shared/audit/abc.json.gz"
     assert result["repeat_reward_audit_sha256"] == "a" * 64
+
+
+@pytest.mark.parametrize("status", ["reward_pending", "running"])
+def test_deferred_cutoff_counts_rollout_completion_but_waits_for_rewards(monkeypatch, status):
+    """No Ray needed: drive the real sampler across generation/reward state changes."""
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", "0.6666666666666666")
+    state = {"train": {
+        "ready": {"is_prompt": True, "status": "finished", "global_steps": 0},
+        "ready_0_0": {"seq_len": 3},
+        "judging": {"is_prompt": True, "status": status, "global_steps": 0, "generation_complete": True},
+        "tail": {"is_prompt": True, "status": "running", "global_steps": 0},
+    }}
+    cancelled = []
+    polls = []
+    def cancel(uids, validate=False):
+        cancelled.extend(uids)
+        for uid in uids:
+            state["train"][uid].update(status="failure", completion_ratio_cutoff=True)
+        return len(uids)
+    rb = _make_rb(train_batch_size=3, cancel_fn=cancel)
+    def clear(*, keys, partition_id):
+        for key in keys:
+            state[partition_id].pop(key, None)
+    monkeypatch.setattr(tq, "kv_clear", clear)
+    monkeypatch.setattr(tq, "kv_list", lambda *args, **kwargs: state)
+    def wait(partition_id, last_debug_time):
+        assert cancelled == ["tail"]
+        polls.append(1)
+        state["train"]["judging"]["status"] = "finished"
+        state["train"]["judging_0_0"] = {"seq_len": 3}
+        return last_debug_time
+    monkeypatch.setattr(rb, "_wait_for_next_poll", wait)
+    monkeypatch.setattr(rb, "_materialize_batch", lambda partition_id, selected, snapshot: selected)
+    selected, metrics = rb.sample(global_steps=0, partition_id="train", batch_size=3)
+    assert set(selected) == {"ready", "judging"}
+    assert polls == [1] and cancelled == ["tail"]
+    assert metrics["training/completion_ratio/terminal_groups"] == 2
+
+
+def test_deferred_error_stops_sampling_instead_of_skipping_penalty(monkeypatch):
+    rb = _make_rb()
+    monkeypatch.setattr(tq, "kv_list", lambda *args, **kwargs: {"train": {
+        "lost": {"is_prompt": True, "status": "reward_error", "global_steps": 0,
+                 "repeat_error": "coordinator died"}}})
+    with pytest.raises(RuntimeError, match="coordinator died"):
+        rb.sample(global_steps=0, partition_id="train", batch_size=1)

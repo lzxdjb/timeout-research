@@ -95,17 +95,39 @@ def export_evidence(pool_dir, output_dir, count, seed):
         db.close()
 
 
-def evaluate_audit(directory, labels_path):
+def label_metrics(decisions, labels):
+    """Describe independent support for selections; UNCERTAIN is never a positive label."""
+    by_hash = {r["transcript_hash"]: r for r in labels}
+    counts = collections.Counter()
+    for decision in decisions:
+        label = by_hash[decision["transcript_hash"]]["label"]
+        counts[("accepted_" if decision["accepted"] else "rejected_") + label] += 1
+    return {
+        **{
+            f"{choice}_{label}": counts[f"{choice}_{label}"]
+            for choice in ("accepted", "rejected")
+            for label in ("good", "bad", "uncertain")
+        },
+        "false_acceptances": counts["accepted_bad"],
+        "unsupported_acceptances": counts["accepted_uncertain"],
+        "false_rejections": counts["rejected_good"],
+    }
+
+
+def evaluate_audit(directory, labels_path, *, diagnostic=False):
     report_path = directory / "quality_report.json"
     decisions_path = directory / "quality_decisions.jsonl"
     pilot = json.loads(report_path.read_text())
+    blockers = []
     if pilot["pilot_cases"] < 50:
-        raise ValueError("Pilot must cover at least 50 real tasks")
+        blockers.append("Pilot must cover at least 50 real tasks")
     decisions = [json.loads(line) for line in decisions_path.read_text().splitlines()]
     labels = [json.loads(line) for line in labels_path.read_text().splitlines()]
     by_hash = {r["transcript_hash"]: r for r in labels}
-    if len(by_hash) != len(labels) or len(labels) < 50:
-        raise ValueError("At least 50 unique independent labels are required")
+    if len(by_hash) != len(labels):
+        raise ValueError("Independent labels must be unique")
+    if len(labels) < 50:
+        blockers.append("At least 50 unique independent labels are required")
     if set(by_hash) != {r["transcript_hash"] for r in decisions}:
         raise ValueError("Independently label every case in the pilot decisions")
     stats = collections.Counter()
@@ -134,9 +156,9 @@ def evaluate_audit(directory, labels_path):
         if label["label"] == "good" and not ids:
             raise ValueError(f"GOOD independent labels need execution evidence: {digest}")
         if artifact["result"].get("error"):
-            raise ValueError("Pilot has model errors; resolve and rerun before full filtering")
+            stats["unresolved_error_cases"] += 1
         if decision["accepted"] and label["label"] != "good":
-            raise ValueError(f"False or unsubstantiated acceptance in pilot: {digest}")
+            stats["unsubstantiated_acceptances"] += 1
         stats["reviewed_cases"] += 1
         stats["stage_" + decision["stage"]] += 1
         stats["independent_" + label["label"]] += 1
@@ -144,9 +166,14 @@ def evaluate_audit(directory, labels_path):
         stats["false_rejections"] += int(not decision["accepted"] and label["label"] == "good")
         artifact_hashes[digest] = artifact_hash
     if not stats["stage_model"]:
-        raise ValueError("Audit must include real model judgments")
-    return {
-        "passed": True,
+        blockers.append("Audit must include real model judgments")
+    if stats["unresolved_error_cases"]:
+        blockers.append("Pilot has model errors; resolve and rerun before full filtering")
+    if stats["unsubstantiated_acceptances"]:
+        blockers.append("False or unsubstantiated acceptance in pilot")
+    report = {
+        "passed": not blockers,
+        "blockers": blockers,
         "source_fingerprint": pilot["source_fingerprint"],
         "config_key": pilot["config_key"],
         "pilot_report_sha256": sha256(report_path),
@@ -156,7 +183,11 @@ def evaluate_audit(directory, labels_path):
         "audit_logic_sha256": sha256(Path(__file__)),
         "artifact_hashes": artifact_hashes,
         "stats": dict(stats),
+        "label_comparison": label_metrics(decisions, labels),
     }
+    if blockers and not diagnostic:
+        raise ValueError("; ".join(blockers))
+    return report
 
 
 def validate_audit(directory):
@@ -184,9 +215,22 @@ def main():
             parser.error("Audit evidence needs at least 50 cases")
         export_evidence(args.pool_dir, args.output_dir, args.cases, args.sample_seed)
     else:
-        report = evaluate_audit(args.pilot_dir, args.labels)
+        report = evaluate_audit(args.pilot_dir, args.labels, diagnostic=True)
+        (args.pilot_dir / "audit_diagnostics.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(
+            json.dumps(
+                {
+                    "stats": report["stats"],
+                    "label_comparison": report["label_comparison"],
+                    "passed": report["passed"],
+                    "blockers": report["blockers"],
+                },
+                indent=2,
+            )
+        )
+        if not report["passed"]:
+            parser.exit(1, "Audit did not pass; see audit_diagnostics.json\n")
         (args.pilot_dir / "audit_report.json").write_text(json.dumps(report, indent=2) + "\n")
-        print(json.dumps(report["stats"], indent=2))
 
 
 if __name__ == "__main__":

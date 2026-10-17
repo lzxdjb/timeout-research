@@ -40,6 +40,9 @@ def run_ppo(config, task_runner_class) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    from verl.trainer.ppo.v1.repeat_judge_queue import validate_deferred_config
+    validate_deferred_config(config)
+
     # Propagate determinism env vars from config before ray.init() so
     # get_ppo_ray_runtime_env() forwards them to all Ray actors.
     if config.actor_rollout_ref.actor.get("tool_failure_penalty_enabled", False):
@@ -169,7 +172,12 @@ class TaskRunnerV1:
                 if tracking is not None:
                     tracking.finish(exit_code=0 if succeeded else 1)
             finally:
-                tq.close()
+                try:
+                    close_repeat = getattr(self.agent_loop_manager, "close_repeat_coordinator", None)
+                    if close_repeat is not None:
+                        close_repeat()
+                finally:
+                    tq.close()
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
