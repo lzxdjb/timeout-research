@@ -1615,7 +1615,7 @@ def test_deferred_cutoff_counts_rollout_completion_but_waits_for_rewards(monkeyp
             state[partition_id].pop(key, None)
     monkeypatch.setattr(tq, "kv_clear", clear)
     monkeypatch.setattr(tq, "kv_list", lambda *args, **kwargs: state)
-    def wait(partition_id, last_debug_time):
+    def wait(partition_id, last_debug_time, sample_started=None):
         assert cancelled == ["tail"]
         polls.append(1)
         state["train"]["judging"]["status"] = "finished"

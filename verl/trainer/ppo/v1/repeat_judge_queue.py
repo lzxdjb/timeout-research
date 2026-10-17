@@ -67,19 +67,20 @@ def finalize_output(output, score, metadata):
 
 
 class RepeatJudgeCoordinator:
-    """One shared HTTP semaphore; reservations bound retained trajectory payloads.
+    """Bound accepted jobs without waiting for capacity in generation sessions.
 
-    Capacity wait occurs at producers *before* sending large public trajectories.
-    Ray actor failure is deliberately propagated rather than converted into a clean reward.
+    Queue-full submissions preserve the base reward with an uncertain verdict.
+    Actor failures still propagate. The shared client limits HTTP calls, while
+    job_slots keeps a bounded number of whole vote sequences active at once.
     """
 
     def __init__(self, config):
         self.config = config
         self.client = None
-        self.capacity = asyncio.Semaphore(config.max_pending)
-        self.reservations = set()
+        self.job_slots = asyncio.Semaphore(config.concurrency)
+        self.pending = set()
         self.running = set()
-        self.waiting = set()
+        self.counts = dict(submitted=0, accepted=0, completed=0, failed=0, cancelled=0, dropped=0)
         self.debug = _debug_bool("SWE_AGENT_REPEAT_JUDGE_DEBUG")
         self.debug_slow_seconds = _debug_slow_seconds()
         self._last_debug_snapshot = 0.0
@@ -87,17 +88,16 @@ class RepeatJudgeCoordinator:
             logger.info(
                 "Repeat judge debug startup endpoint=%s model=%s max_context=%s max_output=%s "
                 "timeout=%s queue_timeout=%s concurrency=%s vote_count=%s vote_quorum=%s max_pending=%s",
-                os.getenv("SWE_AGENT_REPEAT_JUDGE_URL", ""),
-                os.getenv("SWE_AGENT_REPEAT_JUDGE_MODEL", ""),
-                os.getenv("SWE_AGENT_REPEAT_JUDGE_MAX_CONTEXT", ""),
-                os.getenv("SWE_AGENT_REPEAT_JUDGE_MAX_OUTPUT", ""),
-                os.getenv("SWE_AGENT_REPEAT_JUDGE_TIMEOUT", ""),
-                os.getenv("SWE_AGENT_REPEAT_JUDGE_QUEUE_TIMEOUT", ""),
-                getattr(config, "concurrency", ""),
-                getattr(config, "vote_count", ""),
-                getattr(config, "vote_quorum", ""),
-                getattr(config, "max_pending", ""),
+                config.url, config.model, config.max_context, config.max_output,
+                config.timeout, config.queue_timeout, config.concurrency,
+                config.vote_count, config.vote_quorum, config.max_pending,
             )
+
+    def snapshot(self):
+        """Payload-free counters, also available for live actor diagnostics."""
+        return {**self.counts, "queued": len(self.pending - self.running),
+                "active": len(self.running), "pending": len(self.pending),
+                "capacity": self.config.max_pending - len(self.pending)}
 
     def _debug_snapshot(self, reason: str, force: bool = False) -> None:
         if not self.debug:
@@ -107,14 +107,8 @@ class RepeatJudgeCoordinator:
         if not force and now - self._last_debug_snapshot < interval:
             return
         self._last_debug_snapshot = now
-        logger.info(
-            "Repeat judge queue snapshot reason=%s reserved=%d running=%d waiting=%d capacity=%d",
-            reason,
-            len(self.reservations),
-            len(self.running),
-            len(self.waiting),
-            getattr(self.capacity, "_value", "unknown"),
-        )
+        logger.info("Repeat judge queue snapshot reason=%s %s", reason,
+                    " ".join(f"{key}={value}" for key, value in self.snapshot().items()))
 
     def _debug_duration(self, phase: str, job_id: str, started: float) -> None:
         if not self.debug:
@@ -128,54 +122,50 @@ class RepeatJudgeCoordinator:
         from recipe.swe_agent import repetition_reward as repeat
         self.client = repeat.get_client(self.config)
         if self.debug:
-            logger.info("Repeat judge debug preflight start endpoint=%s", os.getenv("SWE_AGENT_REPEAT_JUDGE_URL", ""))
+            logger.info("Repeat judge debug preflight start endpoint=%s", self.config.url)
         started = time.monotonic()
         await self.client.preflight()
         if self.debug:
             self._debug_duration("preflight", "startup", started)
             self._debug_snapshot("ready", force=True)
 
-    async def reserve(self, job_id):
-        started = time.monotonic()
-        if self.debug:
-            self.waiting.add(job_id)
-            logger.info("Repeat judge reservation requested job_id=%s reserved=%d running=%d waiting=%d",
-                        job_id, len(self.reservations), len(self.running), len(self.waiting))
-        try:
-            await self.capacity.acquire()
-        finally:
-            self.waiting.discard(job_id)
-        if job_id in self.reservations:
-            self.capacity.release()
-            raise RuntimeError("Duplicate repeat job reservation: " + job_id)
-        self.reservations.add(job_id)
-        admission = time.monotonic() - started
-        if self.debug:
-            self._debug_duration("reserve_wait", job_id, started)
-            self._debug_snapshot("reservation_acquired", force=admission >= self.debug_slow_seconds)
-        return admission
-
-    async def abandon(self, job_id):
-        if job_id in self.running:
-            raise RuntimeError("Cannot abandon a running repeat job")
-        if job_id in self.reservations:
-            self.reservations.remove(job_id)
-            self.capacity.release()
-        self._debug_snapshot("abandon", force=True)
-
-    async def evaluate(self, job_id, job, admission_seconds=0.0):
+    async def submit(self, job_id, job):
+        """Admit immediately or skip; the returned result is awaited by a finalizer."""
         from recipe.swe_agent import repetition_reward as repeat
 
-        if job_id not in self.reservations or job_id in self.running:
-            raise RuntimeError("Missing or duplicate repeat reservation: " + job_id)
-        self.running.add(job_id)
         started = time.monotonic()
-        if self.debug:
-            logger.info("Repeat judge evaluate start job_id=%s reserved=%d running=%d waiting=%d",
-                        job_id, len(self.reservations), len(self.running), len(self.waiting))
+        if job["config"] != self.config:
+            raise RuntimeError("Repeat coordinator configuration mismatch")
+        if job_id in self.pending:
+            raise RuntimeError("Duplicate repeat job: " + job_id)
+        self.counts["submitted"] += 1
+        job = {**job, "metadata": dict(job["metadata"])}
+        job["metadata"].update(repeat_reward_pending=0, repeat_reward_deferred=1)
+        # No await between the capacity check and registration: async actor
+        # submissions cannot race admission or create a producer-side waiter.
+        if len(self.pending) >= self.config.max_pending:
+            self.counts["dropped"] += 1
+            job["metadata"].update(repeat_reward_queue_full=1, repeat_reward_queue_accepted=0,
+                                   repeat_reward_judge_called=0, repeat_reward_stage=0,
+                                   repeat_reward_deferred_admission_seconds=0.0,
+                                   repeat_reward_deferred_job_queue_seconds=0.0)
+            self._debug_snapshot("queue_full", force=True)
+            score, metadata = await repeat.finish_repeat_reward(job, repeat.uncertain("repeat_queue_full"))
+            metadata["repeat_reward_deferred_wall_seconds"] = time.monotonic() - started
+            return job_id, score, metadata
+
+        self.pending.add(job_id)
+        self.counts["accepted"] += 1
+        admission_seconds = time.monotonic() - started
+        job["metadata"].update(repeat_reward_queue_full=0, repeat_reward_queue_accepted=1)
+        self._debug_snapshot("submitted")
+        acquired = False
         try:
-            if job["config"] != self.config:
-                raise RuntimeError("Repeat coordinator configuration mismatch")
+            await self.job_slots.acquire()
+            acquired = True
+            self.running.add(job_id)
+            queue_seconds = time.monotonic() - started
+            self._debug_snapshot("job_started")
             actor = job["actor_segments"]
             judge_started = time.monotonic()
             if self.debug:
@@ -188,7 +178,6 @@ class RepeatJudgeCoordinator:
                 logger.info("Repeat judge verdict job_id=%s verdict=%s queue_seconds=%.3f service_seconds=%.3f",
                             job_id, verdict.get("verdict", ""), float(verdict.get("queue_seconds", 0.0)),
                             float(verdict.get("service_seconds", 0.0)))
-            job = {**job, "metadata": dict(job["metadata"])}
             job["metadata"].update(
                 repeat_reward_judge_called=1, repeat_reward_stage=2,
                 repeat_reward_pending=0, repeat_reward_deferred=1,
@@ -196,20 +185,27 @@ class RepeatJudgeCoordinator:
             score, metadata = await repeat.finish_repeat_reward(job, verdict)
             metadata.update(
                 repeat_reward_deferred_admission_seconds=admission_seconds,
+                repeat_reward_deferred_job_queue_seconds=queue_seconds,
                 repeat_reward_deferred_wall_seconds=time.monotonic() - started,
                 repeat_reward_deferred_request_queue_seconds=verdict.get("queue_seconds", 0.0),
                 repeat_reward_deferred_service_seconds=verdict.get("service_seconds", 0.0),
             )
+            self.counts["completed"] += 1
             return job_id, score, metadata
+        except asyncio.CancelledError:
+            self.counts["cancelled"] += 1
+            raise
         except Exception as error:
+            self.counts["failed"] += 1
             if self.debug:
                 logger.warning("Repeat judge evaluate error job_id=%s type=%s message=%s",
                                job_id, type(error).__name__, str(error)[:240])
             raise
         finally:
-            self.running.remove(job_id)
-            self.reservations.remove(job_id)
-            self.capacity.release()
+            self.running.discard(job_id)
+            self.pending.remove(job_id)
+            if acquired:
+                self.job_slots.release()
             if self.debug:
                 self._debug_duration("evaluate_total", job_id, started)
                 self._debug_snapshot("evaluation_released", force=True)

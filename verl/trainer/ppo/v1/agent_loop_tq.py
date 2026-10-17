@@ -433,36 +433,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 raise RepeatQueueError("Deferred repeat rewards require a configured coordinator and one SWE output")
             job = outputs[0].extra_fields.pop("_swe_repeat_job")
             job_id = f"{kwargs['global_steps']}:{'val' if validate else 'train'}:{uid}:{session_id}:{uuid4().hex}"
-            self._repeat_debug_event("repeat_reservation_requested", partition_id, str(uid),
-                                     session=session_id, job_id=job_id)
-            # Shield admission so cancellation cannot leak a reservation. If cutoff
-            # arrives during backpressure, finish handoff and retain this completed output.
-            reservation = asyncio.ensure_future(self.repeat_coordinator.reserve.remote(job_id))
-            cancelled = False
+            # Admission and inference both belong to the coordinator. Do not await
+            # either here: even a full queue must release this generation session.
             try:
-                try:
-                    admission = await asyncio.shield(reservation)
-                except asyncio.CancelledError:
-                    admission = await reservation
-                    cancelled = True
+                ref = self.repeat_coordinator.submit.remote(job_id, job)
             except Exception as error:
-                raise RepeatQueueError("Repeat queue admission failed") from error
-            self._repeat_debug_event("repeat_reservation_acquired", partition_id, str(uid),
-                                     session=session_id, job_id=job_id, seconds=admission)
-            try:
-                ref = self.repeat_coordinator.evaluate.remote(job_id, job, admission)
-            except Exception as error:
-                try:
-                    await self.repeat_coordinator.abandon.remote(job_id)
-                except Exception:
-                    logger.exception("Failed to release repeat reservation %s", job_id)
                 raise RepeatQueueError("Repeat queue handoff failed") from error
-            self._repeat_debug_event("judge_rpc_submitted", partition_id, str(uid),
+            self._repeat_debug_event("repeat_job_submitted", partition_id, str(uid),
                                      session=session_id, job_id=job_id)
             task = asyncio.create_task(self._finalize_repeat(ref, job_id, outputs[0], validate, kwargs))
             self.repeat_finalizers[("val" if validate else "train", str(uid))].append(task)
-            if cancelled:
-                raise asyncio.CancelledError
             self._repeat_debug_event("postprocess_handoff_complete", partition_id, str(uid),
                                      session=session_id, seconds=time.monotonic() - postprocess_started)
             return

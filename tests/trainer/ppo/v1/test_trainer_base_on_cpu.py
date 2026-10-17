@@ -229,7 +229,8 @@ def test_rollout_debug_dump_keeps_sorted_row_alignment(tmp_path, persisted):
     )
 
 
-def test_advantage_queue_write_preserves_exclusion_codes_and_loss_mask(monkeypatch):
+@pytest.mark.parametrize("repeat_metrics", [False, True])
+def test_advantage_queue_write_preserves_exclusion_codes_and_loss_mask(monkeypatch, repeat_metrics):
     trainer = _StubTrainer.__new__(_StubTrainer)
     trainer.timeout_prediction_enabled = False
     trainer.config = OmegaConf.create({
@@ -246,7 +247,11 @@ def test_advantage_queue_write_preserves_exclusion_codes_and_loss_mask(monkeypat
                 torch.tensor([0.0, float(i % 2)]) for i in range(6)
             ], layout=torch.jagged),
             "extra_fields": [
-                {"reward_extra_info": {"observed_infrastructure_failure": int(i == 2)}} for i in range(6)
+                {"reward_extra_info": {
+                    "observed_infrastructure_failure": int(i == 2),
+                    **({"repeat_reward_queue_full": int(i == 3), "repeat_reward_queue_accepted": int(i != 3),
+                        "repeat_reward_deferred_job_queue_seconds": float(i)} if repeat_metrics and i >= 2 else {}),
+                }} for i in range(6)
             ],
         },
     )
@@ -270,6 +275,14 @@ def test_advantage_queue_write_preserves_exclusion_codes_and_loss_mask(monkeypat
     assert output["train_exclusion_code"].tolist() == [2, 2, 16, 16, 0, 0]
     assert output["train_sample_mask"].tolist() == [False, False, False, False, True, True]
     assert metrics["grpo/mixed_groups"] == 3
+    if repeat_metrics:
+        assert metrics["repeat_queue/queue_full_count"] == 1
+        assert metrics["repeat_queue/queue_full_fraction"] == .25
+        assert metrics["repeat_queue/queue_accepted_count"] == 3
+        assert metrics["repeat_queue/job_queue_seconds_mean"] == 3.5
+        assert metrics["repeat_queue/job_queue_seconds_max"] == 5.
+    else:
+        assert not any(key.startswith("repeat_queue/") for key in metrics)
 
 
 @pytest.mark.parametrize("retained", [False, True])

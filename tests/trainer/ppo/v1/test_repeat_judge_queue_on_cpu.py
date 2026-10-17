@@ -2,7 +2,6 @@
 import asyncio
 import copy
 import logging
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -35,14 +34,13 @@ def test_deferred_and_inline_finalization_identical(monkeypatch, validation, bas
         inline_job = copy.deepcopy(job)
         inline_job["metadata"].update(repeat_reward_judge_called=1, repeat_reward_stage=2)
         inline_score, inline_meta = await repeat.finish_repeat_reward(inline_job, await queue.client.judge_consensus())
-        admission = await queue.reserve("sample")
-        identity, score, meta = await queue.evaluate("sample", job, admission)
+        identity, score, meta = await queue.submit("sample", job)
         assert identity == "sample" and score == inline_score
         for key, value in inline_meta.items():
             assert meta[key] == value
         assert meta["repeat_reward_pending"] == 0
         assert meta["repeat_reward_deferred_request_queue_seconds"] == 2
-        assert not queue.reservations and not queue.running
+        assert not queue.pending and not queue.running
     monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
     asyncio.run(run())
 
@@ -51,28 +49,29 @@ def test_bounded_admission_duplicates_and_failure_release(monkeypatch):
     async def run():
         config = repeat.RepeatConfig(max_pending=1)
         queue = RepeatJudgeCoordinator(config)
+        entered, release = asyncio.Event(), asyncio.Event()
         class Client:
             async def judge_consensus(self, *args, **kwargs):
+                entered.set()
+                await release.wait()
                 raise RuntimeError("coordinator processing failed")
         queue.client = Client()
-        await queue.reserve("first")
-        pending = asyncio.create_task(queue.reserve("second"))
-        await asyncio.sleep(0)
-        assert not pending.done()
-        with pytest.raises(RuntimeError, match="processing failed"):
-            await queue.evaluate("first", make_job(config))
-        await pending
-        await queue.abandon("second")
-        await queue.reserve("first")
-        await queue.abandon("first")
-        with pytest.raises(RuntimeError, match="Missing or duplicate"):
-            await queue.evaluate("first", make_job(config))
-        config2 = replace(config, max_pending=2)
-        other = RepeatJudgeCoordinator(config2)
-        await other.reserve("same")
+        first = asyncio.create_task(queue.submit("first", make_job(config)))
+        await entered.wait()
         with pytest.raises(RuntimeError, match="Duplicate"):
-            await other.reserve("same")
-        await other.abandon("same")
+            await queue.submit("first", make_job(config))
+        result = await asyncio.wait_for(queue.submit("second", make_job(config)), timeout=2)
+        assert result[1] == 1. and result[2]["repeat_reward_queue_full"] == 1
+        assert queue.snapshot()["pending"] == 1
+        assert queue.snapshot()["dropped"] == 1
+        release.set()
+        with pytest.raises(RuntimeError, match="processing failed"):
+            await first
+        assert queue.snapshot()["capacity"] == 1 and queue.snapshot()["failed"] == 1
+        with pytest.raises(RuntimeError, match="processing failed"):
+            await queue.submit("third", make_job(config))
+        assert queue.snapshot()["failed"] == 2
+    monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
     asyncio.run(run())
 
 
@@ -93,10 +92,103 @@ def test_one_request_semaphore_across_independent_jobs(monkeypatch):
         monkeypatch.setattr(queue.client, "judge", fake_request)
         async def job(i):
             key = str(i)
-            await queue.reserve(key)
-            return await queue.evaluate(key, make_job(config))
+            return await queue.submit(key, make_job(config))
         results = await asyncio.gather(*(job(i) for i in range(8)))
         assert len(results) == 8 and peak == 2
+    monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("validation", [False, True])
+@pytest.mark.parametrize("base", [1., 0., -.1])
+def test_queue_full_preserves_base_and_audits_uncertain(monkeypatch, base, validation):
+    async def run():
+        config = repeat.RepeatConfig(mode="apply", reward_scope="all_valid", max_pending=1)
+        queue = RepeatJudgeCoordinator(config)
+        entered, release = asyncio.Event(), asyncio.Event()
+        class Client:
+            async def judge_consensus(self, *args, **kwargs):
+                entered.set()
+                await release.wait()
+                return {"verdict": "repetitive", "reason": "fixture"}
+        queue.client = Client()
+        first = asyncio.create_task(queue.submit("first", make_job(config)))
+        await entered.wait()
+        job = make_job(config, base, validation)
+        before = copy.deepcopy(job)
+        _, score, metadata = await asyncio.wait_for(queue.submit("full", job), timeout=2)
+        assert job == before
+        assert score == base and metadata["repeat_reward_queue_full"] == 1
+        assert metadata["repeat_reward_queue_accepted"] == 0
+        assert metadata["repeat_reward_pending"] == 0 and metadata["repeat_reward_judge_called"] == 0
+        assert metadata["repeat_reward_stage"] == 0 and metadata["repeat_reward_uncertain"] == 1
+        assert metadata["repeat_reward_applied"] == metadata["repeat_reward_would_apply"] == 0
+        assert "repeat_queue_full" in metadata["repeat_reward_verdict_json"]
+        release.set()
+        await first
+        assert queue.snapshot()["pending"] == 0 and queue.snapshot()["completed"] == 1
+    monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
+    asyncio.run(run())
+
+
+def test_job_queue_cancel_and_failure_do_not_leak_capacity(monkeypatch):
+    async def run():
+        config = repeat.RepeatConfig(max_pending=2, concurrency=1)
+        queue = RepeatJudgeCoordinator(config)
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = 0
+        class Client:
+            async def judge_consensus(self, *args, **kwargs):
+                nonlocal calls
+                calls += 1
+                entered.set()
+                await release.wait()
+                return {"verdict": "clean", "reason": "fixture"}
+        queue.client = Client()
+        running = asyncio.create_task(queue.submit("running", make_job(config)))
+        await entered.wait()
+        queued = asyncio.create_task(queue.submit("queued", make_job(config)))
+        await asyncio.sleep(0)
+        snapshot = queue.snapshot()
+        assert snapshot["active"] == 1 and snapshot["queued"] == 1 and snapshot["capacity"] == 0
+        assert calls == 1
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        assert queue.snapshot()["capacity"] == 1 and queue.snapshot()["queued"] == 0
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        assert queue.snapshot()["capacity"] == 2 and queue.snapshot()["cancelled"] == 2
+        release.set()
+        await queue.submit("replacement", make_job(config))
+        assert calls == 2 and queue.snapshot()["completed"] == 1
+    monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
+    asyncio.run(run())
+
+
+def test_accepted_job_waits_internally_then_runs(monkeypatch):
+    async def run():
+        config = repeat.RepeatConfig(max_pending=2, concurrency=1)
+        queue = RepeatJudgeCoordinator(config)
+        entered, release = asyncio.Event(), asyncio.Event()
+        class Client:
+            async def judge_consensus(self, *args, **kwargs):
+                entered.set()
+                await release.wait()
+                return {"verdict": "clean", "reason": "fixture"}
+        queue.client = Client()
+        first = asyncio.create_task(queue.submit("first", make_job(config)))
+        await entered.wait()
+        second = asyncio.create_task(queue.submit("second", make_job(config)))
+        await asyncio.sleep(0)
+        assert not second.done() and queue.snapshot()["queued"] == 1
+        release.set()
+        results = await asyncio.gather(first, second)
+        assert [result[0] for result in results] == ["first", "second"]
+        assert all(result[2]["repeat_reward_queue_accepted"] == 1 for result in results)
+        assert results[1][2]["repeat_reward_deferred_job_queue_seconds"] > 0
+        assert queue.snapshot()["capacity"] == 2 and queue.snapshot()["completed"] == 2
     monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
     asyncio.run(run())
 
@@ -124,6 +216,9 @@ def test_feature_default_config_validation_and_forwarding(monkeypatch):
     monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEFERRED_ENABLED", "1")
     assert repeat.RepeatConfig.from_env().deferred_enabled
     assert get_ppo_ray_runtime_env()["env_vars"]["SWE_AGENT_REPEAT_JUDGE_DEFERRED_ENABLED"] == "1"
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_MAX_PENDING", "1024")
+    assert repeat.RepeatConfig.from_env().max_pending == 1024
+    assert get_ppo_ray_runtime_env()["env_vars"]["SWE_AGENT_REPEAT_JUDGE_MAX_PENDING"] == "1024"
     validate_deferred_config(config)
     config.trainer.v1.trainer_mode = "async"
     with pytest.raises(ValueError, match="sync"):
@@ -195,12 +290,10 @@ def test_worker_returns_after_handoff_and_publishes_only_final_reward(monkeypatc
         worker, store, publications = worker_harness(monkeypatch)
         config = repeat.RepeatConfig(deferred_enabled=True)
         complete = asyncio.Event()
-        async def reserve(job_id):
-            return 0.
-        async def evaluate(job_id, job, admission):
+        async def submit(job_id, job):
             await complete.wait()
             return job_id, .1, {"repeat_reward_pending": 0}
-        worker.repeat_coordinator = SimpleNamespace(reserve=RemoteMethod(reserve), evaluate=RemoteMethod(evaluate))
+        worker.repeat_coordinator = SimpleNamespace(submit=RemoteMethod(submit))
         worker.repeat_finalizers[("train", "u")] = []
         worker.repeat_generation_sessions[("train", "u")] = (1, set())
         await worker._agent_loop_postprocess(fake_output(config), False, uid="u", session_id=0, global_steps=0)
@@ -222,13 +315,11 @@ def test_cutoff_cancels_unfinished_generation_but_drains_retained_judgment(monke
         finish_judge = asyncio.Event()
         long_generation_started = asyncio.Event()
         generation_cancelled = asyncio.Event()
-        async def reserve(job_id):
-            return 0.
-        async def evaluate(job_id, job, admission):
+        async def submit(job_id, job):
             judging.set()
             await finish_judge.wait()
             return job_id, .1, {"repeat_reward_pending": 0}
-        worker.repeat_coordinator = SimpleNamespace(reserve=RemoteMethod(reserve), evaluate=RemoteMethod(evaluate))
+        worker.repeat_coordinator = SimpleNamespace(submit=RemoteMethod(submit))
         async def session(params, *, session_id, **kwargs):
             if session_id == 1:
                 long_generation_started.set()
@@ -257,26 +348,26 @@ def test_cutoff_cancels_unfinished_generation_but_drains_retained_judgment(monke
     asyncio.run(run())
 
 
-def test_backpressure_completed_generation_is_protected_from_cutoff(monkeypatch):
+def test_pending_submission_does_not_block_generation_and_is_protected_from_cutoff(monkeypatch):
     async def run():
         worker, store, publications = worker_harness(monkeypatch)
-        capacity = asyncio.Event()
-        entered = asyncio.Event()
+        capacity, entered, generation_returned = asyncio.Event(), asyncio.Event(), asyncio.Event()
         config = repeat.RepeatConfig(deferred_enabled=True)
-        async def reserve(job_id):
+        async def submit(job_id, job):
             entered.set()
             await capacity.wait()
-            return 1.
-        async def evaluate(job_id, job, admission):
             return job_id, .1, {"repeat_reward_pending": 0}
-        worker.repeat_coordinator = SimpleNamespace(reserve=RemoteMethod(reserve), evaluate=RemoteMethod(evaluate))
+        worker.repeat_coordinator = SimpleNamespace(submit=RemoteMethod(submit))
         async def session(*args, **kwargs):
             await worker._agent_loop_postprocess(fake_output(config), False, uid="u", session_id=0, global_steps=0)
+            generation_returned.set()
         worker._run_agent_loop = session
         prompt_task = asyncio.create_task(worker._run_prompt({"uid": "u"}, {}, {"validate": False}))
         worker.prompt_tasks["train"]["u"] = prompt_task
+        await asyncio.wait_for(generation_returned.wait(), timeout=2)
         await entered.wait()
         assert store["train"]["u"]["generation_complete"]
+        assert not prompt_task.done() and not publications
         assert await worker.cancel_sequences(["u"]) == 0
         capacity.set()
         await prompt_task
@@ -326,10 +417,9 @@ def test_real_swe_preparation_keeps_stage1_inline_and_releases_before_queue(monk
 def test_worker_queue_loss_is_terminal_error(monkeypatch):
     async def run():
         worker, store, publications = worker_harness(monkeypatch)
-        async def reserve(job_id): return 0.
-        async def evaluate(job_id, job, admission):
+        async def submit(job_id, job):
             raise RuntimeError("actor unavailable")
-        worker.repeat_coordinator = SimpleNamespace(reserve=RemoteMethod(reserve), evaluate=RemoteMethod(evaluate))
+        worker.repeat_coordinator = SimpleNamespace(submit=RemoteMethod(submit))
         async def session(*args, **kwargs):
             await worker._agent_loop_postprocess(fake_output(repeat.RepeatConfig()), False,
                                                 uid="u", session_id=0, global_steps=0)
@@ -340,26 +430,32 @@ def test_worker_queue_loss_is_terminal_error(monkeypatch):
     asyncio.run(run())
 
 
-def test_debug_queue_reports_reservation_backpressure(monkeypatch, caplog):
+def test_debug_queue_reports_full_fallback_and_parsed_startup(monkeypatch, caplog):
     async def run():
-        config = repeat.RepeatConfig(max_pending=1)
+        config = repeat.RepeatConfig(max_pending=1, concurrency=1)
         queue = RepeatJudgeCoordinator(config)
-        await queue.reserve("first")
-        blocked = asyncio.create_task(queue.reserve("second"))
-        await asyncio.sleep(0)
-        assert not blocked.done()
-        await queue.abandon("first")
-        assert await blocked >= 0
-        await queue.abandon("second")
+        entered, release = asyncio.Event(), asyncio.Event()
+        class Client:
+            async def judge_consensus(self, *args, **kwargs):
+                entered.set()
+                await release.wait()
+                return {"verdict": "clean", "reason": "fixture"}
+        queue.client = Client()
+        task = asyncio.create_task(queue.submit("first", make_job(config)))
+        await entered.wait()
+        await queue.submit("second", make_job(config))
+        release.set()
+        await task
 
     monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG", "1")
-    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG_SLOW_SECONDS", "0")
+    monkeypatch.delenv("SWE_AGENT_REPEAT_JUDGE_MODEL", raising=False)
+    monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
     caplog.set_level(logging.INFO, logger="verl.trainer.ppo.v1.repeat_judge_queue")
     asyncio.run(run())
     messages = [record.getMessage() for record in caplog.records]
-    assert any("reservation requested job_id=second" in message for message in messages)
-    assert any("phase=reserve_wait job_id=second" in message for message in messages)
-    assert any("queue snapshot reason=reservation_acquired" in message for message in messages)
+    assert any("model=swe-repeat-judge" in message for message in messages)
+    assert any("reason=queue_full" in message and "dropped=1" in message for message in messages)
+    assert any("capacity=0" in message for message in messages)
 
 
 def test_debug_queue_reports_judge_rpc_and_verdict(monkeypatch, caplog):
@@ -375,8 +471,7 @@ def test_debug_queue_reports_judge_rpc_and_verdict(monkeypatch, caplog):
                 return {"verdict": "clean", "reason": "fixture", "queue_seconds": 0.5, "service_seconds": 1.5}
 
         queue.client = Client()
-        await queue.reserve("judge")
-        task = asyncio.create_task(queue.evaluate("judge", make_job(config)))
+        task = asyncio.create_task(queue.submit("judge", make_job(config)))
         await started.wait()
         release.set()
         await task
@@ -398,15 +493,12 @@ def test_debug_lifecycle_identifies_delayed_finalization(monkeypatch, caplog):
         config = repeat.RepeatConfig(deferred_enabled=True)
         release = asyncio.Event()
 
-        async def reserve(job_id):
-            return 0.0
-
-        async def evaluate(job_id, job, admission):
+        async def submit(job_id, job):
             await release.wait()
             return job_id, 0.1, {"repeat_reward_pending": 0}
 
         worker.repeat_coordinator = SimpleNamespace(
-            reserve=RemoteMethod(reserve), evaluate=RemoteMethod(evaluate)
+            submit=RemoteMethod(submit)
         )
         worker.repeat_finalizers[("train", "u")] = []
         worker.repeat_generation_sessions[("train", "u")] = (1, set())
@@ -436,10 +528,7 @@ def test_debug_lifecycle_identifies_delayed_transfer_queue_publication(monkeypat
         config = repeat.RepeatConfig(deferred_enabled=True)
         entered, release = asyncio.Event(), asyncio.Event()
 
-        async def reserve(job_id):
-            return 0.0
-
-        async def evaluate(job_id, job, admission):
+        async def submit(job_id, job):
             return job_id, 0.1, {"repeat_reward_pending": 0}
 
         async def delayed_batch_put(*args, **kwargs):
@@ -449,7 +538,7 @@ def test_debug_lifecycle_identifies_delayed_transfer_queue_publication(monkeypat
 
         monkeypatch.setattr(module.tq, "async_kv_batch_put", delayed_batch_put)
         worker.repeat_coordinator = SimpleNamespace(
-            reserve=RemoteMethod(reserve), evaluate=RemoteMethod(evaluate)
+            submit=RemoteMethod(submit)
         )
         worker.repeat_finalizers[("train", "u")] = []
         worker.repeat_generation_sessions[("train", "u")] = (1, set())

@@ -2396,7 +2396,7 @@ class PPOTrainer(ABC):
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         extra_fields = data.pop("extra_fields").tolist()
-        for field in ("admission_seconds", "wall_seconds", "request_queue_seconds", "service_seconds"):
+        for field in ("admission_seconds", "job_queue_seconds", "wall_seconds", "request_queue_seconds", "service_seconds"):
             key = "repeat_reward_deferred_" + field
             durations = [extra["reward_extra_info"].get(key) for extra in extra_fields
                          if isinstance(extra, dict) and isinstance(extra.get("reward_extra_info"), dict)]
@@ -2404,6 +2404,13 @@ class PPOTrainer(ABC):
             if durations:
                 metrics[f"repeat_queue/{field}_mean"] = float(np.mean(durations))
                 metrics[f"repeat_queue/{field}_max"] = max(durations)
+        for field in ("queue_full", "queue_accepted"):
+            values = [extra["reward_extra_info"].get("repeat_reward_" + field) for extra in extra_fields
+                      if isinstance(extra, dict) and isinstance(extra.get("reward_extra_info"), dict)]
+            values = [int(value) for value in values if value is not None]
+            if values:
+                metrics[f"repeat_queue/{field}_count"] = sum(values)
+                metrics[f"repeat_queue/{field}_fraction"] = float(np.mean(values))
         direct_fields = {}
         if _task_filter_enabled() or self.timeout_prediction_enabled or tool_failure_enabled:
             for field in (
