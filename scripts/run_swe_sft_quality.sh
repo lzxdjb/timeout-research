@@ -11,6 +11,9 @@ common=(--quality-filter sft-judge --source-manifest "$source_manifest"
   --max-tool-dispatches 120 --relaxed-max-tool-dispatches 120
   --judge-vote-count 8
   --judge-cache-dir "$output_root/judge_cache" --rl-reference-parquet "$rl_reference")
+if [[ "${SWE_SFT_ALLOW_UNAUDITED_PILOT:-0}" == "1" ]]; then
+  common+=(--allow-unaudited-pilot)
+fi
 # Pilot and full must use the same prepared file list even while RL adds files.
 if [[ -f "$output_root/pilot/sources.json" ]]; then
   common+=(--source-snapshot "$output_root/pilot/sources.json")
@@ -32,6 +35,7 @@ case "$action" in
     exec "$python_bin" -m scripts.swe_sft_filter_audit check --pilot-dir "$output_root/pilot" --labels "$1" ;;
   full)
     audit_dir="$output_root/pilot"
+    allow_unaudited="${SWE_SFT_ALLOW_UNAUDITED_PILOT:-0}"
     next_is_audit_dir=false
     for option in "$@"; do
       if $next_is_audit_dir; then
@@ -39,12 +43,13 @@ case "$action" in
         next_is_audit_dir=false
       else
         case "$option" in
+          --allow-unaudited-pilot) allow_unaudited=1 ;;
           --audited-pilot-dir) next_is_audit_dir=true ;;
           --audited-pilot-dir=*) audit_dir="${option#*=}" ;;
         esac
       fi
     done
-    if [[ ! -f "$audit_dir/audit_report.json" ]]; then
+    if [[ ! -f "$audit_dir/audit_report.json" && "$allow_unaudited" != "1" ]]; then
       cat >&2 <<EOF
 Cannot start full filtering: missing $audit_dir/audit_report.json
 Effective output root: $output_root
@@ -53,11 +58,15 @@ Run pilot with this root, independently label every pilot case (at least 50),
 then run: bash scripts/run_swe_sft_quality.sh check /absolute/path/pilot_labels.jsonl
 If using --audited-pilot-dir, validate that pilot with scripts.swe_sft_filter_audit check.
 The small calibration set cannot satisfy the full-run audit requirement.
+To explicitly proceed without the audit, pass --allow-unaudited-pilot.
 No source scan or judge request was started by this invocation.
 EOF
       exit 2
     fi
-    exec "$python_bin" scripts/make_swe_sft_data.py "${common[@]}" \
-      --output-dir "$output_root/full" --audited-pilot-dir "$output_root/pilot" "$@" ;;
+    full_args=("${common[@]}" --output-dir "$output_root/full")
+    if [[ "$allow_unaudited" != "1" ]]; then
+      full_args+=(--audited-pilot-dir "$audit_dir")
+    fi
+    exec "$python_bin" scripts/make_swe_sft_data.py "${full_args[@]}" "$@" ;;
   *) echo 'Usage: run_swe_sft_quality.sh {prepare|evidence|pilot|check LABELS.jsonl|full} [options]' >&2; exit 2 ;;
 esac

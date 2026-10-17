@@ -621,7 +621,7 @@ async def filter_pool(args, db, stats, fingerprint):
 
     config = judge_config(args)
     client = SFTJudgeClient(config)
-    if not args.pilot_cases and args.audited_pilot_dir is None:
+    if not args.pilot_cases and args.audited_pilot_dir is None and not args.allow_unaudited_pilot:
         raise ValueError("Full SFT filtering requires --audited-pilot-dir with >=50 audited pilot cases")
     async with asyncio.timeout(min(config.timeout, 30)):
         await client.preflight()  # No synthetic fallback if the model is unavailable.
@@ -641,7 +641,7 @@ async def filter_pool(args, db, stats, fingerprint):
     queue = asyncio.Queue()
     for task in tasks:
         queue.put_nowait(task)
-    if not args.pilot_cases:
+    if not args.pilot_cases and not args.allow_unaudited_pilot:
         verify_pilot_audit(args.audited_pilot_dir, fingerprint, config_key)
     # Pool counters are durable; execution counters are specific to this run.
     stats = collections.Counter({k: v for k, v in stats.items() if not k.startswith("quality_")})
@@ -794,7 +794,13 @@ async def filter_pool(args, db, stats, fingerprint):
             model_cases=stats["quality_stage_model"],
         ),
     }
-    if not args.pilot_cases:
+    if not args.pilot_cases and args.allow_unaudited_pilot:
+        report["audit_readiness"] = {
+            "full_filter_gate_satisfied": False,
+            "unaudited_override": True,
+            "reason": "Full filtering explicitly enabled without an independent >=50-case audit",
+        }
+    elif not args.pilot_cases:
         report["audit_readiness"] = {
             "full_filter_gate_satisfied": True,
             "audited_pilot_dir": str(args.audited_pilot_dir),
@@ -812,14 +818,23 @@ def build_candidates(args):
     db = None
     try:
         judge_config(args)  # Validate before scanning sources.
-        if not args.prepare_only and not args.pilot_cases and args.audited_pilot_dir is None:
+        if (
+            not args.prepare_only
+            and not args.pilot_cases
+            and args.audited_pilot_dir is None
+            and not args.allow_unaudited_pilot
+        ):
             raise ValueError("Full SFT filtering requires --audited-pilot-dir with >=50 audited pilot cases")
         db, stats, fingerprint = prepare_pool(args)
         if args.prepare_only:
             print(json.dumps({"prepared_only": True, "fingerprint": fingerprint, "stats": dict(stats)}, indent=2))
             write_run_status(args, "prepared", stats=dict(stats))
             return None
-        write_run_status(args, "pilot_running" if args.pilot_cases else "filter_running")
+        write_run_status(
+            args,
+            "pilot_running" if args.pilot_cases else "filter_running",
+            unaudited_override=bool(not args.pilot_cases and args.allow_unaudited_pilot),
+        )
         return asyncio.run(filter_pool(args, db, stats, fingerprint))
     except BaseException as exc:
         write_run_status(
@@ -848,6 +863,11 @@ def add_arguments(parser):
     )
     parser.add_argument(
         "--audited-pilot-dir", type=Path, help="Required for full model filtering; pilot with >=50 audited cases"
+    )
+    parser.add_argument(
+        "--allow-unaudited-pilot",
+        action="store_true",
+        help="Explicitly run full filtering without the independent >=50-case audit; recorded as unaudited",
     )
     parser.add_argument("--sample-seed", default="sft-pilot-v1")
     parser.add_argument("--judge-url", default=os.getenv("SWE_SFT_JUDGE_URL", "http://127.0.0.1:18090"))

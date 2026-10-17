@@ -36,6 +36,13 @@ DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
 GOLDEN_REPLAY_PARTITION = "golden_replay"
 
 
+def _repeat_debug_enabled() -> bool:
+    value = os.getenv("SWE_AGENT_REPEAT_JUDGE_DEBUG", "0").lower()
+    if value not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+        raise ValueError("SWE_AGENT_REPEAT_JUDGE_DEBUG must be a boolean")
+    return value in {"1", "true", "yes", "on"}
+
+
 def rollout_diagnostics(extra) -> dict:
     """Versioned nonsecret metadata shared by rollout dumps and discard evidence."""
     extra = getattr(extra, "data", extra)
@@ -464,6 +471,7 @@ class ReplayBuffer:
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
         self.pending_keys: dict[str, set] = defaultdict(set)
         self.running_keys: dict[str, set] = defaultdict(set)
+        self.generation_complete_keys: dict[str, set] = defaultdict(set)
         # Generation + hidden evaluation are complete; final repeat reward is not.
         # Count as inflight for sampling/draining, but not for generation cutoff.
         self.reward_pending_keys: dict[str, set] = defaultdict(set)
@@ -736,6 +744,7 @@ class ReplayBuffer:
         self.partitions.clear()
         self.pending_keys.clear()
         self.running_keys.clear()
+        self.generation_complete_keys.clear()
         self.reward_pending_keys.clear()
         self.finished_keys.clear()
         self.failure_keys.clear()
@@ -758,11 +767,13 @@ class ReplayBuffer:
                         case "running":
                             self.running_keys[partition_id].add(key)
                             if tag.get("generation_complete", False):
+                                self.generation_complete_keys[partition_id].add(key)
                                 self.reward_pending_keys[partition_id].add(key)
                         case "reward_pending":
                             if self.trainer_mode != "sync":
                                 raise RuntimeError("Deferred repeat rewards support only synchronous sampling")
                             self.running_keys[partition_id].add(key)
+                            self.generation_complete_keys[partition_id].add(key)
                             self.reward_pending_keys[partition_id].add(key)
                         case "reward_error":
                             raise RuntimeError(f"Deferred repeat reward failed for {key}: {tag.get('repeat_error', '')}")
@@ -805,6 +816,7 @@ class ReplayBuffer:
             del self.partitions[partition_id][key]
         for status_keys in (self.pending_keys, self.running_keys, self.finished_keys, self.failure_keys):
             status_keys[partition_id].difference_update(uids)
+        self.generation_complete_keys[partition_id].difference_update(uids)
         self.completion_ratio_cutoff_keys[partition_id].difference_update(uids)
         self.reward_pending_keys[partition_id].difference_update(uids)
         for uid in uids:
@@ -1144,15 +1156,40 @@ class ReplayBuffer:
                 tags.append(tag)
         return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
-    def _wait_for_next_poll(self, partition_id: str, last_debug_time: float) -> float:
+    def _wait_for_next_poll(
+        self, partition_id: str, last_debug_time: float, sample_started: float | None = None
+    ) -> float:
         time.sleep(self.poll_interval)
         now = time.time()
+        if _repeat_debug_enabled() and now - last_debug_time > VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS:
+            blocked_only_rewards = bool(self.reward_pending_keys[partition_id]) and not (
+                (self.pending_keys[partition_id] | self.running_keys[partition_id])
+                - self.reward_pending_keys[partition_id]
+            )
+            logger.info(
+                "Repeat replay wait partition=%s sample_wait_seconds=%.3f pending=%d running=%d "
+                "generation_complete=%d reward_pending=%d finished=%d failure=%d blocked_only_rewards=%s "
+                "blocked_uid_samples=%s",
+                partition_id,
+                (time.monotonic() - sample_started) if sample_started is not None else 0.0,
+                len(self.pending_keys[partition_id]),
+                len(self.running_keys[partition_id]),
+                len(self.generation_complete_keys[partition_id]),
+                len(self.reward_pending_keys[partition_id]),
+                len(self.finished_keys[partition_id]),
+                len(self.failure_keys[partition_id]),
+                blocked_only_rewards,
+                sorted(self.reward_pending_keys[partition_id])[:5] if blocked_only_rewards else [],
+            )
+            return now
         if now - last_debug_time > VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS:
             logger.info(
-                f"pending: {len(self.pending_keys[partition_id])}, "
-                f"running: {len(self.running_keys[partition_id])}, "
-                f"finished: {len(self.finished_keys[partition_id])}, "
-                f"failure: {len(self.failure_keys[partition_id])}"
+                "Replay wait partition=%s pending=%d running=%d finished=%d failure=%d",
+                partition_id,
+                len(self.pending_keys[partition_id]),
+                len(self.running_keys[partition_id]),
+                len(self.finished_keys[partition_id]),
+                len(self.failure_keys[partition_id]),
             )
             return now
         return last_debug_time
@@ -1262,7 +1299,11 @@ class ReplayBuffer:
             KVBatchMeta: A batch of data.
             dict: Auxiliary metrics.
         """
+        sample_started = time.monotonic()
         last_debug_time = time.time()
+        if _repeat_debug_enabled():
+            logger.info("Repeat replay sample_start partition=%s global_step=%s batch_size=%s",
+                        partition_id, global_steps, batch_size)
         eviction_metrics: dict = {}
         dapo_enabled = partition_id != "val" and self.filter_groups_metric is not None
         refill_credit = 0
@@ -1363,7 +1404,7 @@ class ReplayBuffer:
                 - self.reward_pending_keys[partition_id]
             )
             wait_started = time.monotonic()
-            last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
+            last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time, sample_started)
             if reward_only:
                 reward_only_wait_seconds += time.monotonic() - wait_started
 
@@ -1377,7 +1418,11 @@ class ReplayBuffer:
             if not self.sync_refill_failed_groups:
                 message += " Enable trainer.v1.sampler.sync_refill_failed_groups to replace failed groups."
             raise RuntimeError(message)
-        return self._materialize_batch(partition_id, selected_prompt_uids, partition_snapshot), eviction_metrics
+        result = self._materialize_batch(partition_id, selected_prompt_uids, partition_snapshot), eviction_metrics
+        if _repeat_debug_enabled():
+            logger.info("Repeat replay sample_end partition=%s global_step=%s selected=%d sample_seconds=%.3f",
+                        partition_id, global_steps, len(selected_prompt_uids), time.monotonic() - sample_started)
+        return result
 
 
 class ReplayBufferAsync(ReplayBuffer):
@@ -1427,7 +1472,11 @@ class ReplayBufferAsync(ReplayBuffer):
     @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
     def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:
         """Sample a batch while evicting and replacing stale, DAPO-filtered, or failed groups."""
+        sample_started = time.monotonic()
         last_debug_time = time.time()
+        if _repeat_debug_enabled():
+            logger.info("Repeat replay sample_start partition=%s global_step=%s batch_size=%s",
+                        partition_id, global_steps, batch_size)
         eviction_metrics: dict = {}
 
         while True:
@@ -1451,7 +1500,7 @@ class ReplayBufferAsync(ReplayBuffer):
                 )
                 break
 
-            last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
+            last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time, sample_started)
 
         if partition_id != "val" and self.max_off_policy_strategy == "drop":
             selected_spans = [
@@ -1462,4 +1511,8 @@ class ReplayBufferAsync(ReplayBuffer):
                 f"threshold={self.max_off_policy_threshold}"
             )
 
-        return self._materialize_batch(partition_id, selected_prompt_uids, partition_snapshot), eviction_metrics
+        result = self._materialize_batch(partition_id, selected_prompt_uids, partition_snapshot), eviction_metrics
+        if _repeat_debug_enabled():
+            logger.info("Repeat replay sample_end partition=%s global_step=%s selected=%d sample_seconds=%.3f",
+                        partition_id, global_steps, len(selected_prompt_uids), time.monotonic() - sample_started)
+        return result

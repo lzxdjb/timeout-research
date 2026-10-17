@@ -1,6 +1,7 @@
 """Network-free contracts for repeat-only deferred reward scheduling."""
 import asyncio
 import copy
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -144,6 +145,9 @@ def worker_harness(monkeypatch, n=1):
     worker.repeat_coordinator = None
     worker.repeat_finalizers = {}
     worker.repeat_generation_sessions = {}
+    worker.repeat_debug = module._repeat_debug_enabled()
+    worker.repeat_debug_slow_seconds = module._repeat_debug_slow_seconds()
+    worker.repeat_debug_prompts = {}
     worker.prompt_tasks = {"train": {}, "val": {}}
     worker.config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"n": n, "val_kwargs": {"n": n}}}})
     store, publications = {}, []
@@ -334,3 +338,133 @@ def test_worker_queue_loss_is_terminal_error(monkeypatch):
         assert store["train"]["u"]["status"] == "reward_error"
         assert not publications
     asyncio.run(run())
+
+
+def test_debug_queue_reports_reservation_backpressure(monkeypatch, caplog):
+    async def run():
+        config = repeat.RepeatConfig(max_pending=1)
+        queue = RepeatJudgeCoordinator(config)
+        await queue.reserve("first")
+        blocked = asyncio.create_task(queue.reserve("second"))
+        await asyncio.sleep(0)
+        assert not blocked.done()
+        await queue.abandon("first")
+        assert await blocked >= 0
+        await queue.abandon("second")
+
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG", "1")
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG_SLOW_SECONDS", "0")
+    caplog.set_level(logging.INFO, logger="verl.trainer.ppo.v1.repeat_judge_queue")
+    asyncio.run(run())
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("reservation requested job_id=second" in message for message in messages)
+    assert any("phase=reserve_wait job_id=second" in message for message in messages)
+    assert any("queue snapshot reason=reservation_acquired" in message for message in messages)
+
+
+def test_debug_queue_reports_judge_rpc_and_verdict(monkeypatch, caplog):
+    async def run():
+        config = repeat.RepeatConfig(max_pending=1)
+        queue = RepeatJudgeCoordinator(config)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        class Client:
+            async def judge_consensus(self, *args, **kwargs):
+                started.set()
+                await release.wait()
+                return {"verdict": "clean", "reason": "fixture", "queue_seconds": 0.5, "service_seconds": 1.5}
+
+        queue.client = Client()
+        await queue.reserve("judge")
+        task = asyncio.create_task(queue.evaluate("judge", make_job(config)))
+        await started.wait()
+        release.set()
+        await task
+
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG", "1")
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG_SLOW_SECONDS", "0")
+    monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
+    caplog.set_level(logging.INFO, logger="verl.trainer.ppo.v1.repeat_judge_queue")
+    asyncio.run(run())
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("RPC submitted job_id=judge" in message for message in messages)
+    assert any("verdict job_id=judge verdict=clean" in message for message in messages)
+    assert any("phase=judge_rpc job_id=judge" in message for message in messages)
+
+
+def test_debug_lifecycle_identifies_delayed_finalization(monkeypatch, caplog):
+    async def run():
+        worker, _store, _publications = worker_harness(monkeypatch)
+        config = repeat.RepeatConfig(deferred_enabled=True)
+        release = asyncio.Event()
+
+        async def reserve(job_id):
+            return 0.0
+
+        async def evaluate(job_id, job, admission):
+            await release.wait()
+            return job_id, 0.1, {"repeat_reward_pending": 0}
+
+        worker.repeat_coordinator = SimpleNamespace(
+            reserve=RemoteMethod(reserve), evaluate=RemoteMethod(evaluate)
+        )
+        worker.repeat_finalizers[("train", "u")] = []
+        worker.repeat_generation_sessions[("train", "u")] = (1, set())
+        await worker._agent_loop_postprocess(fake_output(config), False, uid="u", session_id=0, global_steps=0)
+        await asyncio.sleep(0)
+        assert worker.repeat_finalizers[("train", "u")]
+        assert not worker.repeat_finalizers[("train", "u")][0].done()
+        release.set()
+        await worker._join_repeat("train", "u")
+
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG", "1")
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG_SLOW_SECONDS", "0")
+    monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
+    caplog.set_level(logging.INFO, logger="verl.trainer.ppo.v1.agent_loop_tq")
+    asyncio.run(run())
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("event=finalizer_start partition=train uid=u" in message for message in messages)
+    assert any("event=join_repeat_start partition=train uid=u" in message for message in messages)
+    assert any("event=finalizer_end partition=train uid=u" in message for message in messages)
+
+
+def test_debug_lifecycle_identifies_delayed_transfer_queue_publication(monkeypatch, caplog):
+    async def run():
+        worker, _store, _publications = worker_harness(monkeypatch)
+        from verl.trainer.ppo.v1 import agent_loop_tq as module
+
+        config = repeat.RepeatConfig(deferred_enabled=True)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def reserve(job_id):
+            return 0.0
+
+        async def evaluate(job_id, job, admission):
+            return job_id, 0.1, {"repeat_reward_pending": 0}
+
+        async def delayed_batch_put(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return None
+
+        monkeypatch.setattr(module.tq, "async_kv_batch_put", delayed_batch_put)
+        worker.repeat_coordinator = SimpleNamespace(
+            reserve=RemoteMethod(reserve), evaluate=RemoteMethod(evaluate)
+        )
+        worker.repeat_finalizers[("train", "u")] = []
+        worker.repeat_generation_sessions[("train", "u")] = (1, set())
+        await worker._agent_loop_postprocess(fake_output(config), False, uid="u", session_id=0, global_steps=0)
+        await entered.wait()
+        task = worker.repeat_finalizers[("train", "u")][0]
+        assert not task.done()
+        release.set()
+        await worker._join_repeat("train", "u")
+
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG", "1")
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG_SLOW_SECONDS", "0")
+    monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
+    caplog.set_level(logging.INFO, logger="verl.trainer.ppo.v1.agent_loop_tq")
+    asyncio.run(run())
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("event=trajectory_published partition=train uid=u" in message for message in messages)
+    assert any("event=finalizer_end partition=train uid=u" in message for message in messages)

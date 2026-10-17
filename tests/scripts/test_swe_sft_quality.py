@@ -420,6 +420,37 @@ def test_full_filter_requires_audited_pilot_before_model_calls(tmp_path):
         asyncio.run(quality.filter_pool(args, None, {}, "fingerprint"))
 
 
+def test_explicit_unaudited_full_run_keeps_judge_review_and_reports_override(tmp_path, monkeypatch):
+    args = args_for(tmp_path, "--allow-unaudited-pilot")
+    run = args.rollout_root / "run"
+    run.mkdir()
+    (run / "1.jsonl").write_text(json.dumps(fixture_row()) + "\n")
+    called = []
+
+    async def preflight(self):
+        self.served_root = "test-fixture-only"
+
+    async def judge(self, transcript, events, **kwargs):
+        called.append(self.config)
+        return {"accepted": True, "verdict": "good", "reason": "Fixture-only decision", "error": 0}
+
+    def unexpected_audit(*args):
+        raise AssertionError("Explicit override must not try to certify an audit")
+
+    monkeypatch.setattr(quality.SFTJudgeClient, "preflight", preflight)
+    monkeypatch.setattr(quality.SFTJudgeClient, "judge_consensus", judge)
+    monkeypatch.setattr(quality, "verify_pilot_audit", unexpected_audit)
+    core, _, _, _ = quality.build_candidates(args)
+    assert len(core) == 1 and len(called) == 1
+    assert called[0].vote_count == called[0].vote_quorum == 8 and called[0].reviewer_enabled
+    report = json.loads((args.output_dir / "quality_report.json").read_text())
+    status = json.loads((args.output_dir / "run_status.json").read_text())
+    assert report["audit_readiness"]["unaudited_override"]
+    assert not report["audit_readiness"]["full_filter_gate_satisfied"]
+    assert status["audit_readiness"] == report["audit_readiness"]
+    assert not (args.output_dir / "audit_report.json").exists()
+
+
 def test_source_snapshot_ignores_additions_and_is_shared_with_full_pool(tmp_path):
     args = args_for(tmp_path)
     run = args.rollout_root / "run"

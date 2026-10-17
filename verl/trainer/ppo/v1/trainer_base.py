@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -127,6 +128,13 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
     params["top_p"] = 1.0
     params["top_k"] = -1
     params["temperature"] = 0
+
+
+def _repeat_debug_enabled() -> bool:
+    value = os.getenv("SWE_AGENT_REPEAT_JUDGE_DEBUG", "0").lower()
+    if value not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+        raise ValueError("SWE_AGENT_REPEAT_JUDGE_DEBUG must be a boolean")
+    return value in {"1", "true", "yes", "on"}
 
 
 def _resolve_validation_metric_sources(
@@ -800,11 +808,18 @@ class PPOTrainer(ABC):
         # 1. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
+            sample_started = time.monotonic()
+            if _repeat_debug_enabled():
+                logger.info("Repeat trainer sample_start partition=train global_step=%s batch_size=%s",
+                            self.global_steps, sample_batch_size)
             batch, off_policy_metrics = self.replay_buffer.sample(
                 global_steps=self.global_steps,
                 partition_id="train",
                 batch_size=sample_batch_size,
             )
+            if _repeat_debug_enabled():
+                logger.info("Repeat trainer sample_end partition=train global_step=%s selected=%d seconds=%.3f",
+                            self.global_steps, len(batch.keys), time.monotonic() - sample_started)
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
@@ -1305,9 +1320,16 @@ class PPOTrainer(ABC):
             self._submit_validation_batch(batch)
 
             # 2. sample batch from replay buffer: one prompt (GRPO group) per submitted row.
+            sample_started = time.monotonic()
+            if _repeat_debug_enabled():
+                logger.info("Repeat trainer sample_start partition=val global_step=%s batch_size=%s",
+                            self.global_steps, len(batch))
             batch, _ = self.replay_buffer.sample(
                 global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
             )
+            if _repeat_debug_enabled():
+                logger.info("Repeat trainer sample_end partition=val global_step=%s selected=%d seconds=%.3f",
+                            self.global_steps, len(batch.keys), time.monotonic() - sample_started)
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -1912,6 +1934,10 @@ class PPOTrainer(ABC):
 
     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
         """Register prompts in TransferQueue and dispatch them for generation."""
+        started = time.monotonic()
+        if _repeat_debug_enabled():
+            logger.info("Repeat trainer rollout_submit_start partition=train global_step=%s prompts=%d",
+                        self.global_steps, len(batch))
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
         if self.trainer_mode != "sync":
             tq.kv_batch_put(
@@ -1926,16 +1952,26 @@ class PPOTrainer(ABC):
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)
 
         self.agent_loop_manager.generate_sequences(batch)
+        if _repeat_debug_enabled():
+            logger.info("Repeat trainer rollout_submit_end partition=train global_step=%s prompts=%d seconds=%.3f",
+                        self.global_steps, len(batch), time.monotonic() - started)
         return len(batch)
 
     def _submit_validation_batch(self, batch: TensorDict) -> int:
         """Register validation prompts and retain templates for exact retries."""
+        started = time.monotonic()
+        if _repeat_debug_enabled():
+            logger.info("Repeat trainer rollout_submit_start partition=val global_step=%s prompts=%d",
+                        self.global_steps, len(batch))
         uid_values = [str(uid) for uid in batch["uid"]]
         for index, uid in enumerate(uid_values):
             self._validation_prompt_templates[uid] = batch[index : index + 1].clone()
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in uid_values]
         tq.kv_batch_put(keys=uid_values, partition_id="val", tags=tags)
         self.agent_loop_manager.generate_sequences(batch)
+        if _repeat_debug_enabled():
+            logger.info("Repeat trainer rollout_submit_end partition=val global_step=%s prompts=%d seconds=%.3f",
+                        self.global_steps, len(batch), time.monotonic() - started)
         return len(batch)
 
     def _refill_validation_groups(self, discarded_uids: list[str]) -> int:
