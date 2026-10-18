@@ -75,9 +75,11 @@ def test_bounded_admission_duplicates_and_failure_release(monkeypatch):
     asyncio.run(run())
 
 
-def test_one_request_semaphore_across_independent_jobs(monkeypatch):
+@pytest.mark.parametrize("early_exit", [False, True])
+def test_one_request_semaphore_across_independent_jobs(monkeypatch, early_exit):
     async def run():
-        config = repeat.RepeatConfig(concurrency=2, max_pending=10, vote_count=3, vote_quorum=2)
+        config = repeat.RepeatConfig(concurrency=2, max_pending=10, vote_count=3, vote_quorum=2,
+                                     early_exit_enabled=early_exit)
         queue = RepeatJudgeCoordinator(config)
         queue.client = repeat.JudgeClient(config)
         active = peak = 0
@@ -95,6 +97,10 @@ def test_one_request_semaphore_across_independent_jobs(monkeypatch):
             return await queue.submit(key, make_job(config))
         results = await asyncio.gather(*(job(i) for i in range(8)))
         assert len(results) == 8 and peak == 2
+        assert queue.snapshot()["completed"] == 8 and queue.snapshot()["pending"] == 0
+        assert all(result[1] == 1. for result in results)
+        assert all(result[2]["repeat_reward_judge_vote_count"] == (2 if early_exit else 3) for result in results)
+        assert all(result[2]["repeat_reward_judge_votes_skipped"] == int(early_exit) for result in results)
     monkeypatch.setattr(repeat, "save_audit", lambda *args, **kwargs: {})
     asyncio.run(run())
 
@@ -557,3 +563,54 @@ def test_debug_lifecycle_identifies_delayed_transfer_queue_publication(monkeypat
     messages = [record.getMessage() for record in caplog.records]
     assert any("event=trajectory_published partition=train uid=u" in message for message in messages)
     assert any("event=finalizer_end partition=train uid=u" in message for message in messages)
+
+
+def test_reward_drain_heartbeat_preserves_publication_barrier(monkeypatch, caplog):
+    async def run():
+        worker, _store, _publications = worker_harness(monkeypatch)
+        release = asyncio.Event()
+        finalizer = asyncio.create_task(release.wait())
+        worker.repeat_finalizers[("train", "u")] = [finalizer]
+        join = asyncio.create_task(worker._join_repeat("train", "u"))
+        try:
+            async with asyncio.timeout(2):
+                while "event=join_repeat_progress" not in caplog.text:
+                    await asyncio.sleep(.002)
+            assert not join.done() and not finalizer.done()
+            release.set()
+            await join
+            assert finalizer.done()
+        finally:
+            release.set()
+            await join
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_DEBUG", "1")
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_PROGRESS_INTERVAL_SECONDS", ".005")
+    caplog.set_level(logging.INFO, logger="verl.trainer.ppo.v1.agent_loop_tq")
+    asyncio.run(run())
+
+
+def test_manager_cancellation_heartbeat_does_not_block_on_snapshot(monkeypatch, caplog):
+    from verl.trainer.ppo.v1 import agent_loop_tq as module
+    manager = object.__new__(module.AgentLoopManagerTQ)
+    manager.agent_loop_workers = [SimpleNamespace(cancel_sequences=SimpleNamespace(remote=lambda *a, **kw: "worker"))]
+    manager.repeat_coordinator = SimpleNamespace(snapshot=SimpleNamespace(remote=lambda: "snapshot"))
+    tick = [0.]
+    worker_polls = [0]
+    def wait(refs, *, num_returns=1, timeout):
+        if refs == ["snapshot"]:
+            assert timeout == 0
+            return [], refs  # A slow snapshot must never stall cancellation.
+        worker_polls[0] += 1
+        tick[0] += 2
+        return ([], refs) if worker_polls[0] == 1 else (refs, [])
+    def get(refs):
+        assert refs != "snapshot"
+        return [1] if refs else []
+    monkeypatch.setenv("SWE_AGENT_REPEAT_JUDGE_PROGRESS_INTERVAL_SECONDS", "1")
+    monkeypatch.setattr(module.ray, "wait", wait)
+    monkeypatch.setattr(module.ray, "get", get)
+    monkeypatch.setattr(module.time, "monotonic", lambda: tick[0])
+    caplog.set_level(logging.INFO, logger=module.__name__)
+    assert manager.cancel_sequences(["u"]) == 1
+    assert "cancellation/drain progress" in caplog.text
+    assert "cancellation/drain end" in caplog.text

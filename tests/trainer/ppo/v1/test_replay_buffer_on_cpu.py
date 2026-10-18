@@ -1627,6 +1627,7 @@ def test_deferred_cutoff_counts_rollout_completion_but_waits_for_rewards(monkeyp
     assert set(selected) == {"ready", "judging"}
     assert polls == [1] and cancelled == ["tail"]
     assert metrics["training/completion_ratio/terminal_groups"] == 2
+    assert metrics["training/repeat_queue/cancellation_drain_seconds"] >= 0
 
 
 def test_deferred_error_stops_sampling_instead_of_skipping_penalty(monkeypatch):

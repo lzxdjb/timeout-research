@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import os
 import time
 
@@ -23,6 +24,13 @@ def _debug_slow_seconds() -> float:
     value = float(os.getenv("SWE_AGENT_REPEAT_JUDGE_DEBUG_SLOW_SECONDS", "30"))
     if value < 0:
         raise ValueError("SWE_AGENT_REPEAT_JUDGE_DEBUG_SLOW_SECONDS must be nonnegative")
+    return value
+
+
+def progress_interval_seconds() -> float:
+    value = float(os.getenv("SWE_AGENT_REPEAT_JUDGE_PROGRESS_INTERVAL_SECONDS", "60"))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("SWE_AGENT_REPEAT_JUDGE_PROGRESS_INTERVAL_SECONDS must be finite and positive")
     return value
 
 
@@ -87,10 +95,11 @@ class RepeatJudgeCoordinator:
         if self.debug:
             logger.info(
                 "Repeat judge debug startup endpoint=%s model=%s max_context=%s max_output=%s "
-                "timeout=%s queue_timeout=%s concurrency=%s vote_count=%s vote_quorum=%s max_pending=%s",
+                "timeout=%s queue_timeout=%s concurrency=%s vote_count=%s vote_quorum=%s max_pending=%s "
+                "early_exit_enabled=%s",
                 config.url, config.model, config.max_context, config.max_output,
                 config.timeout, config.queue_timeout, config.concurrency,
-                config.vote_count, config.vote_quorum, config.max_pending,
+                config.vote_count, config.vote_quorum, config.max_pending, config.early_exit_enabled,
             )
 
     def snapshot(self):

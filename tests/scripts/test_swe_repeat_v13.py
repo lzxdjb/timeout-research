@@ -139,6 +139,21 @@ def test_reviewer_disable_keeps_guard_and_only_skips_review(monkeypatch):
     assert asyncio.run(client.judge_consensus('',[event(1),event(2)]))['verdict']=='uncertain'
 
 
+@pytest.mark.parametrize('invalid_kind', ['schema', 'guard'])
+def test_early_exit_uses_guarded_votes_not_model_proposals(monkeypatch, tmp_path, invalid_kind):
+    cfg = p.RepeatConfig(vote_count=8, vote_quorum=7, early_exit_enabled=True)
+    proposal = {**positive(), **({'event_ids': [1, 999]} if invalid_kind == 'schema'
+                               else {'category': 'ineffective_action_loop'})}
+    client, calls = fake_client(monkeypatch, cfg, iter([proposal, proposal]))
+    monkeypatch.setenv('SWE_AGENT_REPEAT_AUDIT_DIR', str(tmp_path))
+    result = asyncio.run(client.judge_consensus('', [event(1), event(2)]))
+    assert result['verdict'] == 'uncertain' and result['early_exit_taken']
+    assert result['repetitive_votes'] == 0 and result['votes_skipped'] == 6
+    assert result['error_count' if invalid_kind == 'schema' else 'guard_blocked'] == 2
+    assert not result['evidence_review_called']
+    assert len([x for stage, x in calls if stage == 'completion']) == 2
+
+
 def test_queue_wait_does_not_consume_service_budget_and_cancel_releases_slot(monkeypatch):
     async def run():
         cfg=p.RepeatConfig(timeout=0.12,queue_timeout=1,concurrency=1)

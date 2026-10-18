@@ -1237,7 +1237,12 @@ class ReplayBuffer:
         if self.cancel_fn is None:
             raise RuntimeError("Completion-ratio rollout cutoff requires an agent-loop cancellation callback")
 
+        logger.info("Starting %s completion-ratio cutoff cancellation/drain: requested=%s; "
+                    "waiting for retained rewards and publication before materializing groups",
+                    partition_id, len(inflight_uids))
+        cancellation_started = time.monotonic()
         cancelled = int(self.cancel_fn(sorted(inflight_uids), validate=partition_id == "val"))
+        cancellation_drain_seconds = time.monotonic() - cancellation_started
         prefix = self._metrics_prefix(partition_id)
         if golden_training_cutoff:
             logger.info(
@@ -1269,6 +1274,9 @@ class ReplayBuffer:
             f"{prefix}/completion_ratio/total_groups": float(total_groups),
             f"{prefix}/completion_ratio/cutoff_groups": float(len(inflight_uids)),
             f"{prefix}/completion_ratio/cancelled_groups": float(cancelled),
+            # Includes generation cancellation, retained rewards and publication;
+            # this is deliberately separate from pure reward-only polling time.
+            f"{prefix}/repeat_queue/cancellation_drain_seconds": cancellation_drain_seconds,
         }
         if golden_training_cutoff:
             metrics.update(

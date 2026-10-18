@@ -410,7 +410,8 @@ def test_success_repeat_benchmark_online_mock_and_public_projection(tmp_path, mo
     assert result["regression_pass"] is True and result["production_ready"] is False
     assert result["combined"]["tp"] == 1 and result["raw_success_subset"]["tp"] == 1
     assert result["level1"]["deferred"] == 1
-    assert result["judge_voting"] == {"vote_count": 3, "vote_quorum": 2, "temperature": 0.2}
+    assert result["judge_voting"] == {"vote_count": 3, "vote_quorum": 2, "temperature": 0.2,
+                                       "early_exit_enabled": False}
     assert result["judge_repetitive_votes"] == 3
     assert result["rows"][0]["vote_count"] == 3
     (tmp_path / "manifest.json").write_text(json.dumps({

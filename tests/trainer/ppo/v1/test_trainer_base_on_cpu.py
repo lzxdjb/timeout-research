@@ -230,7 +230,8 @@ def test_rollout_debug_dump_keeps_sorted_row_alignment(tmp_path, persisted):
 
 
 @pytest.mark.parametrize("repeat_metrics", [False, True])
-def test_advantage_queue_write_preserves_exclusion_codes_and_loss_mask(monkeypatch, repeat_metrics):
+@pytest.mark.parametrize("padding", [False, True])
+def test_advantage_queue_write_preserves_exclusion_codes_and_loss_mask(monkeypatch, repeat_metrics, padding):
     trainer = _StubTrainer.__new__(_StubTrainer)
     trainer.timeout_prediction_enabled = False
     trainer.config = OmegaConf.create({
@@ -239,6 +240,8 @@ def test_advantage_queue_write_preserves_exclusion_codes_and_loss_mask(monkeypat
     })
     keys = [f"{group}_{session}_0" for group in ("cutoff", "infra", "keep") for session in range(2)]
     batch = KVBatchMeta(partition_id="train", keys=keys, tags=[{"completion_ratio_cutoff": True}] + [{}] * 5)
+    if padding:
+        batch.tags[-1] = {"is_padding": True}
     queue_data = tu.get_tensordict(
         {
             "uid": torch.tensor([0, 0, 1, 1, 2, 2]),
@@ -250,6 +253,11 @@ def test_advantage_queue_write_preserves_exclusion_codes_and_loss_mask(monkeypat
                 {"reward_extra_info": {
                     "observed_infrastructure_failure": int(i == 2),
                     **({"repeat_reward_queue_full": int(i == 3), "repeat_reward_queue_accepted": int(i != 3),
+                        "repeat_reward_judge_called": 1,
+                        "repeat_reward_judge_vote_count": 2,
+                        "repeat_reward_judge_configured_vote_count": 8,
+                        "repeat_reward_judge_votes_skipped": 6,
+                        "repeat_reward_judge_early_exit_taken": 1,
                         "repeat_reward_deferred_job_queue_seconds": float(i)} if repeat_metrics and i >= 2 else {}),
                 }} for i in range(6)
             ],
@@ -272,15 +280,18 @@ def test_advantage_queue_write_preserves_exclusion_codes_and_loss_mask(monkeypat
         trainer._compute_advantage(batch, metrics)
     output = put.call_args.kwargs["fields"]
     assert output["train_exclusion_code"].dtype == torch.int64
-    assert output["train_exclusion_code"].tolist() == [2, 2, 16, 16, 0, 0]
-    assert output["train_sample_mask"].tolist() == [False, False, False, False, True, True]
+    assert output["train_exclusion_code"].tolist() == [2, 2, 16, 16, 0, int(padding)]
+    assert output["train_sample_mask"].tolist() == [False, False, False, False, True, not padding]
     assert metrics["grpo/mixed_groups"] == 3
     if repeat_metrics:
         assert metrics["repeat_queue/queue_full_count"] == 1
-        assert metrics["repeat_queue/queue_full_fraction"] == .25
-        assert metrics["repeat_queue/queue_accepted_count"] == 3
-        assert metrics["repeat_queue/job_queue_seconds_mean"] == 3.5
-        assert metrics["repeat_queue/job_queue_seconds_max"] == 5.
+        assert metrics["repeat_queue/queue_full_fraction"] == pytest.approx(1 / (4 - padding))
+        assert metrics["repeat_queue/queue_accepted_count"] == 3 - padding
+        assert metrics["repeat_queue/job_queue_seconds_mean"] == (3. if padding else 3.5)
+        assert metrics["repeat_queue/job_queue_seconds_max"] == (4. if padding else 5.)
+        assert metrics["repeat_queue/votes_executed_count"] == 2 * (4 - padding)
+        assert metrics["repeat_queue/votes_skipped_count"] == 6 * (4 - padding)
+        assert metrics["repeat_queue/early_exit_taken_count"] == 4 - padding
     else:
         assert not any(key.startswith("repeat_queue/") for key in metrics)
 

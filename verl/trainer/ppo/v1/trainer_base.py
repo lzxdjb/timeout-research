@@ -2396,21 +2396,29 @@ class PPOTrainer(ABC):
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         extra_fields = data.pop("extra_fields").tolist()
+        reward_diagnostics = [extra["reward_extra_info"] for extra, tag in zip(extra_fields, batch.tags, strict=True)
+                              if not tag.get("is_padding", False) and isinstance(extra, dict)
+                              and isinstance(extra.get("reward_extra_info"), dict)]
         for field in ("admission_seconds", "job_queue_seconds", "wall_seconds", "request_queue_seconds", "service_seconds"):
             key = "repeat_reward_deferred_" + field
-            durations = [extra["reward_extra_info"].get(key) for extra in extra_fields
-                         if isinstance(extra, dict) and isinstance(extra.get("reward_extra_info"), dict)]
+            durations = [info.get(key) for info in reward_diagnostics]
             durations = [float(value) for value in durations if value is not None]
             if durations:
                 metrics[f"repeat_queue/{field}_mean"] = float(np.mean(durations))
                 metrics[f"repeat_queue/{field}_max"] = max(durations)
         for field in ("queue_full", "queue_accepted"):
-            values = [extra["reward_extra_info"].get("repeat_reward_" + field) for extra in extra_fields
-                      if isinstance(extra, dict) and isinstance(extra.get("reward_extra_info"), dict)]
+            values = [info.get("repeat_reward_" + field) for info in reward_diagnostics]
             values = [int(value) for value in values if value is not None]
             if values:
                 metrics[f"repeat_queue/{field}_count"] = sum(values)
                 metrics[f"repeat_queue/{field}_fraction"] = float(np.mean(values))
+        for field, name in (("vote_count", "votes_executed"), ("configured_vote_count", "votes_configured"),
+                            ("votes_skipped", "votes_skipped"), ("early_exit_taken", "early_exit_taken")):
+            values = [int(info["repeat_reward_judge_" + field]) for info in reward_diagnostics
+                      if "repeat_reward_judge_" + field in info and info.get("repeat_reward_judge_called")]
+            if values:
+                metrics[f"repeat_queue/{name}_count"] = sum(values)
+                metrics[f"repeat_queue/{name}_mean"] = float(np.mean(values))
         direct_fields = {}
         if _task_filter_enabled() or self.timeout_prediction_enabled or tool_failure_enabled:
             for field in (

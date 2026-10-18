@@ -33,7 +33,7 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
-from verl.trainer.ppo.v1.repeat_judge_queue import RepeatQueueError
+from verl.trainer.ppo.v1.repeat_judge_queue import RepeatQueueError, progress_interval_seconds
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
@@ -140,7 +140,18 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         self._repeat_debug_event("join_repeat_start", partition_id, uid, jobs=len(tasks))
         # Shield retained judgments from generation-cutoff cancellation. Publication
         # must settle before ReplayBuffer is allowed to materialize or clear a group.
-        errors = await asyncio.shield(_settle_session_tasks(tasks))
+        # asyncio.wait never cancels the settlement task if this caller is
+        # cancelled, preserving the original shield/publication barrier.
+        settlement = asyncio.ensure_future(_settle_session_tasks(tasks))
+        interval = progress_interval_seconds() if self.repeat_debug else None
+        while True:
+            done, _ = await asyncio.wait([settlement], timeout=interval)
+            if done:
+                errors = settlement.result()
+                break
+            self._repeat_debug_event("join_repeat_progress", partition_id, uid,
+                                     jobs=len(tasks), pending=sum(not task.done() for task in tasks),
+                                     seconds=time.monotonic() - started)
         logger.info("Repeat reward barrier partition=%s uid=%s jobs=%d wait_seconds=%.3f",
                     partition_id, uid, len(tasks), time.monotonic() - started)
         self._repeat_debug_event("join_repeat_end", partition_id, uid, jobs=len(tasks),
@@ -616,14 +627,40 @@ class AgentLoopManagerTQ(AgentLoopManager):
         """Cancel the requested prompt groups on whichever workers own them."""
         if not uids:
             return 0
-        return sum(
-            ray.get(
-                [
-                    worker.cancel_sequences.remote(uids, validate=validate)
-                    for worker in self.agent_loop_workers
-                ]
-            )
-        )
+        started = time.monotonic()
+        interval = progress_interval_seconds()
+        pending = [worker.cancel_sequences.remote(uids, validate=validate)
+                   for worker in self.agent_loop_workers]
+        logger.info("Rollout cancellation/drain start partition=%s groups=%d workers=%d",
+                    "val" if validate else "train", len(uids), len(pending))
+        cancelled = 0
+        snapshot_ref = None
+        last_progress = started
+        while pending:
+            done, pending = ray.wait(pending, num_returns=1, timeout=interval)
+            cancelled += sum(ray.get(done))
+            now = time.monotonic()
+            if now - last_progress >= interval:
+                logger.info("Rollout cancellation/drain progress partition=%s pending_workers=%d "
+                            "cancelled_groups=%d wait_seconds=%.3f",
+                            "val" if validate else "train", len(pending), cancelled, now - started)
+                last_progress = now
+                if self.repeat_coordinator is not None:
+                    # Snapshot diagnostics must never introduce another blocking
+                    # ray.get or obscure errors from the cancellation workers.
+                    try:
+                        if snapshot_ref is None:
+                            snapshot_ref = self.repeat_coordinator.snapshot.remote()
+                        ready, _ = ray.wait([snapshot_ref], timeout=0)
+                        if ready:
+                            logger.info("Repeat judge cancellation/drain queue snapshot %s", ray.get(snapshot_ref))
+                            snapshot_ref = None
+                    except Exception as error:
+                        logger.warning("Repeat judge drain snapshot unavailable type=%s", type(error).__name__)
+                        snapshot_ref = None
+        logger.info("Rollout cancellation/drain end partition=%s cancelled_groups=%d wait_seconds=%.3f",
+                    "val" if validate else "train", cancelled, time.monotonic() - started)
+        return cancelled
 
     def close_repeat_coordinator(self):
         if self.repeat_coordinator is not None:
