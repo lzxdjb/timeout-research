@@ -325,6 +325,12 @@ tool_failure_penalty_cost: 0.02
 tool_failure_penalty_cap: 0.10
 tool_failure_penalty_warmup_steps: 10
 
+# Conservative exact thinking repetition; independent of tool and RM penalties.
+thinking_repeat_penalty_enabled: false
+thinking_repeat_penalty_cost: 0.02
+thinking_repeat_penalty_cap: 0.10
+thinking_repeat_penalty_warmup_steps: 10
+
 # Router replay configuration for MoE models
 router_replay:
 

@@ -316,6 +316,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     counts = [None] * torch.distributed.get_world_size(self.engine.get_data_parallel_group())
                     torch.distributed.all_gather_object(counts, active_count, self.engine.get_data_parallel_group())
                     tu.assign_non_tensor(mini_batch_td, tool_failure_active_global_count=sum(counts))
+                if "thinking_repeat_weights" in mini_batch_td:
+                    active_count = float(mini_batch_td["thinking_repeat_normalizer"].sum().item())
+                    counts = [None] * torch.distributed.get_world_size(self.engine.get_data_parallel_group())
+                    torch.distributed.all_gather_object(counts, active_count, self.engine.get_data_parallel_group())
+                    tu.assign_non_tensor(mini_batch_td, thinking_repeat_active_global_count=sum(counts))
                 # add global token num
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)

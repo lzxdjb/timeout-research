@@ -84,6 +84,14 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # select fields and convert to padded tensor
     tool_failure_enabled = getattr(config, "tool_failure_penalty_enabled", False)
+    thinking_repeat_enabled = getattr(config, "thinking_repeat_penalty_enabled", False)
+    thinking_active_global_count = None
+    if thinking_repeat_enabled:
+        if config.policy_loss.get("loss_mode", "vanilla") != "vanilla":
+            raise ValueError("Thinking-repeat penalty currently supports vanilla PPO only")
+        thinking_active_global_count = tu.get_non_tensor_data(data, "thinking_repeat_active_global_count", default=None)
+        if thinking_active_global_count is None or "thinking_repeat_weights" not in data:
+            raise ValueError("Enabled thinking-repeat penalty requires V1 minibatch cost fields")
     active_global_count = None
     if tool_failure_enabled:
         if config.policy_loss.get("loss_mode", "vanilla") != "vanilla":
@@ -94,6 +102,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     fields = ["response_mask", "old_log_probs", "advantages"]
     if tool_failure_enabled:
         fields.append("tool_failure_weights")
+    if thinking_repeat_enabled:
+        fields.append("thinking_repeat_weights")
     if "train_sample_mask" in data:
         fields.append("train_sample_mask")
     if "rollout_is_weights" in data:
@@ -142,6 +152,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         )
         policy_loss = policy_loss + tool_loss
         metrics["actor/tool_failure_loss"] = Metric(value=tool_loss, aggregation=AggregationType.SUM)
+    if thinking_repeat_enabled:
+        from verl.utils.swe_tool_failure import local_ppo_loss
+        thinking_loss = local_ppo_loss(
+            log_prob, old_log_prob, data["thinking_repeat_weights"], response_mask, config,
+            active_global_count=thinking_active_global_count,
+            dp_size=config.global_batch_info["dp_size"], rollout_is_weights=rollout_is_weights,
+        )
+        policy_loss = policy_loss + thinking_loss
+        metrics["actor/thinking_repeat_loss"] = Metric(value=thinking_loss, aggregation=AggregationType.SUM)
 
     # add entropy loss
     if entropy is not None:

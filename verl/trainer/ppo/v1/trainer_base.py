@@ -2381,6 +2381,8 @@ class PPOTrainer(ABC):
         """Compute the advantage of the batch."""
         tool_config = self.config.actor_rollout_ref.get("actor", {})
         tool_failure_enabled = tool_config.get("tool_failure_penalty_enabled", False)
+        thinking_repeat_enabled = tool_config.get("thinking_repeat_penalty_enabled", False)
+        local_penalty_enabled = tool_failure_enabled or thinking_repeat_enabled
         fields = [
             "uid",
             "response_mask",
@@ -2391,7 +2393,7 @@ class PPOTrainer(ABC):
             "values",
             "extra_fields",
         ]
-        if tool_failure_enabled:
+        if local_penalty_enabled:
             fields.append("responses")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
@@ -2420,7 +2422,7 @@ class PPOTrainer(ABC):
                 metrics[f"repeat_queue/{name}_count"] = sum(values)
                 metrics[f"repeat_queue/{name}_mean"] = float(np.mean(values))
         direct_fields = {}
-        if _task_filter_enabled() or self.timeout_prediction_enabled or tool_failure_enabled:
+        if _task_filter_enabled() or self.timeout_prediction_enabled or local_penalty_enabled:
             for field in (
                 "observed_infrastructure_failure",
                 "observed_infrastructure_failure_code",
@@ -2532,8 +2534,8 @@ class PPOTrainer(ABC):
 
         # Apply only after GRPO's session-level scalar broadcasting. Keep the
         # terminal task reward intact, including valid missing-submission -0.1.
-        if tool_failure_enabled:
-            from verl.utils.swe_tool_failure import build_cost_weights, gate_positive_credit, trajectory_normalizer
+        if local_penalty_enabled:
+            from verl.utils.swe_tool_failure import gate_positive_credit, trajectory_normalizer
             active = exclusion_codes.eq(0) & data.batch["response_mask"].bool().any(-1)
             if "train_sample_mask" in data.batch:
                 active &= data.batch["train_sample_mask"].bool()
@@ -2544,26 +2546,42 @@ class PPOTrainer(ABC):
                     active[i] = False
             trajectory_ids = [key.rsplit("_", 1)[0] for key in batch.keys]
             normalizer = trajectory_normalizer(active, trajectory_ids)
-            weights, counts = build_cost_weights(
-                data.batch["responses"], data.batch["response_mask"], extra_fields, active,
-                cost=tool_config.tool_failure_penalty_cost,
-                cap=tool_config.tool_failure_penalty_cap,
-                warmup_steps=tool_config.tool_failure_penalty_warmup_steps,
-                step=self.global_steps,
-                trajectory_ids=trajectory_ids,
-            )
-            data.batch["tool_failure_weights"] = weights
-            data.batch["tool_failure_active"] = active
-            data.batch["tool_failure_normalizer"] = normalizer
-            data.batch["advantages"] = gate_positive_credit(data.batch["advantages"], weights)
-            counts["active"] = round(float(normalizer.sum()))
-            metrics.update({f"tool_failure/{key}": value for key, value in counts.items()})
-            metrics["tool_failure/mean_cost"] = counts["cost"] / max(1, counts["active"])
+            for name, enabled in (("tool_failure", tool_failure_enabled), ("thinking_repeat", thinking_repeat_enabled)):
+                if not enabled:
+                    continue
+                if name == "tool_failure":
+                    from verl.utils.swe_tool_failure import build_cost_weights
+                else:
+                    from verl.utils.swe_thinking_repeat import build_cost_weights
+                weights, counts = build_cost_weights(
+                    data.batch["responses"], data.batch["response_mask"], extra_fields, active,
+                    cost=tool_config.get(name + "_penalty_cost", 0.02),
+                    cap=tool_config.get(name + "_penalty_cap", 0.10),
+                    warmup_steps=tool_config.get(name + "_penalty_warmup_steps", 10),
+                    step=self.global_steps,
+                    trajectory_ids=trajectory_ids,
+                )
+                data.batch[name + "_weights"] = weights
+                data.batch[name + "_active"] = active
+                data.batch[name + "_normalizer"] = normalizer
+                data.batch["advantages"] = gate_positive_credit(data.batch["advantages"], weights)
+                counts["active"] = round(float(normalizer.sum()))
+                metrics.update({f"{name}/{key}": value for key, value in counts.items()})
+                metrics[f"{name}/mean_cost"] = counts["cost"] / max(1, counts["active"])
+                if name == "thinking_repeat":
+                    metrics["thinking_repeat/flagged_trajectory_fraction"] = (
+                        counts["flagged_trajectories"] / max(1, counts["active"])
+                    )
+                    metrics["thinking_repeat/penalized_token_fraction"] = (
+                        counts["penalized_tokens"] / max(1, counts["active_tokens"])
+                    )
 
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]
         if tool_failure_enabled:
             fields.append("tool_failure_weights")
+        if thinking_repeat_enabled:
+            fields.append("thinking_repeat_weights")
         if self.config.algorithm.use_kl_in_reward:
             fields.append("token_level_rewards")
         if rollout_correction:
@@ -2575,6 +2593,9 @@ class PPOTrainer(ABC):
         if tool_failure_enabled:
             output["tool_failure_active"] = data.batch["tool_failure_active"]
             output["tool_failure_normalizer"] = data.batch["tool_failure_normalizer"]
+        if thinking_repeat_enabled:
+            output["thinking_repeat_active"] = data.batch["thinking_repeat_active"]
+            output["thinking_repeat_normalizer"] = data.batch["thinking_repeat_normalizer"]
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
         if self.timeout_prediction_enabled or _task_filter_enabled() or "train_sample_mask" in data.batch:

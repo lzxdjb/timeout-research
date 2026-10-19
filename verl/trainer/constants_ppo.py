@@ -142,4 +142,8 @@ def get_ppo_ray_runtime_env(config=None):
         actor = getattr(getattr(config, "actor_rollout_ref", None), "actor", {})
         tool_enabled = "1" if actor.get("tool_failure_penalty_enabled", False) else "0"
     runtime_env["env_vars"]["SWE_AGENT_TRAINING_TOOL_FAILURE_PENALTY_ENABLED"] = tool_enabled
+    thinking_enabled = os.environ.get("SWE_AGENT_TRAINING_THINKING_REPEAT_PENALTY_ENABLED", "0")
+    if config is not None:
+        thinking_enabled = "1" if actor.get("thinking_repeat_penalty_enabled", False) else "0"
+    runtime_env["env_vars"]["SWE_AGENT_TRAINING_THINKING_REPEAT_PENALTY_ENABLED"] = thinking_enabled
     return runtime_env

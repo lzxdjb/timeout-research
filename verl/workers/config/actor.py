@@ -209,6 +209,10 @@ class ActorConfig(BaseConfig):
     tool_failure_penalty_cost: float = 0.02
     tool_failure_penalty_cap: float = 0.10
     tool_failure_penalty_warmup_steps: int = 10
+    thinking_repeat_penalty_enabled: bool = False
+    thinking_repeat_penalty_cost: float = 0.02
+    thinking_repeat_penalty_cap: float = 0.10
+    thinking_repeat_penalty_warmup_steps: int = 10
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -221,6 +225,14 @@ class ActorConfig(BaseConfig):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING
         assert self.rollout_n != MISSING
+        if self.thinking_repeat_penalty_enabled:
+            import math
+            if (not all(math.isfinite(x) and x >= 0 for x in
+                        (self.thinking_repeat_penalty_cost, self.thinking_repeat_penalty_cap))
+                    or self.thinking_repeat_penalty_warmup_steps < 0):
+                raise ValueError("Invalid thinking-repeat cost, cap, or warmup")
+            if self.policy_loss.get("loss_mode", "vanilla") != "vanilla":
+                raise ValueError("Thinking-repeat penalty currently supports vanilla PPO only")
         if self.tool_failure_penalty_enabled:
             import math
             if (not all(math.isfinite(x) and x >= 0 for x in
