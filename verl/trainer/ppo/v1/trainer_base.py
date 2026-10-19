@@ -2402,6 +2402,14 @@ class PPOTrainer(ABC):
         reward_diagnostics = [extra["reward_extra_info"] for extra, tag in zip(extra_fields, batch.tags, strict=True)
                               if not tag.get("is_padding", False) and isinstance(extra, dict)
                               and isinstance(extra.get("reward_extra_info"), dict)]
+        shortcut_rows = [info for info in reward_diagnostics if info.get("repeat_reward_local_shortcut_enabled")]
+        if shortcut_rows:
+            values = [int(info.get("repeat_reward_local_shortcut", 0)) for info in shortcut_rows]
+            metrics["repeat_queue/local_shortcut_count"] = sum(values)
+            metrics["repeat_queue/local_shortcut_fraction"] = float(np.mean(values))
+            for family in ("tool_failure", "tool_repeat", "thinking_repeat"):
+                metrics[f"repeat_queue/local_shortcut_{family}_events"] = sum(
+                    int(info.get("repeat_reward_local_shortcut_" + family, 0)) for info in shortcut_rows)
         for field in ("admission_seconds", "job_queue_seconds", "wall_seconds", "request_queue_seconds", "service_seconds"):
             key = "repeat_reward_deferred_" + field
             durations = [info.get(key) for info in reward_diagnostics]

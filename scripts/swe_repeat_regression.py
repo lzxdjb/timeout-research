@@ -636,8 +636,15 @@ def replay_evidence(case: dict, policy) -> tuple[list[dict], str, str, list[dict
         if audit.get("version") == policy.SERIALIZER_VERSION:
             serializer = policy
             actor_kwargs = {"actor_segments": audit.get("actor_segments"),
-                            "input_view": audit.get("config", {}).get("input_view", "full")}
+                            "input_view": audit.get("config", {}).get("input_view", "full"),
+                            "input_format": audit.get("config", {}).get("input_format", "json"),
+                            "prompt_policy": audit.get("config", {}).get("prompt_policy", "legacy")}
             source = "captured_exact"
+        elif audit.get("version") == "repeat-public-trajectory-v7":
+            from recipe.swe_agent import repeat_legacy_render_v7 as serializer
+            actor_kwargs = {"actor_segments": audit.get("actor_segments"),
+                            "input_view": audit.get("config", {}).get("input_view", "full")}
+            source = "captured_render_v7_migrated"
         elif audit.get("version") == "repeat-public-trajectory-v6":
             from recipe.swe_agent import repeat_legacy_render_v6 as serializer
             actor_kwargs = {"actor_segments": audit.get("actor_segments")}
@@ -703,6 +710,10 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
         raise ValueError("Labels must explicitly target success-repeat-v1, never reuse legacy repeat labels")
     indexed_labels = {c["id"]: c for c in labels_data["cases"]}
     config = policy.RepeatConfig.from_env()
+    if config.local_penalty_shortcut_enabled:
+        raise ValueError("Decoded offline fixtures cannot prove native token-local penalties. Set "
+                         "SWE_AGENT_REPEAT_JUDGE_LOCAL_PENALTY_SHORTCUT_ENABLED=0 for judge evaluation; "
+                         "test the training shortcut with tests/scripts/test_swe_repeat_v15.py.")
     client = policy.JudgeClient(config)
     if online:
         await client.preflight()
@@ -813,6 +824,10 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
                                "skipped_votes": sum(r.get("votes_skipped", 0) for r in audit_rows),
                                "temperature": config.temperature},
               "input_view": config.input_view,
+              "input_format": config.input_format, "prompt_policy": config.prompt_policy,
+              "label_counts": dict(collections.Counter(str(r["expected"]) for r in rows)),
+              "protected_control_penalties_by_scope": dict(collections.Counter(
+                  r["label_scope"] for r in rows if r["expected"] in {"clean", "uncertain"} and r["verdict"] == "repetitive")),
               "input_budget": {"context_overflow_cases": sum(bool(r.get("context_overflow")) for r in audit_rows),
                   "review_context_overflow_cases": sum(bool((r.get("evidence_review") or {}).get("context_overflow"))
                       for r in audit_rows),
