@@ -552,7 +552,8 @@ class ToolAgentLoop(AgentLoopBase):
             msg = f"Unknown function '{tool_name}'. Available tools: {available}"
             logger.warning(msg)
             metadata = {}
-            if getattr(agent_data, "_swe_tool_failure_enabled", False):
+            if (getattr(agent_data, "_swe_tool_failure_enabled", False)
+                    or getattr(agent_data, "_swe_tool_repeat_enabled", False)):
                 from verl.utils.swe_tool_failure import rejection_metadata
                 metadata = rejection_metadata("unknown_tool")
             return ToolResponse(text=msg), 0.0, metadata
@@ -564,7 +565,8 @@ class ToolAgentLoop(AgentLoopBase):
             msg = f"Invalid JSON in arguments for '{tool_name}': {e}"
             logger.warning(msg)
             metadata = {}
-            if getattr(agent_data, "_swe_tool_failure_enabled", False):
+            if (getattr(agent_data, "_swe_tool_failure_enabled", False)
+                    or getattr(agent_data, "_swe_tool_repeat_enabled", False)):
                 from verl.utils.swe_tool_failure import rejection_metadata
                 metadata = rejection_metadata("invalid_json")
             return ToolResponse(text=msg), 0.0, metadata

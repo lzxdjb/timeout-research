@@ -381,3 +381,14 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
+
+# Independent conservative tool repetition penalty; all rules opt in.
+tool_repeat_penalty_enabled: false
+tool_repeat_penalty_cost: 0.02
+tool_repeat_penalty_cap: 0.10
+tool_repeat_penalty_warmup_steps: 10
+tool_repeat_penalty_noop_edits: false
+tool_repeat_penalty_unchanged_reads: false
+tool_repeat_penalty_read_cycles: false
+tool_repeat_penalty_contract_rejections: false
+tool_repeat_penalty_varied_noop_edits: false

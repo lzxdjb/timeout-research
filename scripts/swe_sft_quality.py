@@ -19,6 +19,7 @@ import sqlite3
 from pathlib import Path
 
 from recipe.swe_agent import repetition_reward as repeat
+from recipe.swe_agent import repeat_legacy_render_v6 as sft_render
 from scripts import swe_repeat_regression as replay
 
 VERSION = "swe-sft-quality-v1"
@@ -112,11 +113,15 @@ def schema(events, segments):
 
 
 class SFTJudgeClient(repeat.JudgeClient):
+    reference_fallback_enabled = True
+
     def messages(
         self, transcript, events, *, review_claims=None, encoding=repeat.SERIALIZER_VERSION, actor_segments=None
     ):
         # Use exactly the same public timeline, escaping and lossless compaction.
-        messages = repeat.judge_messages("", events, actor_segments=actor_segments)
+        # SFT quality has a separate prompt/encoding contract. Keep its existing
+        # representation independent of the repetition-policy rendering upgrade.
+        messages = sft_render.judge_messages("", events, actor_segments=actor_segments)
         body = json.loads(messages[1]["content"])
         body.update(sft_policy_version=VERSION, original_public_task=transcript)
         if review_claims is not None:

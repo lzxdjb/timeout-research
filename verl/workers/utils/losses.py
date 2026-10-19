@@ -85,6 +85,14 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     # select fields and convert to padded tensor
     tool_failure_enabled = getattr(config, "tool_failure_penalty_enabled", False)
     thinking_repeat_enabled = getattr(config, "thinking_repeat_penalty_enabled", False)
+    tool_repeat_enabled = getattr(config, "tool_repeat_penalty_enabled", False)
+    repeat_active_global_count = None
+    if tool_repeat_enabled:
+        if config.policy_loss.get("loss_mode", "vanilla") != "vanilla":
+            raise ValueError("Tool-repeat penalty currently supports vanilla PPO only")
+        repeat_active_global_count = tu.get_non_tensor_data(data, "tool_repeat_active_global_count", default=None)
+        if repeat_active_global_count is None or "tool_repeat_weights" not in data:
+            raise ValueError("Enabled tool-repeat penalty requires V1 minibatch cost fields")
     thinking_active_global_count = None
     if thinking_repeat_enabled:
         if config.policy_loss.get("loss_mode", "vanilla") != "vanilla":
@@ -102,6 +110,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     fields = ["response_mask", "old_log_probs", "advantages"]
     if tool_failure_enabled:
         fields.append("tool_failure_weights")
+    if tool_repeat_enabled:
+        fields.append("tool_repeat_weights")
     if thinking_repeat_enabled:
         fields.append("thinking_repeat_weights")
     if "train_sample_mask" in data:
@@ -152,6 +162,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         )
         policy_loss = policy_loss + tool_loss
         metrics["actor/tool_failure_loss"] = Metric(value=tool_loss, aggregation=AggregationType.SUM)
+    if tool_repeat_enabled:
+        from verl.utils.swe_tool_failure import local_ppo_loss
+        repeat_loss = local_ppo_loss(
+            log_prob, old_log_prob, data["tool_repeat_weights"], response_mask, config,
+            active_global_count=repeat_active_global_count,
+            dp_size=config.global_batch_info["dp_size"], rollout_is_weights=rollout_is_weights,
+        )
+        policy_loss = policy_loss + repeat_loss
+        metrics["actor/tool_repeat_loss"] = Metric(value=repeat_loss, aggregation=AggregationType.SUM)
     if thinking_repeat_enabled:
         from verl.utils.swe_tool_failure import local_ppo_loss
         thinking_loss = local_ppo_loss(

@@ -43,6 +43,15 @@ def run_ppo(config, task_runner_class) -> None:
     from verl.trainer.ppo.v1.repeat_judge_queue import validate_deferred_config
     validate_deferred_config(config)
 
+    if config.actor_rollout_ref.actor.get("tool_repeat_penalty_enabled", False):
+        if not config.trainer.get("use_v1", False):
+            raise ValueError("Tool-repeat penalty requires trainer.use_v1=True")
+        if config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") != "vanilla":
+            raise ValueError("Tool-repeat penalty currently supports vanilla PPO only")
+        correction = config.algorithm.get("rollout_correction")
+        if correction and correction.get("bypass_mode", False):
+            raise ValueError("Tool-repeat penalty requires recomputed old log probabilities (no bypass mode)")
+
     if config.actor_rollout_ref.actor.get("thinking_repeat_penalty_enabled", False):
         if not config.trainer.get("use_v1", False):
             raise ValueError("Thinking-repeat penalty requires trainer.use_v1=True")

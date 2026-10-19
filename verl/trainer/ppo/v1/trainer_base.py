@@ -2382,7 +2382,8 @@ class PPOTrainer(ABC):
         tool_config = self.config.actor_rollout_ref.get("actor", {})
         tool_failure_enabled = tool_config.get("tool_failure_penalty_enabled", False)
         thinking_repeat_enabled = tool_config.get("thinking_repeat_penalty_enabled", False)
-        local_penalty_enabled = tool_failure_enabled or thinking_repeat_enabled
+        tool_repeat_enabled = tool_config.get("tool_repeat_penalty_enabled", False)
+        local_penalty_enabled = tool_failure_enabled or thinking_repeat_enabled or tool_repeat_enabled
         fields = [
             "uid",
             "response_mask",
@@ -2536,6 +2537,7 @@ class PPOTrainer(ABC):
         # terminal task reward intact, including valid missing-submission -0.1.
         if local_penalty_enabled:
             from verl.utils.swe_tool_failure import gate_positive_credit, trajectory_normalizer
+
             active = exclusion_codes.eq(0) & data.batch["response_mask"].bool().any(-1)
             if "train_sample_mask" in data.batch:
                 active &= data.batch["train_sample_mask"].bool()
@@ -2546,20 +2548,42 @@ class PPOTrainer(ABC):
                     active[i] = False
             trajectory_ids = [key.rsplit("_", 1)[0] for key in batch.keys]
             normalizer = trajectory_normalizer(active, trajectory_ids)
-            for name, enabled in (("tool_failure", tool_failure_enabled), ("thinking_repeat", thinking_repeat_enabled)):
+            for name, enabled in (
+                ("tool_failure", tool_failure_enabled),
+                ("tool_repeat", tool_repeat_enabled),
+                ("thinking_repeat", thinking_repeat_enabled),
+            ):
                 if not enabled:
                     continue
                 if name == "tool_failure":
                     from verl.utils.swe_tool_failure import build_cost_weights
+                elif name == "tool_repeat":
+                    from verl.utils.swe_tool_repeat import build_cost_weights
                 else:
                     from verl.utils.swe_thinking_repeat import build_cost_weights
+                cap = tool_config.get(name + "_penalty_cap", 0.10)
+                if tool_repeat_enabled and tool_failure_enabled and name in {"tool_failure", "tool_repeat"}:
+                    cap = min(
+                        tool_config.get("tool_failure_penalty_cap", 0.10),
+                        tool_config.get("tool_repeat_penalty_cap", 0.10),
+                    )
+                additional = (
+                    {"existing_weights": data.batch.get("tool_failure_weights")} if name == "tool_repeat" else {}
+                )
+                if name == "tool_repeat":
+                    from verl.utils.swe_tool_repeat import RULES
+
+                    additional["enabled_rules"] = {
+                        rule for rule in RULES if tool_config.get("tool_repeat_penalty_" + rule, False)
+                    }
                 weights, counts = build_cost_weights(
                     data.batch["responses"], data.batch["response_mask"], extra_fields, active,
                     cost=tool_config.get(name + "_penalty_cost", 0.02),
-                    cap=tool_config.get(name + "_penalty_cap", 0.10),
+                    cap=cap,
                     warmup_steps=tool_config.get(name + "_penalty_warmup_steps", 10),
                     step=self.global_steps,
                     trajectory_ids=trajectory_ids,
+                    **additional,
                 )
                 data.batch[name + "_weights"] = weights
                 data.batch[name + "_active"] = active
@@ -2580,6 +2604,8 @@ class PPOTrainer(ABC):
         fields = ["advantages", "returns"]
         if tool_failure_enabled:
             fields.append("tool_failure_weights")
+        if tool_repeat_enabled:
+            fields.append("tool_repeat_weights")
         if thinking_repeat_enabled:
             fields.append("thinking_repeat_weights")
         if self.config.algorithm.use_kl_in_reward:
@@ -2593,6 +2619,9 @@ class PPOTrainer(ABC):
         if tool_failure_enabled:
             output["tool_failure_active"] = data.batch["tool_failure_active"]
             output["tool_failure_normalizer"] = data.batch["tool_failure_normalizer"]
+        if tool_repeat_enabled:
+            output["tool_repeat_active"] = data.batch["tool_repeat_active"]
+            output["tool_repeat_normalizer"] = data.batch["tool_repeat_normalizer"]
         if thinking_repeat_enabled:
             output["thinking_repeat_active"] = data.batch["thinking_repeat_active"]
             output["thinking_repeat_normalizer"] = data.batch["thinking_repeat_normalizer"]

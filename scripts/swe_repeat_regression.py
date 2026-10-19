@@ -635,8 +635,13 @@ def replay_evidence(case: dict, policy) -> tuple[list[dict], str, str, list[dict
         events, transcript = audit["events"], audit["original_public_context"]
         if audit.get("version") == policy.SERIALIZER_VERSION:
             serializer = policy
-            actor_kwargs = {"actor_segments": audit.get("actor_segments")}
+            actor_kwargs = {"actor_segments": audit.get("actor_segments"),
+                            "input_view": audit.get("config", {}).get("input_view", "full")}
             source = "captured_exact"
+        elif audit.get("version") == "repeat-public-trajectory-v6":
+            from recipe.swe_agent import repeat_legacy_render_v6 as serializer
+            actor_kwargs = {"actor_segments": audit.get("actor_segments")}
+            source = "captured_render_v6_migrated"
         elif audit.get("version") == "repeat-public-events-v3":
             # Validate the historical literal request using its frozen serializer,
             # THEN build a new v4 request. Never relabel old requests as current.
@@ -802,7 +807,16 @@ async def evaluate_two_level(fixtures: Path, labels: Path, report_path: Path, *,
               "vote_policy_version": policy.VOTE_POLICY_VERSION,
               "judge_voting": {"vote_count": config.vote_count, "vote_quorum": config.vote_quorum,
                                "early_exit_enabled": config.early_exit_enabled,
+                               "early_exit_cases": sum(bool(r.get("early_exit_taken")) for r in audit_rows),
+                               "executed_votes": sum(r.get("vote_count", 0) for r in audit_rows),
+                               "configured_votes": len(audit_rows) * config.vote_count,
+                               "skipped_votes": sum(r.get("votes_skipped", 0) for r in audit_rows),
                                "temperature": config.temperature},
+              "input_view": config.input_view,
+              "input_budget": {"context_overflow_cases": sum(bool(r.get("context_overflow")) for r in audit_rows),
+                  "review_context_overflow_cases": sum(bool((r.get("evidence_review") or {}).get("context_overflow"))
+                      for r in audit_rows),
+                  "largest_primary_prompt_tokens": max((r.get("selected_prompt_tokens", 0) for r in audit_rows), default=0)},
               "contract_extensions": contract_extensions,
               "fixtures_sha256": file_digest(fixtures), "labels_sha256": file_digest(labels),
               "online": online, "model": config.model, "cases": len(rows),

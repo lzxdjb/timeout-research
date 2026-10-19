@@ -411,7 +411,8 @@ def test_success_repeat_benchmark_online_mock_and_public_projection(tmp_path, mo
     assert result["combined"]["tp"] == 1 and result["raw_success_subset"]["tp"] == 1
     assert result["level1"]["deferred"] == 1
     assert result["judge_voting"] == {"vote_count": 3, "vote_quorum": 2, "temperature": 0.2,
-                                       "early_exit_enabled": False}
+                                       "early_exit_enabled": False, "early_exit_cases": 0,
+                                       "executed_votes": 3, "configured_votes": 3, "skipped_votes": 0}
     assert result["judge_repetitive_votes"] == 3
     assert result["rows"][0]["vote_count"] == 3
     (tmp_path / "manifest.json").write_text(json.dumps({
@@ -694,16 +695,16 @@ def test_repeat_public_alignment_preserves_full_context_and_excludes_private_dat
     response = 'START of public observation\n' + 'x' * 2000 + '\nEND of public observation'
     events[0]['observation_view'] = repeat_policy.public_observation_view(response)
     events[0]['observation'] = response
+    events[0]['result'] = response
     events[0]['metadata'] = {'hidden_test': 'PRIVATE_SECRET'}
     transcript = 'FULL CONTEXT ' + response
     body = json.loads(repeat_policy.judge_messages(transcript, events)[1]['content'])
     assert body['public_transcript'] == ''
     first = body['trajectory'][0]
-    assert first['id'] == 1 and first['arguments_view']['text'] == json.dumps(events[0]['arguments'], sort_keys=True)
-    view = first['observation_view']
-    assert view['omitted'] and view['source_chars'] == len(response)
-    assert view['text'].startswith('START') and view['text'].endswith('END of public observation')
-    assert len(view['text']) < 600 and 'PRIVATE_SECRET' not in json.dumps(body)
+    assert first['id'] == 1 and first['arguments'] == events[0]['arguments']
+    assert first['result'] == response
+    assert set(first).isdisjoint({'arguments_view', 'observation_view', 'observation', 'evidence'})
+    assert 'PRIVATE_SECRET' not in json.dumps(body)
     assert events[0]['completed']  # Display shortening does not fabricate missing evidence.
 
 
@@ -823,7 +824,8 @@ def test_repeat_spans_do_not_merge_across_progress_or_count_undispatched_calls()
     assert all(s['all_explicit_noop_edits'] for s in spans)
     transcript = 'full public evidence'
     payload = json.loads(repeat_policy.judge_messages(transcript, events)[1]['content'])
-    assert 'candidate_spans' not in payload and payload['public_transcript'] == transcript
+    assert 'candidate_spans' not in payload and payload['public_transcript'] == ''
+    assert not payload['evidence_complete']
 
 
 def test_repeat_historical_noop_tail_frozen_replay(tmp_path):

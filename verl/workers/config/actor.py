@@ -209,6 +209,15 @@ class ActorConfig(BaseConfig):
     tool_failure_penalty_cost: float = 0.02
     tool_failure_penalty_cap: float = 0.10
     tool_failure_penalty_warmup_steps: int = 10
+    tool_repeat_penalty_enabled: bool = False
+    tool_repeat_penalty_cost: float = 0.02
+    tool_repeat_penalty_cap: float = 0.10
+    tool_repeat_penalty_warmup_steps: int = 10
+    tool_repeat_penalty_noop_edits: bool = False
+    tool_repeat_penalty_unchanged_reads: bool = False
+    tool_repeat_penalty_read_cycles: bool = False
+    tool_repeat_penalty_contract_rejections: bool = False
+    tool_repeat_penalty_varied_noop_edits: bool = False
     thinking_repeat_penalty_enabled: bool = False
     thinking_repeat_penalty_cost: float = 0.02
     thinking_repeat_penalty_cap: float = 0.10
@@ -225,6 +234,14 @@ class ActorConfig(BaseConfig):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING
         assert self.rollout_n != MISSING
+        if self.tool_repeat_penalty_enabled:
+            import math
+            if (not all(math.isfinite(x) and x >= 0 for x in
+                        (self.tool_repeat_penalty_cost, self.tool_repeat_penalty_cap))
+                    or self.tool_repeat_penalty_warmup_steps < 0):
+                raise ValueError("Invalid tool-repeat cost, cap, or warmup")
+            if self.policy_loss.get("loss_mode", "vanilla") != "vanilla":
+                raise ValueError("Tool-repeat penalty currently supports vanilla PPO only")
         if self.thinking_repeat_penalty_enabled:
             import math
             if (not all(math.isfinite(x) and x >= 0 for x in

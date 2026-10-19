@@ -1,4 +1,4 @@
-"""Lossless overflow fallback, budget isolation, and literal-request audit safety."""
+"""Historical compact replay, literal budget isolation and request audit safety."""
 import asyncio
 import copy
 import gzip
@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from recipe.swe_agent import repetition_reward as policy
+from recipe.swe_agent import repeat_legacy_render_v6 as legacy
 from scripts.swe_repeat_regression import replay_events
 
 
@@ -37,9 +38,9 @@ def test_all_eight_historical_overflows_roundtrip_exactly(suffix):
     with gzip.open(fixtures, "rt") as stream:
         case = next(c for c in map(json.loads, stream) if c["id"] == "capture:validation_data:" + suffix)
     public, transcript, _ = replay_events(case, policy)
-    full = body(policy.judge_messages(transcript, public))
-    compact = body(policy.judge_messages(transcript, public, encoding=policy.COMPACT_ENCODING_VERSION))
-    assert policy.decode_compact_body(compact) == canonical(full)
+    full = body(legacy.judge_messages(transcript, public))
+    compact = body(legacy.judge_messages(transcript, public, encoding=legacy.COMPACT_ENCODING_VERSION))
+    assert legacy.decode_compact_body(compact) == canonical(full)
     assert [e["id"] for e in compact["trajectory"]] == [e["id"] for e in public]
     assert len(json.dumps(compact)) < len(json.dumps(full))
 
@@ -51,12 +52,12 @@ def test_reference_shaped_untrusted_data_is_terminal_and_control_tokens_escaped(
     public[0]["observation"] = public[0]["result"] + public[0]["feedback"]
     # Mismatched observation must be stored in full, not reconstructed incorrectly.
     public[1]["observation"] = "different observation"
-    messages = policy.judge_messages("", public, encoding=policy.COMPACT_ENCODING_VERSION)
+    messages = legacy.judge_messages("", public, encoding=legacy.COMPACT_ENCODING_VERSION)
     assert "<|" not in messages[1]["content"]
     compact = body(messages)
     assert "concat_refs" in compact["trajectory"][0]["observation"]
     assert "value_ref" in compact["trajectory"][1]["observation"]
-    assert policy.decode_compact_body(compact) == canonical(body(policy.judge_messages("", public)))
+    assert legacy.decode_compact_body(compact) == canonical(body(legacy.judge_messages("", public)))
 
 
 def test_legacy_missing_observation_and_fallback_statuses_are_preserved():
@@ -65,9 +66,9 @@ def test_legacy_missing_observation_and_fallback_statuses_are_preserved():
     public[0]["observation_view"] = {"text": "partial", "omitted": True, "source_chars": 10000}
     public[0].update(completed=False, serial=False, observation_status="artifact_incomplete")
     public[1]["evidence"] = {"version": "proof", "complete": False, "before": "a", "after": "b"}
-    compact = body(policy.judge_messages("FULL LEGACY TRANSCRIPT", public, encoding=policy.COMPACT_ENCODING_VERSION))
-    decoded = policy.decode_compact_body(compact)
-    assert decoded == canonical(body(policy.judge_messages("FULL LEGACY TRANSCRIPT", public)))
+    compact = body(legacy.judge_messages("FULL LEGACY TRANSCRIPT", public, encoding=legacy.COMPACT_ENCODING_VERSION))
+    decoded = legacy.decode_compact_body(compact)
+    assert decoded == canonical(body(legacy.judge_messages("FULL LEGACY TRANSCRIPT", public)))
     assert decoded["public_transcript"] == "FULL LEGACY TRANSCRIPT" and not decoded["evidence_complete"]
     assert "observation" not in decoded["trajectory"][0]
     assert decoded["trajectory"][0]["observation_view"]["omitted"] is True
@@ -75,7 +76,7 @@ def test_legacy_missing_observation_and_fallback_statuses_are_preserved():
 
 @pytest.mark.parametrize("mutation", ["missing", "ambiguous", "nonstring_concat", "unknown_version"])
 def test_decoder_rejects_corrupt_references(mutation):
-    compact = body(policy.judge_messages("", events(), encoding=policy.COMPACT_ENCODING_VERSION))
+    compact = body(legacy.judge_messages("", events(), encoding=legacy.COMPACT_ENCODING_VERSION))
     if mutation == "missing":
         compact["trajectory"][0]["arguments"] = {"value_ref": "missing"}
     elif mutation == "ambiguous":
@@ -85,7 +86,7 @@ def test_decoder_rejects_corrupt_references(mutation):
     else:
         compact["encoding_version"] = "future-unknown"
     with pytest.raises(ValueError):
-        policy.decode_compact_body(compact)
+        legacy.decode_compact_body(compact)
 
 
 def mock_client(monkeypatch, primary_count, compact_count, *, positive=False, review_count=100):
@@ -115,30 +116,24 @@ def test_budget_boundary_and_identical_vote_token_count_reuse(monkeypatch, offse
     config = policy.RepeatConfig()
     client, calls = mock_client(monkeypatch, config.max_context - config.max_output + offset, 100)
     result = asyncio.run(client.judge_consensus("", events()))
-    assert result["compact_fallback"] == offset
-    assert len([c for c in calls if c[0] == "/tokenize"]) == 1 + offset
+    assert result["compact_fallback"] == 0
+    assert result["context_overflow"] == offset
+    assert len([c for c in calls if c[0] == "/tokenize"]) == 1
     sent = [p for path, p in calls if path == "/v1/chat/completions"]
-    assert len(sent) == 8
+    assert len(sent) == (0 if offset else 8)
     for vote, request in zip(result["votes"], sent):
-        expected = policy.completion_request(config, "", events(), seed=vote["seed"], encoding=result["encoding_version"])
+        expected = policy.completion_request(config, "", events(), seed=vote["seed"])
         assert request == expected
         assert vote["request_sha256"] == policy.digest(request)
         assert vote["input_sha256"] == policy.digest(request["messages"])
-    if not offset:
-        assert sent[0]["messages"] == policy.judge_messages("", events())
 
 
-@pytest.mark.parametrize("primary_overflow,review_overflow", [(True, False), (False, True), (True, True)])
-def test_review_has_independent_budget_and_encoding_and_literal_audit(monkeypatch, tmp_path, primary_overflow, review_overflow):
-    config = policy.RepeatConfig()
-    huge = config.max_context
-    client, calls = mock_client(monkeypatch, huge if primary_overflow else 100, 80, positive=True,
-                                review_count=huge if review_overflow else 110)
+def test_review_has_independent_budget_and_literal_audit(monkeypatch, tmp_path):
+    client, calls = mock_client(monkeypatch, 100, 80, positive=True, review_count=110)
     result = asyncio.run(client.judge_consensus("", events()))
     assert result["verdict"] == "repetitive" and result["evidence_review_passed"] == 1
-    assert result["compact_fallback"] == primary_overflow
-    assert result["evidence_review"]["compact_fallback"] == review_overflow
-    assert len([c for c in calls if c[0] == "/tokenize"]) == 2 + primary_overflow + review_overflow
+    assert not result["compact_fallback"] and not result["evidence_review"]["compact_fallback"]
+    assert len([c for c in calls if c[0] == "/tokenize"]) == 2
     monkeypatch.setenv("SWE_AGENT_REPEAT_AUDIT_DIR", str(tmp_path))
     saved = policy.save_audit("", events(), result, client.config)
     with gzip.open(saved["repeat_reward_audit_path"], "rt") as stream:
@@ -148,42 +143,39 @@ def test_review_has_independent_budget_and_encoding_and_literal_audit(monkeypatc
         assert {**audit["completion_request_template"], "seed": vote["seed"]} == request
     assert audit["evidence_review_request"] == sent[-1]
     assert audit["events"] == events() and audit["judge_request_sent"] is True
-    assert audit["messages"] == sent[0]["messages"]
 
 
-def test_double_overflow_defers_without_completions_and_audit_says_unsent(monkeypatch, tmp_path):
+def test_overflow_defers_without_completions_or_reference_fallback(monkeypatch, tmp_path):
     config = policy.RepeatConfig()
-    client, calls = mock_client(monkeypatch, config.max_context + 100, config.max_context)
+    client, calls = mock_client(monkeypatch, config.max_context + 100, 80)
     result = asyncio.run(client.judge_consensus("", events()))
     assert result["verdict"] == "uncertain" and result["context_overflow"] == 1
-    assert result["compact_fallback"] == 1 and result["token_savings"] == 100
+    assert result["compact_fallback"] == 0 and result["token_savings"] == 0
     assert all(v["reason"] == "context_overflow" for v in result["votes"])
     assert not any(path == "/v1/chat/completions" for path, _ in calls)
-    assert len([c for c in calls if c[0] == "/tokenize"]) == 2
+    assert len([c for c in calls if c[0] == "/tokenize"]) == 1
     monkeypatch.setenv("SWE_AGENT_REPEAT_AUDIT_DIR", str(tmp_path))
     saved = policy.save_audit("", events(), result, config)
     with gzip.open(saved["repeat_reward_audit_path"], "rt") as stream:
         assert json.load(stream)["judge_request_sent"] is False
 
 
-def test_review_double_overflow_vetoes_positive_quorum(monkeypatch):
+def test_review_overflow_vetoes_positive_quorum(monkeypatch):
     config = policy.RepeatConfig()
-    client, calls = mock_client(monkeypatch, 100, config.max_context, positive=True,
-                                review_count=config.max_context + 100)
+    client, calls = mock_client(monkeypatch, 100, 80, positive=True, review_count=config.max_context)
     result = asyncio.run(client.judge_consensus("", events()))
     assert result["verdict"] == "uncertain" and result["repetitive_votes"] == 8
     assert result["evidence_review"]["reason"] == "context_overflow"
     assert result["evidence_review"]["context_overflow"] == 1
     assert len([c for c in calls if c[0] == "/v1/chat/completions"]) == 8
-    assert len([c for c in calls if c[0] == "/tokenize"]) == 3
+    assert len([c for c in calls if c[0] == "/tokenize"]) == 2
 
 
-def test_compact_audit_replays_and_tampered_request_is_rejected(monkeypatch, tmp_path):
-    config = policy.RepeatConfig()
-    client, _ = mock_client(monkeypatch, config.max_context, 100)
+def test_literal_audit_replays_and_tampered_request_is_rejected(monkeypatch, tmp_path):
+    client, _ = mock_client(monkeypatch, 100, 80)
     result = asyncio.run(client.judge_consensus("", events()))
     monkeypatch.setenv("SWE_AGENT_REPEAT_AUDIT_DIR", str(tmp_path))
-    saved = policy.save_audit("", events(), result, config)
+    saved = policy.save_audit("", events(), result, client.config)
     replayed, transcript, source = replay_events(saved, policy)
     assert replayed == events() and transcript == "" and source == "captured_exact"
     with gzip.open(saved["repeat_reward_audit_path"], "rt") as stream:
@@ -191,7 +183,6 @@ def test_compact_audit_replays_and_tampered_request_is_rejected(monkeypatch, tmp
     audit["messages"][1]["content"] += " tampered"
     with gzip.open(saved["repeat_reward_audit_path"], "wt") as stream:
         json.dump(audit, stream)
-    # Even an explicitly updated artifact hash cannot hide a request mismatch.
     from scripts.swe_repeat_regression import file_digest
     saved["repeat_reward_audit_sha256"] = file_digest(Path(saved["repeat_reward_audit_path"]))
     with pytest.raises(ValueError, match="cannot be replayed"):

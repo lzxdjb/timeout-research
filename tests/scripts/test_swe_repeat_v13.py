@@ -52,7 +52,7 @@ def test_complete_content_physically_interleaved_and_boundary_clutter_removed():
     assert set(body).isdisjoint({'events', 'actor_segments', 'timeline'})
     assert [(x['kind'], x['id']) for x in body['trajectory']] == [('actor', 'a1'), ('tool', 1), ('actor', 'a2')]
     assert body['trajectory'][0]['text'].strip() == 'Investigate.'
-    assert body['trajectory'][1]['observation'] == 'different source 1'
+    assert body['trajectory'][1]['result'] == 'different source 1'
     assert '</think>' not in body['trajectory'][-1]['text']
     assert segments[0]['text'].startswith('<think>')  # capture is untouched
 

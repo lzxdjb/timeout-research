@@ -53,9 +53,6 @@ def test_rendering_keeps_raw_audit_and_guard_contract(tmp_path, monkeypatch):
     assert p.validate_verdict(value, [], segments) == value
     assert p.evidence_guard(value, [], segments) == value  # guard intentionally unchanged
     full = json.loads(p.judge_messages('', [], actor_segments=segments)[1]['content'])
-    compact = json.loads(p.judge_messages('', [], actor_segments=segments,
-                                         encoding=p.COMPACT_ENCODING_VERSION)[1]['content'])
-    assert p.decode_compact_body(compact) == full
     assert full['trajectory'][0]['text'] == ''
     monkeypatch.setenv('SWE_AGENT_REPEAT_AUDIT_DIR', str(tmp_path))
     audit = p.save_audit('', [], value, p.RepeatConfig(), actor_segments=segments)

@@ -103,13 +103,15 @@ def verified_span(event, response, mask):
 
 
 def build_cost_weights(
-    responses, response_mask, extra_fields, active, *, cost, cap, warmup_steps, step, trajectory_ids=None
+    responses, response_mask, extra_fields, active, *, cost, cap, warmup_steps, step, trajectory_ids=None,
+    event_key="tool_failure_events", verifier=None, diagnostic_prefix="tool_failure_", existing_weights=None,
 ):
     """Validate sparse events and cap trajectory cost before any minibatch split."""
     import torch
 
     if not math.isfinite(cost) or not math.isfinite(cap) or min(cost, cap) < 0 or warmup_steps < 0:
         raise ValueError("Tool-failure cost/cap must be finite and nonnegative; warmup must be nonnegative")
+    verifier = verifier or verified_span
     weights = torch.zeros_like(response_mask, dtype=torch.float32)
     warmup = min(1.0, max(0.0, step / warmup_steps)) if warmup_steps else 1.0
     trajectory_ids = list(range(len(extra_fields))) if trajectory_ids is None else trajectory_ids
@@ -125,24 +127,35 @@ def build_cost_weights(
         "alignment_abstentions": 0,
     }
     by_trajectory, seen = {}, set()
+    response_rows = responses.tolist()
+    reserved = {}
+    if existing_weights is not None:
+        for row, values in enumerate(existing_weights.detach().gt(0).tolist()):
+            if any(values):
+                reserved.setdefault(trajectory_ids[row], []).append((response_rows[row], values))
     for row, (ids, mask, extra) in enumerate(
-        zip(responses.tolist(), response_mask.tolist(), extra_fields, strict=True)
+        zip(response_rows, response_mask.tolist(), extra_fields, strict=True)
     ):
         extra = getattr(extra, "data", extra)
         if isinstance(extra, dict):
             for key in ("dispatches", "proved_rejections", "outcome_metadata_calls", "alignment_abstentions"):
-                value = extra.get("tool_failure_" + key, 0)
+                value = extra.get(diagnostic_prefix + key, 0)
                 if type(value) is int and value >= 0:
                     counts[key] += value
-        events = extra.get("tool_failure_events", []) if isinstance(extra, dict) else []
+        events = extra.get(event_key, []) if isinstance(extra, dict) else []
         if not isinstance(events, list):
             continue
         counts["events"] += len(events)
         spans, occupied = [], set()
         for event in events:
-            span = verified_span(event, ids, mask)
+            span = verifier(event, ids, mask)
             identity = (trajectory_ids[row], span, event.get("prefix_sha256")) if span else None
-            if span is None or occupied.intersection(range(*span)) or identity in seen:
+            already_charged = span is not None and any(
+                any(values[span[0]:span[1]]) and ids[:span[1]] == previous_ids[:span[1]]
+                for previous_ids, values in reserved.get(trajectory_ids[row], [])
+            )
+            if (span is None or occupied.intersection(range(*span)) or identity in seen
+                    or already_charged):
                 counts["abstained"] += 1
                 continue
             occupied.update(range(*span))
@@ -151,8 +164,11 @@ def build_cost_weights(
         if not bool(active[row]) or not spans:
             continue
         by_trajectory.setdefault(trajectory_ids[row], []).extend((row, start, end) for start, end in spans)
-    for spans in by_trajectory.values():
-        per_call = min(cost, cap / len(spans)) * warmup
+    for trajectory, spans in by_trajectory.items():
+        spent = (sum(float(existing_weights[i].sum()) for i, key in enumerate(trajectory_ids)
+                     if key == trajectory) if existing_weights is not None else 0.0)
+        per_call = (min(cost, cap / len(spans)) * warmup if existing_weights is None
+                    else min(cost * warmup, max(0.0, cap * warmup - spent) / len(spans)))
         if per_call == 0:
             continue
         for row, start, end in spans:
