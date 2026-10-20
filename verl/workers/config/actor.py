@@ -221,7 +221,10 @@ class ActorConfig(BaseConfig):
     tool_repeat_penalty_noop_writes: bool = False
     tool_repeat_penalty_shell_reads: bool = False
     tool_repeat_penalty_shell_min_copies: int = 10
+    tool_repeat_penalty_python_tests: bool = False
+    tool_repeat_penalty_python_test_protected_calls: int = 20
     tool_repeat_shadow_enabled: bool = False
+    tool_repeat_python_test_shadow_enabled: bool = False
     thinking_repeat_penalty_enabled: bool = False
     thinking_repeat_penalty_cost: float = 0.02
     thinking_repeat_penalty_cap: float = 0.10
@@ -250,6 +253,9 @@ class ActorConfig(BaseConfig):
         assert self.rollout_n != MISSING
         if type(self.tool_repeat_penalty_shell_min_copies) is not int or self.tool_repeat_penalty_shell_min_copies < 5:
             raise ValueError("tool_repeat_penalty_shell_min_copies must be >=5")
+        if (type(self.tool_repeat_penalty_python_test_protected_calls) is not int
+                or self.tool_repeat_penalty_python_test_protected_calls < 20):
+            raise ValueError("tool_repeat_penalty_python_test_protected_calls must be >=20")
         if self.tool_repeat_penalty_enabled:
             import math
             if (not all(math.isfinite(x) and x >= 0 for x in

@@ -29,6 +29,21 @@ from verl.trainer.ppo.v1.trainer_base import (
     _v1_train_sample_mask_from_tags,
 )
 from verl.utils import tensordict_utils as tu
+from verl.trainer.ppo.v1.utils import validation_reward_metadata
+
+
+def test_validation_metadata_preserves_scores_and_detector_counters_without_spans():
+    extra = {"reward_extra_info": {"score": 1.0, "raw_score": 1.0, "task_id": "task"},
+             "tool_repeat_shadow_python_test_calls": 20,
+             "thinking_repeat_cross_turn_selected": 8,
+             "tool_repeat_events": [{"start": 1, "end": 10}],
+             "thinking_repeat_events": [{"start": 2, "end": 9}],
+             "secret_token": "do not export"}
+    result = validation_reward_metadata(extra)
+    assert result == {**extra["reward_extra_info"], "tool_repeat_shadow_python_test_calls": 20,
+                      "thinking_repeat_cross_turn_selected": 8}
+    assert validation_reward_metadata({"reward_extra_info": {"score": 0.0}}) == {"score": 0.0}
+    assert validation_reward_metadata(None) == {}
 
 
 class _StubTrainer(PPOTrainer):

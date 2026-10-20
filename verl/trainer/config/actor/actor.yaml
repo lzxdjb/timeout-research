@@ -395,7 +395,11 @@ tool_repeat_penalty_varied_noop_edits: false
 tool_repeat_penalty_noop_writes: false
 tool_repeat_penalty_shell_reads: false
 tool_repeat_penalty_shell_min_copies: 10
+# Experimental observed-loop heuristic; measurements do not prove Python purity.
+tool_repeat_penalty_python_tests: false
+tool_repeat_penalty_python_test_protected_calls: 20
 tool_repeat_shadow_enabled: false
+tool_repeat_python_test_shadow_enabled: false
 
 # Conservative extensions remain off unless independently enabled.
 thinking_repeat_aggregate_enabled: false

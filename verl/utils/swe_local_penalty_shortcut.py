@@ -7,11 +7,14 @@ def verified_local_penalties(output, actor_config):
     """Return supported event counts, independent of warmup's current multiplier.
 
     Costs remain the trainer's responsibility, including exclusions and dedup.
+    The experimental python_tests heuristic participates only with its separate
+    rule flag enabled and a captured aligned event, never from shadow counters.
     A zero cost/cap, disabled rule or stale span must never suppress the judge.
     """
     from verl.utils.swe_thinking_repeat import verified_event
     from verl.utils.swe_tool_failure import verified_span as verify_failure
-    from verl.utils.swe_tool_repeat import RULES, verified_span as verify_repeat
+    from verl.utils.swe_tool_repeat import RULES
+    from verl.utils.swe_tool_repeat import verified_span as verify_repeat
 
     response, mask = output.response_ids, output.response_mask
     extra = output.extra_fields

@@ -103,6 +103,7 @@ from verl.trainer.ppo.v1.utils import (
     compute_v1_trajectory_debug_metrics,
     flatten_v1_extra_fields,
     v1_success_values,
+    validation_reward_metadata,
 )
 from verl.utils import tensordict_utils as tu
 from verl.utils import timeout_debug
@@ -1419,9 +1420,9 @@ class PPOTrainer(ABC):
             if extra_fields_list is not None:
                 n_prior = len(reward_extra_infos_dict["reward"]) - len(extra_fields_list.tolist())
                 for extra_field in extra_fields_list.tolist():
-                    reward_extra_info = (
-                        extra_field.get("reward_extra_info", {}) if isinstance(extra_field, dict) else {}
-                    )
+                    # Validation needs the same scalar detector diagnostics as
+                    # rollout dumps; native spans stay in TransferQueue only.
+                    reward_extra_info = validation_reward_metadata(extra_field)
                     for key in reward_extra_infos_dict:
                         if key != "reward" and key not in reward_extra_info:
                             reward_extra_infos_dict[key].append(None)

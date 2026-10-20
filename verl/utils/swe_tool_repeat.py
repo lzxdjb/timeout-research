@@ -1,9 +1,10 @@
-"""Default-off, execution-proven tool loops and token-local PPO costs.
+"""Default-off tool loops and token-local PPO costs.
 
 No shell purity inference, output-text error classification, or RM dependency.
 The first two calls (two cycles for cyclic reads) are protected. A complete
 five-call streak (ten calls by default for shell reads) or >=20-call/five-copy
-read cycle is required before charging.
+read cycle is required before charging. The separately opted-in Python/test
+observed-loop heuristic protects 20 calls; it does not establish program purity.
 """
 
 import hashlib
@@ -20,6 +21,7 @@ RULES = (
     "varied_noop_edits",
     "noop_writes",
     "shell_reads",
+    "python_tests",
 )
 
 
@@ -53,6 +55,11 @@ def _keys(event):
     ):
         return {}
     keys = {}
+    from recipe.swe_agent.python_test_repeat_evidence import observed_loop_key
+
+    python_key = observed_loop_key(event)
+    if python_key is not None:
+        keys["python_tests"] = python_key
     from recipe.swe_agent.tool_repeat_evidence import proven_extension_key
 
     for rule in ("noop_writes", "shell_reads"):
@@ -82,16 +89,22 @@ def _keys(event):
     return keys
 
 
-def detect(events, enabled_rules, *, shell_min_copies=10):
+def detect(events, enabled_rules, *, shell_min_copies=10, python_test_protected_calls=20):
     """Return all eligible event IDs, not representative trajectory citations."""
     if type(shell_min_copies) is not int or shell_min_copies < 5:
         raise ValueError("shell_min_copies must be an integer >=5")
+    if type(python_test_protected_calls) is not int or python_test_protected_calls < 20:
+        raise ValueError("python_test_protected_calls must be an integer >=20")
     selected = {}
     keys = [_keys(e) for e in events]
     for rule in (r for r in RULES if r in enabled_rules and r != "read_cycles"):
         run, previous = [], None
 
         def flush(current_run, current_rule):
+            if current_rule == "python_tests":
+                for e in current_run[python_test_protected_calls:]:
+                    selected.setdefault(e["id"], set()).add(current_rule)
+                return
             if len(current_run) >= (shell_min_copies if current_rule == "shell_reads" else 5):
                 for e in current_run[2:]:
                     selected.setdefault(e["id"], set()).add(current_rule)
@@ -130,9 +143,10 @@ def detect(events, enabled_rules, *, shell_min_copies=10):
     return {event_id: sorted(rules) for event_id, rules in selected.items()}
 
 
-def capture_events(events, enabled_rules, *, shell_min_copies=10):
+def capture_events(events, enabled_rules, *, shell_min_copies=10, python_test_protected_calls=20):
     """Attach exact generation alignment to every selected call, once."""
-    selected = detect(events, enabled_rules, shell_min_copies=shell_min_copies)
+    selected = detect(events, enabled_rules, shell_min_copies=shell_min_copies,
+                      python_test_protected_calls=python_test_protected_calls)
     captured = []
     for e in events:
         if e["id"] in selected and isinstance(e.get("token_span"), dict):
@@ -196,7 +210,14 @@ def build_cost_weights(*args, enabled_rules=None, **kwargs):
     )
 
 
-def diagnostics(events, *, shadow=False):
+def _python_test_call(event):
+    """Compatibility entry point for the independent diagnostic classifier."""
+    from recipe.swe_agent.python_test_repeat_evidence import is_python_test_call
+
+    return is_python_test_call(event)
+
+
+def diagnostics(events, *, shadow=False, python_test_shadow=False):
     """Numeric eligible/abstention counts; shadow candidates never create events."""
     from collections import Counter
 
@@ -217,6 +238,9 @@ def diagnostics(events, *, shadow=False):
             reason = "infrastructure"
         elif not keys:
             field = (
+                "repeat_python_test_evidence"
+                if event.get("repeat_python_test_evidence") is not None
+                else
                 "repeat_shell_read_evidence"
                 if event.get("name") in {"Bash", "run_shell"}
                 else "tool_repeat_noop_write"
@@ -238,13 +262,20 @@ def diagnostics(events, *, shadow=False):
                 reason = "unsupported_or_unverified"
         if reason:
             out["tool_repeat_abstained_" + reason] += 1
-    if shadow:
+    if shadow or python_test_shadow:
+        if python_test_shadow:
+            out["tool_repeat_shadow_python_test_streaks"] = 0
+            out["tool_repeat_shadow_python_test_calls"] = 0
         previous, run = None, []
 
         def flush():
             if len(run) >= 20:
-                out["tool_repeat_shadow_streaks"] += 1
-                out["tool_repeat_shadow_calls"] += len(run)
+                if shadow:
+                    out["tool_repeat_shadow_streaks"] += 1
+                    out["tool_repeat_shadow_calls"] += len(run)
+                if python_test_shadow and _python_test_call(run[0]):
+                    out["tool_repeat_shadow_python_test_streaks"] += 1
+                    out["tool_repeat_shadow_python_test_calls"] += len(run)
 
         for event in events:
             valid = (

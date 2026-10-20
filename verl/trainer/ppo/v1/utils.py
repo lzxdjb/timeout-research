@@ -22,6 +22,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import compute_advantage
 from verl.trainer.ppo.v1.replay_buffer import (
     DAPO_FILTERED_REWARD_COUNTS_KEY,
+    rollout_diagnostics,
     trajectory_is_unverified,
     unverified_group_decision,
 )
@@ -79,6 +80,17 @@ def v1_success_values(extra_fields: list[Any], fallback_scores: list[Any]) -> li
     if has_accuracy:
         return accuracy_values
     return [_optional_finite_float(score) for score in fallback_scores]
+
+
+def validation_reward_metadata(extra: Any) -> dict[str, Any]:
+    """Keep reward fields and scalar local-detector evidence in validation dumps."""
+    extra = getattr(extra, "data", extra)
+    reward = extra.get("reward_extra_info", {}) if isinstance(extra, dict) else {}
+    reward = reward if isinstance(reward, dict) else {}
+    return {**reward, **{
+        key: value for key, value in rollout_diagnostics(extra).items()
+        if key.startswith(("tool_repeat_", "thinking_repeat_"))
+    }}
 
 
 def flatten_v1_extra_fields(extra_fields: list[Any]) -> dict[str, np.ndarray]:

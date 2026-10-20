@@ -295,7 +295,8 @@ def test_actual_actor_disabled_parity_and_enabled_gradient():
     assert (x.grad - before).sum() == pytest.approx(0.01, abs=1e-7)
 
 
-def run_v1(monkeypatch, enabled, scores, keys=None, tags=None, extras=None, *, thinking=False, tool_repeat=False):
+def run_v1(monkeypatch, enabled, scores, keys=None, tags=None, extras=None, *, thinking=False, tool_repeat=False,
+           python_tests=False):
     from transfer_queue import KVBatchMeta
 
     from verl.trainer.ppo.v1 import trainer_base
@@ -322,6 +323,7 @@ def run_v1(monkeypatch, enabled, scores, keys=None, tags=None, extras=None, *, t
                     tool_failure_penalty_warmup_steps=10,
                     tool_repeat_penalty_enabled=tool_repeat,
                     tool_repeat_penalty_noop_edits=tool_repeat,
+                    tool_repeat_penalty_python_tests=python_tests,
                     tool_repeat_penalty_cost=0.02,
                     tool_repeat_penalty_cap=0.1,
                     tool_repeat_penalty_warmup_steps=10,

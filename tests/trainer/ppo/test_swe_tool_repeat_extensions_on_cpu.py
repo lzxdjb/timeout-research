@@ -39,9 +39,10 @@ def event(i, name, args, text, metadata):
         feedback_delivered=True,
         completed=True,
         observation_status="observed",
+        contract_observation_complete=not metadata.get("output_artifact_path") and not metadata.get("output_truncated"),
         result=rr.public_result(text, metadata),
     )
-    for field in ("repeat_shell_read_evidence", "tool_repeat_noop_write"):
+    for field in ("repeat_shell_read_evidence", "tool_repeat_noop_write", "repeat_python_test_evidence"):
         e[field] = metadata.get(field)
     return e
 
@@ -225,6 +226,50 @@ def test_audited_historical_cards_abstain_without_executor_proof(card):
             assert parse_shell_read(Path("/tmp"), card["arguments"], mount="/testbed") is None
 
 
+@pytest.mark.parametrize("command,expected", [
+    ("python -c 'print(1)'", True),
+    ("cd /testbed && python << 'EOF'\nprint(1)\nEOF", True),
+    ("X=1 /usr/bin/python3.12 -m pytest", True),
+    ("env X=1 pytest -q", True),
+    ("python -m unittest", True),
+    ("tox -e py", True),
+    ("./bin/test test_file.py", True),
+    ("grep python a.py", False),
+    ("echo 'pytest -q'", False),
+    ("bash -c 'python -c 1'", False),
+    ("pythonista a.py", False),
+    ("python 'unterminated", False),
+])
+def test_python_test_shadow_is_independent_and_never_proof(command, expected):
+    events = [event(i, "Bash", {"command": command}, "result may change", {}) for i in range(1, 21)]
+    baseline = diagnostics(events)
+    assert not any("shadow" in key for key in baseline)
+    counters = diagnostics(events, python_test_shadow=True)
+    assert counters["tool_repeat_shadow_python_test_streaks"] == int(expected)
+    assert counters["tool_repeat_shadow_python_test_calls"] == 20 * int(expected)
+    assert "tool_repeat_shadow_streaks" not in counters
+    generic = diagnostics(events, shadow=True)
+    both = diagnostics(events, shadow=True, python_test_shadow=True)
+    assert generic["tool_repeat_shadow_calls"] == both["tool_repeat_shadow_calls"] == 20
+    assert detect(events, {"noop_writes", "shell_reads", "unchanged_reads"}) == {}
+    assert parse_shell_read(Path("/tmp"), {"command": command}) is None or not expected
+
+
+@pytest.mark.parametrize("barrier", ["serial", "feedback_delivered", "infrastructure_failure", "id", "arguments"])
+def test_python_test_shadow_respects_streak_barriers(barrier):
+    events = [event(i, "Bash", {"command": "python -c 'print(1)'"}, "result", {}) for i in range(1, 21)]
+    assert diagnostics(events[:19], python_test_shadow=True)["tool_repeat_shadow_python_test_calls"] == 0
+    if barrier in {"serial", "feedback_delivered"}:
+        events[10][barrier] = False
+    elif barrier == "infrastructure_failure":
+        events[10][barrier] = True
+    elif barrier == "id":
+        events[10][barrier] = 99
+    else:
+        events[10][barrier] = {"command": "python -c 'print(2)'"}
+    assert diagnostics(events, python_test_shadow=True)["tool_repeat_shadow_python_test_calls"] == 0
+
+
 @pytest.mark.parametrize("card", [c for c in CARDS if c["tool"] == "Write"], ids=lambda c: c["task_id"])
 def test_audited_write_content_live_executor(tmp_path, monkeypatch, card):
     s = session(tmp_path, monkeypatch)
@@ -364,6 +409,7 @@ def test_v1_new_diagnostics_are_logged_and_padding_excluded(monkeypatch):
     [
         ("Write", {"file_path": "a.py", "content": "hello"}, "noop_writes", 6),
         ("Bash", {"command": "grep hello a.py"}, "shell_reads", 11),
+        ("Bash", {"command": "python3 -S -c 'print(123)'"}, "python_tests", 23),
     ],
 )
 def test_native_loop_forwards_new_proof_and_aligns_only_call_tokens(
@@ -392,6 +438,7 @@ def test_native_loop_forwards_new_proof_and_aligns_only_call_tokens(
     loop.enable_continuous_token = False
     loop.max_assistant_turns = loop.max_user_turns = None
     loop._swe_tool_repeat_enabled = True
+    loop._swe_tool_repeat_rules = {rule}
     loop._swe_tool_failure_enabled = False
     loop._swe_is_validation = False
     loop._swe_repeat_config = rr.RepeatConfig(mode="off")
@@ -416,6 +463,7 @@ def test_native_loop_forwards_new_proof_and_aligns_only_call_tokens(
             name,
             tools._normalize_tool_parameters(tools.normalize_tool_name(name), parameters),
             collect_contract_rejections=True,
+            collect_python_test_repeat_evidence=getattr(data, "_swe_python_test_repeat_evidence_enabled", False),
         )
 
     loop._await_with_trajectory_deadline = deadline
@@ -441,7 +489,7 @@ def test_native_loop_forwards_new_proof_and_aligns_only_call_tokens(
             data.response_mask += [0]
             data.user_turns += 1
         captured, selected = capture_events(loop._swe_repeat_events, {rule})
-        assert len(captured) == selected == count - 3
+        assert len(captured) == selected == count - (21 if rule == "python_tests" else 3)
         assert loop._swe_repeat_events[-1]["feedback_delivered"] is False
         response = data.prompt_ids[-len(data.response_mask) :]
         for item in captured:
