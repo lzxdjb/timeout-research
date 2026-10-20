@@ -2,7 +2,8 @@
 
 No shell purity inference, output-text error classification, or RM dependency.
 The first two calls (two cycles for cyclic reads) are protected. A complete
-five-call streak or >=20-call/five-copy read cycle is required before charging.
+five-call streak (ten calls by default for shell reads) or >=20-call/five-copy
+read cycle is required before charging.
 """
 
 import hashlib
@@ -11,7 +12,15 @@ import json
 from verl.utils.swe_tool_failure import token_digest, valid_proof
 
 VERSION = 1
-RULES = ("noop_edits", "unchanged_reads", "read_cycles", "contract_rejections", "varied_noop_edits")
+RULES = (
+    "noop_edits",
+    "unchanged_reads",
+    "read_cycles",
+    "contract_rejections",
+    "varied_noop_edits",
+    "noop_writes",
+    "shell_reads",
+)
 
 
 def _proof_digest(proof):
@@ -44,6 +53,12 @@ def _keys(event):
     ):
         return {}
     keys = {}
+    from recipe.swe_agent.tool_repeat_evidence import proven_extension_key
+
+    for rule in ("noop_writes", "shell_reads"):
+        key = proven_extension_key(event, rule)
+        if key is not None:
+            keys[rule] = key
     if rr.explicit_noop_edit(event):
         keys["noop_edits"] = rr.digest(event["arguments"])
         proof = event.get("tool_repeat_noop_edit") or {}
@@ -67,15 +82,17 @@ def _keys(event):
     return keys
 
 
-def detect(events, enabled_rules):
+def detect(events, enabled_rules, *, shell_min_copies=10):
     """Return all eligible event IDs, not representative trajectory citations."""
+    if type(shell_min_copies) is not int or shell_min_copies < 5:
+        raise ValueError("shell_min_copies must be an integer >=5")
     selected = {}
     keys = [_keys(e) for e in events]
     for rule in (r for r in RULES if r in enabled_rules and r != "read_cycles"):
         run, previous = [], None
 
         def flush(current_run, current_rule):
-            if len(current_run) >= 5:
+            if len(current_run) >= (shell_min_copies if current_rule == "shell_reads" else 5):
                 for e in current_run[2:]:
                     selected.setdefault(e["id"], set()).add(current_rule)
 
@@ -113,9 +130,9 @@ def detect(events, enabled_rules):
     return {event_id: sorted(rules) for event_id, rules in selected.items()}
 
 
-def capture_events(events, enabled_rules):
+def capture_events(events, enabled_rules, *, shell_min_copies=10):
     """Attach exact generation alignment to every selected call, once."""
-    selected = detect(events, enabled_rules)
+    selected = detect(events, enabled_rules, shell_min_copies=shell_min_copies)
     captured = []
     for e in events:
         if e["id"] in selected and isinstance(e.get("token_span"), dict):
@@ -177,3 +194,70 @@ def build_cost_weights(*args, enabled_rules=None, **kwargs):
     return build(
         *args, event_key="tool_repeat_events", verifier=verify_enabled, diagnostic_prefix="tool_repeat_", **kwargs
     )
+
+
+def diagnostics(events, *, shadow=False):
+    """Numeric eligible/abstention counts; shadow candidates never create events."""
+    from collections import Counter
+
+    from recipe.swe_agent.repetition_reward import digest
+
+    out = Counter()
+    for event in events:
+        keys = _keys(event)
+        for rule in RULES:
+            if rule != "read_cycles":
+                out["tool_repeat_eligible_" + rule] += rule in keys
+        reason = None
+        if event.get("serial") is not True:
+            reason = "nonserial"
+        elif event.get("feedback_delivered") is not True:
+            reason = "undelivered"
+        elif event.get("infrastructure_failure") is True:
+            reason = "infrastructure"
+        elif not keys:
+            field = (
+                "repeat_shell_read_evidence"
+                if event.get("name") in {"Bash", "run_shell"}
+                else "tool_repeat_noop_write"
+                if event.get("name") in {"Write", "write_file"}
+                else "evidence"
+            )
+            proof = event.get(field)
+            if not isinstance(proof, dict):
+                reason = "proof_missing"
+            elif proof.get("unavailable_reason") == "disabled_on_execution_service":
+                reason = "proof_disabled"
+            elif proof.get("before") and proof.get("before") != proof.get("after"):
+                reason = "state_changed"
+            elif proof.get("unavailable_reason") == "unsupported_or_incomplete":
+                reason = "unsupported_or_incomplete_scope"
+            elif proof.get("complete") is False:
+                reason = "proof_incomplete"
+            else:
+                reason = "unsupported_or_unverified"
+        if reason:
+            out["tool_repeat_abstained_" + reason] += 1
+    if shadow:
+        previous, run = None, []
+
+        def flush():
+            if len(run) >= 20:
+                out["tool_repeat_shadow_streaks"] += 1
+                out["tool_repeat_shadow_calls"] += len(run)
+
+        for event in events:
+            valid = (
+                event.get("serial") is True
+                and event.get("feedback_delivered") is True
+                and event.get("infrastructure_failure") is not True
+            )
+            key = (event.get("name"), digest(event.get("arguments"))) if valid else None
+            if key is None or key != previous or run and event["id"] != run[-1]["id"] + 1:
+                flush()
+                run = []
+            if key is not None:
+                run.append(event)
+            previous = key
+        flush()
+    return dict(out)

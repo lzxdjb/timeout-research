@@ -60,7 +60,7 @@ def rollout_diagnostics(extra) -> dict:
                   "verification_invalidated", "submission_after_fresh_verification", "diagnostic_outcome_code",
                   "hidden_pass", "verification_attempted", "verification_passed", "verification_meaningful",
                   "verification_meaningful_reason"})
-    prefixes = ("trajectory_", "partial_hidden_reward_", "repeat_reward_", "tool_repeat_", "observed_infrastructure_failure",
+    prefixes = ("trajectory_", "partial_hidden_reward_", "repeat_reward_", "tool_repeat_", "thinking_repeat_", "observed_infrastructure_failure",
                 "private_evaluator_", "hidden_test_count", "hidden_test_commands_", "hidden_tests_total_", "hidden_tests_passed_",
                 "oom_", "public_verification_", "public_patch_", "public_hidden_workspace_", "final_patch_")
     result = {"rollout_diagnostic_version": 1}

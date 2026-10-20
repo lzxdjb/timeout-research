@@ -392,3 +392,19 @@ tool_repeat_penalty_unchanged_reads: false
 tool_repeat_penalty_read_cycles: false
 tool_repeat_penalty_contract_rejections: false
 tool_repeat_penalty_varied_noop_edits: false
+tool_repeat_penalty_noop_writes: false
+tool_repeat_penalty_shell_reads: false
+tool_repeat_penalty_shell_min_copies: 10
+tool_repeat_shadow_enabled: false
+
+# Conservative extensions remain off unless independently enabled.
+thinking_repeat_aggregate_enabled: false
+thinking_repeat_aggregate_max_gap: 4096
+thinking_repeat_aggregate_min_identities: 3
+thinking_repeat_aggregate_min_surplus: 512
+thinking_repeat_aggregate_min_fraction: 0.3
+thinking_repeat_cross_turn_enabled: false
+thinking_repeat_cross_turn_min_tokens: 32
+thinking_repeat_cross_turn_min_copies: 8
+thinking_repeat_cross_turn_min_surplus: 256
+thinking_repeat_cross_turn_max_period: 4

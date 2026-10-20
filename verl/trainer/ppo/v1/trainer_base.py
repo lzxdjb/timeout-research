@@ -2399,6 +2399,15 @@ class PPOTrainer(ABC):
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         extra_fields = data.pop("extra_fields").tolist()
+        if tool_repeat_enabled:
+            for extra, tag in zip(extra_fields, batch.tags, strict=True):
+                if tag.get("is_padding", False) or not isinstance(extra, dict):
+                    continue
+                for key, value in extra.items():
+                    if key.startswith(("tool_repeat_eligible_", "tool_repeat_abstained_", "tool_repeat_shadow_")):
+                        if isinstance(value, (int, float)) and np.isfinite(value) and value >= 0:
+                            name = "tool_repeat/" + key.removeprefix("tool_repeat_")
+                            metrics[name] = metrics.get(name, 0) + value
         reward_diagnostics = [extra["reward_extra_info"] for extra, tag in zip(extra_fields, batch.tags, strict=True)
                               if not tag.get("is_padding", False) and isinstance(extra, dict)
                               and isinstance(extra.get("reward_extra_info"), dict)]

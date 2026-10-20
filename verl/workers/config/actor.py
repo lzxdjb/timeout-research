@@ -218,10 +218,24 @@ class ActorConfig(BaseConfig):
     tool_repeat_penalty_read_cycles: bool = False
     tool_repeat_penalty_contract_rejections: bool = False
     tool_repeat_penalty_varied_noop_edits: bool = False
+    tool_repeat_penalty_noop_writes: bool = False
+    tool_repeat_penalty_shell_reads: bool = False
+    tool_repeat_penalty_shell_min_copies: int = 10
+    tool_repeat_shadow_enabled: bool = False
     thinking_repeat_penalty_enabled: bool = False
     thinking_repeat_penalty_cost: float = 0.02
     thinking_repeat_penalty_cap: float = 0.10
     thinking_repeat_penalty_warmup_steps: int = 10
+    thinking_repeat_aggregate_enabled: bool = False
+    thinking_repeat_aggregate_max_gap: int = 4096
+    thinking_repeat_aggregate_min_identities: int = 3
+    thinking_repeat_aggregate_min_surplus: int = 512
+    thinking_repeat_aggregate_min_fraction: float = 0.3
+    thinking_repeat_cross_turn_enabled: bool = False
+    thinking_repeat_cross_turn_min_tokens: int = 32
+    thinking_repeat_cross_turn_min_copies: int = 8
+    thinking_repeat_cross_turn_min_surplus: int = 256
+    thinking_repeat_cross_turn_max_period: int = 4
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -234,6 +248,8 @@ class ActorConfig(BaseConfig):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING
         assert self.rollout_n != MISSING
+        if type(self.tool_repeat_penalty_shell_min_copies) is not int or self.tool_repeat_penalty_shell_min_copies < 5:
+            raise ValueError("tool_repeat_penalty_shell_min_copies must be >=5")
         if self.tool_repeat_penalty_enabled:
             import math
             if (not all(math.isfinite(x) and x >= 0 for x in
@@ -242,6 +258,11 @@ class ActorConfig(BaseConfig):
                 raise ValueError("Invalid tool-repeat cost, cap, or warmup")
             if self.policy_loss.get("loss_mode", "vanilla") != "vanilla":
                 raise ValueError("Tool-repeat penalty currently supports vanilla PPO only")
+        if self.thinking_repeat_aggregate_enabled or self.thinking_repeat_cross_turn_enabled:
+            if not self.thinking_repeat_penalty_enabled:
+                raise ValueError("Thinking-repeat extensions require thinking_repeat_penalty_enabled")
+        from verl.utils.swe_thinking_repeat import configs_from_actor
+        configs_from_actor(vars(self))  # Validate detector thresholds before starting workers.
         if self.thinking_repeat_penalty_enabled:
             import math
             if (not all(math.isfinite(x) and x >= 0 for x in
