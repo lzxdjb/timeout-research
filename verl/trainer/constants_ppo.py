@@ -150,4 +150,21 @@ def get_ppo_ray_runtime_env(config=None):
     if config is not None:
         repeat_enabled = "1" if actor.get("tool_repeat_penalty_enabled", False) else "0"
     runtime_env["env_vars"]["SWE_AGENT_TRAINING_TOOL_REPEAT_PENALTY_ENABLED"] = repeat_enabled
+    # Cutoff diagnostics are opt-in and must reach Ray rollout workers, where
+    # per-session lifecycle and partial-token state are available.
+    runtime_env["env_vars"]["SWE_AGENT_CUTOFF_DEBUG"] = os.environ.get("SWE_AGENT_CUTOFF_DEBUG", "0")
+    runtime_env["env_vars"]["SWE_AGENT_CUTOFF_DEBUG_DIR"] = os.environ.get("SWE_AGENT_CUTOFF_DEBUG_DIR", "")
+    # Empty values explicitly disable overrides on reused Ray workers.
+    for key in (
+        "SWE_AGENT_ROLLOUT_TRAINING_RESPONSE_LENGTH",
+        "SWE_AGENT_ROLLOUT_VALIDATION_RESPONSE_LENGTH",
+    ):
+        runtime_env["env_vars"][key] = os.environ.get(key, "")
+    for key in (
+        "SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD",
+        "SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            runtime_env["env_vars"][key] = value
     return runtime_env

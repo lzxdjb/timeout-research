@@ -257,6 +257,15 @@ if ! [[ "$ref_log_prob_max_token_len_per_gpu" =~ ^[0-9]+$ ]] || (( 10#$ref_log_p
 fi
 max_sequence_length=$((10#$max_prompt_length + 10#$max_response_length))
 
+# Optional effective SWE budgets; keep shared engine/tensor capacity unchanged.
+# Leave either variable unset/empty to inherit max_response_length. These can be
+# changed independently when restarting from a full training checkpoint.
+export SWE_AGENT_ROLLOUT_TRAINING_RESPONSE_LENGTH="${SWE_AGENT_ROLLOUT_TRAINING_RESPONSE_LENGTH:-}"
+export SWE_AGENT_ROLLOUT_VALIDATION_RESPONSE_LENGTH="${SWE_AGENT_ROLLOUT_VALIDATION_RESPONSE_LENGTH:-}"
+if [[ -n "$SWE_AGENT_ROLLOUT_TRAINING_RESPONSE_LENGTH$SWE_AGENT_ROLLOUT_VALIDATION_RESPONSE_LENGTH" ]]; then
+  python "$TARGET_VERL/verl/utils/swe_response_budget.py" "$max_response_length"
+fi
+
 SWE_AGENT_HARNESS_PROFILE="${SWE_AGENT_HARNESS_PROFILE:-baseline}"
 export SWE_AGENT_HARNESS_PROFILE
 if [[ -z "${SWE_AGENT_TOOL_CONFIG_PATH:-}" ]]; then

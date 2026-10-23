@@ -35,6 +35,7 @@ from verl.experimental.agent_loop import (
 )
 from verl.trainer.ppo.v1.repeat_judge_queue import RepeatQueueError, progress_interval_seconds
 from verl.utils.ray_utils import auto_await
+from verl.utils.swe_cutoff_debug import cutoff_debug_enabled, reconcile_cutoff_sessions, write_cutoff_debug_event
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         self.repeat_debug_prompts: dict[tuple[str, str], float] = {}
         self.background_tasks = set()
         self.prompt_tasks: dict[str, dict[str, asyncio.Task[Any]]] = {"train": {}, "val": {}}
+        self.cutoff_session_states: dict[tuple[str, str], dict[str, Any]] = {}
 
     async def configure_repeat_coordinator(self, coordinator):
         self.repeat_coordinator = coordinator
@@ -206,6 +208,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
 
+        if cutoff_debug_enabled():
+            write_cutoff_debug_event(
+                "rollout_debug_config", partition="val" if validate else "train",
+                temperature=sampling_params["temperature"], top_p=sampling_params["top_p"],
+                top_k=sampling_params["top_k"], rollout_n=config.val_kwargs.n if validate else config.n,
+                training_completion_ratio=os.environ.get("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD"),
+                validation_completion_ratio=os.environ.get("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD"),
+            )
+
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch:
             default_agent_loop = config.agent.default_agent_loop
@@ -228,14 +239,31 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 else:
                     logger.exception(f"Unsupported type {type(v)} for key {k}")
 
+            uid = str(prompt["uid"])
+            partition_id = "val" if validate else "train"
+            if cutoff_debug_enabled():
+                config = self.config.actor_rollout_ref.rollout
+                expected = prompt.get("__rollout_n__", config.val_kwargs.n if validate else config.n)
+                self.cutoff_session_states[(partition_id, uid)] = {
+                    "expected": int(expected),
+                    "started": set(),
+                    "returned": set(),
+                    "cancelled": set(),
+                    "failed": set(),
+                    "published": set(),
+                    "published_trajectory_count": 0,
+                    "session_summaries": {},
+                    "cancel_reason": None,
+                    "step": trajectory_info[i].get("step"),
+                    "sample_index": trajectory_info[i].get("sample_index"),
+                    "started_at": time.time(),
+                }
             # “fire-and-forget” background tasks
             task = asyncio.create_task(
                 self._run_prompt(prompt, sampling_params, trajectory=trajectory_info[i], trace=trace_this_sample)
             )
             self.background_tasks.add(task)
             task.add_done_callback(self.background_tasks.discard)
-            uid = str(prompt["uid"])
-            partition_id = "val" if validate else "train"
             self.prompt_tasks[partition_id][uid] = task
             task.add_done_callback(
                 lambda completed, partition_id=partition_id, uid=uid: self._discard_prompt_task(
@@ -254,6 +282,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             and items.get(uid, {}).get("status") != "reward_pending"
             and not items.get(uid, {}).get("generation_complete", False)
         }
+        cutoff_states = {}
+        for uid in tasks_by_uid:
+            state = self.cutoff_session_states.get((partition_id, str(uid)))
+            if state is not None:
+                state["cancel_reason"] = "completion_ratio_cutoff"
+                state["cutoff_requested_at"] = time.time()
+                cutoff_states[uid] = state
         for task in tasks_by_uid.values():
             task.cancel()
         if tasks_by_uid:
@@ -265,10 +300,32 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         items = (tq.kv_list(partition_id) or {}).get(partition_id, {})
         for uid in tasks_by_uid:
             tag = items.get(uid, {})
+            trajectory_keys = [key for key in items if key.startswith(f"{uid}_")]
+            if tag.get("status") in {"pending", "running"}:
+                trajectory_keys = self._ready_trajectory_keys(partition_id, trajectory_keys)
+            state = cutoff_states.get(uid)
+            if state is not None:
+                # Observe the existing queue snapshot. Readiness checks below may
+                # delete incomplete fields, so never add one for a terminal group.
+                published_sessions = set()
+                for key in trajectory_keys:
+                    suffix = key[len(f"{uid}_"):].rsplit("_", 1)[0]
+                    try:
+                        published_sessions.add(int(suffix))
+                    except (TypeError, ValueError):
+                        continue
+                self._record_cutoff_group_census(
+                    partition_id, str(uid), state,
+                    published=published_sessions,
+                    trajectory_count=len(trajectory_keys),
+                    terminal_status=tag.get("status"),
+                    cutoff_applied=(
+                        bool(tag.get("completion_ratio_cutoff")) or tag.get("status") in {"pending", "running"}
+                    ),
+                )
+            self.cutoff_session_states.pop((partition_id, str(uid)), None)
             if tag.get("status") not in {"pending", "running"}:
                 continue
-            trajectory_keys = [key for key in items if key.startswith(f"{uid}_")]
-            trajectory_keys = self._ready_trajectory_keys(partition_id, trajectory_keys)
             if trajectory_keys:
                 trajectory_tags = []
                 for key in trajectory_keys:
@@ -293,30 +350,66 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         prompt_started = time.monotonic()
         self.repeat_debug_prompts[(partition_id, str(uid))] = prompt_started
         self._repeat_debug_event("prompt_start", partition_id, str(uid))
-        await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
-        self._repeat_debug_event("prompt_running", partition_id, str(uid))
         tasks = []
         self.repeat_finalizers[(partition_id, str(uid))] = []
+        config = self.config.actor_rollout_ref.rollout
+        n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
+        do_sample = prompt.pop("__do_sample__", True)
+        state_key = (partition_id, str(uid))
+        session_state = self.cutoff_session_states.get(state_key) if cutoff_debug_enabled() else None
+        if cutoff_debug_enabled() and session_state is None:
+            session_state = {
+                "expected": n,
+                "started": set(),
+                "returned": set(),
+                "cancelled": set(),
+                "failed": set(),
+                "published": set(),
+                "published_trajectory_count": 0,
+                "session_summaries": {},
+                "cancel_reason": None,
+                "step": trajectory.get("step"),
+                "sample_index": trajectory.get("sample_index"),
+                "started_at": time.time(),
+            }
+            self.cutoff_session_states[state_key] = session_state
+        self.repeat_generation_sessions[state_key] = (n, set())
         try:
-            # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
-            config = self.config.actor_rollout_ref.rollout
-            n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
-            do_sample = prompt.pop("__do_sample__", True)
-            self.repeat_generation_sessions[(partition_id, str(uid))] = (n, set())
-
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
+            self._repeat_debug_event("prompt_running", partition_id, str(uid))
             run_sampling_params = dict(sampling_params)
             if not trajectory["validate"] and not do_sample:
                 apply_greedy_sampling_params(run_sampling_params)
 
+            async def run_session(session_id: int):
+                if session_state is not None:
+                    session_state["started"].add(session_id)
+                try:
+                    result = await self._run_agent_loop(
+                        run_sampling_params,
+                        trajectory=trajectory,
+                        trace=trace,
+                        session_id=session_id,
+                        **({"_swe_cutoff_context": session_state} if session_state is not None else {}),
+                        **({"_swe_repeat_deferred_supported": True} if self.repeat_coordinator is not None else {}),
+                        **prompt,
+                    )
+                except asyncio.CancelledError:
+                    if session_state is not None:
+                        session_state["cancelled"].add(session_id)
+                    raise
+                except BaseException:
+                    if session_state is not None:
+                        session_state["failed"].add(session_id)
+                    raise
+                else:
+                    if session_state is not None:
+                        session_state["returned"].add(session_id)
+                    return result
+
             tasks = []
             for i in range(n):
-                task = asyncio.create_task(
-                    self._run_agent_loop(
-                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i,
-                        **({"_swe_repeat_deferred_supported": True} if self.repeat_coordinator is not None else {}),
-                        **prompt
-                    )
-                )
+                task = asyncio.create_task(run_session(i))
                 tasks.append(task)
 
             # Publish a terminal status only after every session settles, so no sibling can write after
@@ -344,6 +437,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             else:
                 status = "finished"
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
+            if session_state is not None:
+                session_state["terminal_status"] = status
             self._repeat_debug_event("prompt_finished", partition_id, str(uid), status=status,
                                      seconds=time.monotonic() - prompt_started)
         except asyncio.CancelledError:
@@ -406,6 +501,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             except Exception as reward_error:
                 e = reward_error
             status = "reward_error" if isinstance(e, RepeatQueueError) else "failure"
+            if session_state is not None:
+                session_state["terminal_status"] = status
             tag = {"status": status}
             if status == "reward_error":
                 tag["repeat_error"] = str(e)[:1000]
@@ -414,15 +511,100 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                                      seconds=time.monotonic() - prompt_started,
                                      error_type=type(e).__name__)
         finally:
+            if session_state is not None and session_state.get("cancel_reason") is None:
+                self._record_cutoff_group_census(
+                    partition_id, str(uid), session_state,
+                    published=session_state["published"],
+                    trajectory_count=session_state["published_trajectory_count"],
+                    terminal_status=session_state.get("terminal_status"),
+                )
             self.repeat_debug_prompts.pop((partition_id, str(uid)), None)
             self.repeat_finalizers.pop((partition_id, str(uid)), None)
             self.repeat_generation_sessions.pop((partition_id, str(uid)), None)
+            self.cutoff_session_states.pop((partition_id, str(uid)), None)
+
+    @staticmethod
+    def _record_cutoff_group_census(
+        partition_id: str,
+        uid: str,
+        state: dict[str, Any],
+        *,
+        published: set[int],
+        trajectory_count: int,
+        terminal_status: str | None = None,
+        cutoff_applied: bool = False,
+    ) -> None:
+        if state.get("census_written"):
+            return
+        try:
+            state["census_written"] = True
+            counts = reconcile_cutoff_sessions(
+                state.get("expected", 0),
+                started=state.get("started", ()),
+                returned=state.get("returned", ()),
+                cancelled=state.get("cancelled", ()),
+                failed=state.get("failed", ()),
+                published=published,
+            )
+            threshold_name = (
+                "SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD"
+                if partition_id == "val"
+                else "SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD"
+            )
+            cutoff_requested = state.get("cancel_reason") == "completion_ratio_cutoff"
+            cancelled = bool(counts["cancelled_sessions"])
+            if cutoff_requested:
+                event = "prompt_group_cutoff_census"
+            elif cancelled:
+                event = "prompt_group_cancelled_census"
+            else:
+                event = "prompt_group_settled_census"
+            write_cutoff_debug_event(
+                event,
+                partition=partition_id,
+                uid=uid,
+                global_step=state.get("step"),
+                sample_index=state.get("sample_index"),
+                cutoff_reason=state.get("cancel_reason"),
+                cutoff_requested=int(cutoff_requested),
+                cutoff_applied=int(cutoff_applied),
+                terminal_status=terminal_status,
+                threshold=os.environ.get(threshold_name),
+                cutoff_requested_at_unix_seconds=state.get("cutoff_requested_at"),
+                group_elapsed_seconds=round(time.time() - state.get("started_at", time.time()), 3),
+                published_trajectory_count=int(trajectory_count),
+                **counts,
+            )
+            for session_id, summary in state.get("session_summaries", {}).items():
+                write_cutoff_debug_event(
+                    "session_behavior_summary",
+                    partition=partition_id,
+                    uid=uid,
+                    global_step=state.get("step"),
+                    sample_index=state.get("sample_index"),
+                    session_id=session_id,
+                    cutoff_requested=int(cutoff_requested),
+                    cutoff_group=int(cutoff_applied),
+                    **summary,
+                )
+            logger.info(
+                "Cutoff session census partition=%s uid=%s expected=%d started=%d returned=%d "
+                "cancelled=%d failed=%d published=%d not_started=%d unpublished=%d trajectories=%d",
+                partition_id, uid, counts["expected_sessions"], counts["started_sessions"],
+                counts["returned_sessions"], counts["cancelled_sessions"], counts["failed_sessions"],
+                counts["published_sessions"], counts["not_started_sessions"],
+                counts["returned_without_publication_sessions"], trajectory_count,
+            )
+        except Exception:
+            logger.warning("Unable to summarize cutoff group; rollout behavior is unchanged", exc_info=True)
+            state["census_written"] = True
 
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
         """Put agent loop outputs into TransferQueue."""
         kwargs.pop("_swe_repeat_deferred_supported", None)
+        kwargs.pop("_swe_cutoff_context", None)
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         partition_id = "val" if validate else "train"
         postprocess_started = time.monotonic()
@@ -569,6 +751,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             tags=tags,
             partition_id="train" if not validate else "val",
         )
+        cutoff_state = self.cutoff_session_states.get((partition_id, str(uid)))
+        if cutoff_state is not None:
+            cutoff_state["published"].add(int(session_id))
+            cutoff_state["published_trajectory_count"] += len(keys)
         self._repeat_debug_event("trajectory_published", partition_id, str(uid),
                                  session=session_id, outputs=len(outputs),
                                  seconds=time.monotonic() - postprocess_started)

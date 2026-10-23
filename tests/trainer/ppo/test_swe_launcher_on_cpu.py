@@ -4,7 +4,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LAUNCHER = REPO_ROOT / "scripts" / "run_swe_agent_qwen3_5_35b_a3b.sh"
 
@@ -33,6 +32,9 @@ TIMEOUT_DEFAULTS = {
 def _create_fake_checkouts(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     target = tmp_path / "verl"
     (target / "verl").mkdir(parents=True)
+    budget_helper = target / "verl" / "utils" / "swe_response_budget.py"
+    budget_helper.parent.mkdir()
+    budget_helper.write_bytes((LAUNCHER.parents[1] / "verl" / "utils" / "swe_response_budget.py").read_bytes())
     example = target / "examples" / "grpo_trainer" / "run_qwen3_5_35b_megatron.sh"
     example.parent.mkdir(parents=True)
     example.write_text("#!/usr/bin/env bash\n/usr/bin/env\n", encoding="utf-8")
@@ -73,6 +75,8 @@ def _launcher_env(target: Path, source: Path, model: Path) -> dict[str, str]:
         env.pop(name, None)
     env.pop("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", None)
     env.pop("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD", None)
+    env.pop("SWE_AGENT_ROLLOUT_TRAINING_RESPONSE_LENGTH", None)
+    env.pop("SWE_AGENT_ROLLOUT_VALIDATION_RESPONSE_LENGTH", None)
     env.update(
         {
             "TARGET_VERL": str(target),
@@ -144,6 +148,30 @@ def test_launcher_rejects_invalid_completion_ratio(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "must be greater than 0 and at most 1" in result.stderr
+
+
+def test_launcher_exports_independent_response_lengths_without_changing_capacity(tmp_path: Path) -> None:
+    target, source, model, _revision = _create_fake_checkouts(tmp_path)
+    env = _launcher_env(target, source, model)
+    env["max_response_length"] = "253952"
+    env["SWE_AGENT_ROLLOUT_TRAINING_RESPONSE_LENGTH"] = "65536"
+    env["SWE_AGENT_ROLLOUT_VALIDATION_RESPONSE_LENGTH"] = "253952"
+    result = subprocess.run([str(LAUNCHER)], env=env, check=True, text=True, capture_output=True)
+    exported = _exported_environment(result.stdout)
+    assert exported["SWE_AGENT_ROLLOUT_TRAINING_RESPONSE_LENGTH"] == "65536"
+    assert exported["SWE_AGENT_ROLLOUT_VALIDATION_RESPONSE_LENGTH"] == "253952"
+    assert "training=65536 validation=253952 capacity=253952" in result.stdout
+    assert "response=253952" in result.stdout
+
+
+def test_launcher_rejects_response_budget_above_shared_capacity(tmp_path: Path) -> None:
+    target, source, model, _revision = _create_fake_checkouts(tmp_path)
+    env = _launcher_env(target, source, model)
+    env["max_response_length"] = "40000"
+    env["SWE_AGENT_ROLLOUT_TRAINING_RESPONSE_LENGTH"] = "65536"
+    result = subprocess.run([str(LAUNCHER)], env=env, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert "exceeds shared rollout response capacity 40000" in result.stderr
 
 
 def test_launcher_rejects_source_revision_mismatch(tmp_path: Path) -> None:
