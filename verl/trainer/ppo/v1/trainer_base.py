@@ -87,14 +87,14 @@ from verl.trainer.ppo.utils import (
     need_teacher_policy,
 )
 from verl.trainer.ppo.v1.replay_buffer import (
-    trajectory_is_unverified,
-    unverified_trajectory_ratio_threshold,
     DAPO_FILTERED_REWARD_COUNTS_KEY,
     ReplayBuffer,
     ReplayBufferAsync,
     golden_replay_enabled,
     infrastructure_failure_ratio_threshold,
     rollout_diagnostics,
+    trajectory_is_unverified,
+    unverified_trajectory_ratio_threshold,
 )
 from verl.trainer.ppo.v1.utils import (
     MetricsAggregator,
@@ -117,6 +117,14 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip import SkipManager
+from verl.utils.swe_validation import (
+    fixed_roster_report,
+    load_roster,
+    positive_seconds,
+    strict_validation_enabled,
+    task_identity,
+    write_json_atomic,
+)
 from verl.utils.tracking import DapoFilteredRewardTableLogger, Tracking, ValidationGenerationsLogger
 from verl.workers.config import CriticConfig, DistillationConfig, HFModelConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
@@ -992,6 +1000,13 @@ class PPOTrainer(ABC):
             is_train=False,
             max_samples=self.config.data.get("val_max_samples", -1),
         )
+        if strict_validation_enabled():
+            if self.trainer_mode != "sync":
+                raise ValueError("Strict SWE validation currently requires the synchronous V1 trainer")
+            self._validation_roster, self._validation_roster_provenance = load_roster(self.config.data.val_files)
+            if len(self.val_dataset) != len(self._validation_roster):
+                raise ValueError(
+                    "Validation preprocessing changed the fixed roster; disable subsampling/prompt filtering")
 
         # Exact refill counts require single-prompt dataloader fetches.
         filter_groups = self.config.algorithm.get("filter_groups", None)
@@ -1293,6 +1308,18 @@ class PPOTrainer(ABC):
             f.write(str(self.global_steps))
 
     def _validate(self) -> dict[str, float]:
+        strict = strict_validation_enabled()
+        validation_started = time.monotonic()
+        validation_attempts = []
+        observations = []
+        replay_metrics = defaultdict(float)
+        if strict:
+            if not hasattr(self, "_validation_roster"):
+                self._validation_roster, self._validation_roster_provenance = load_roster(self.config.data.val_files)
+            self._validation_lineage = {}
+            self.replay_buffer.validation_deadline_at = validation_started + positive_seconds(
+                "SWE_AGENT_VALIDATION_TOTAL_TIMEOUT_SECONDS", 21600)
+            self._write_validation_audit([], [], status="running")
         # Lists to collect samples for the table
         sample_uids = []
         sample_inputs = []
@@ -1310,6 +1337,11 @@ class PPOTrainer(ABC):
         success_metric_tags: list[dict] = []
 
         for batch_dict in self.val_dataloader:
+            if strict and time.monotonic() >= self.replay_buffer.validation_deadline_at:
+                # Unsubmitted tasks stay in the roster as unresolved. Do not
+                # create fresh work after the validation-wide deadline.
+                replay_metrics["validation/fixed_roster/deadline_reached"] = 1
+                break
             self._validation_prompt_templates.clear()
             # 1. put batch to agent loop manager
             batch_dict["uid"] = np.array(
@@ -1318,16 +1350,35 @@ class PPOTrainer(ABC):
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
-            self._submit_validation_batch(batch)
-
             # 2. sample batch from replay buffer: one prompt (GRPO group) per submitted row.
             sample_started = time.monotonic()
             if _repeat_debug_enabled():
                 logger.info("Repeat trainer sample_start partition=val global_step=%s batch_size=%s",
                             self.global_steps, len(batch))
-            batch, _ = self.replay_buffer.sample(
-                global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
-            )
+            try:
+                if strict:
+                    self.replay_buffer.validation_attempt_records = []
+                    self.replay_buffer.validation_audit_callback = lambda records: self._write_validation_audit(
+                        validation_attempts + records, observations, status="running")
+                self._submit_validation_batch(batch)
+                batch, batch_replay_metrics = self.replay_buffer.sample(
+                    global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
+                )
+            except Exception as error:
+                if strict:
+                    validation_attempts.extend(getattr(self.replay_buffer, "validation_attempt_records", []))
+                    self._write_validation_audit(validation_attempts, observations, status="error", error=str(error))
+                raise
+            finally:
+                if strict:
+                    self.replay_buffer.validation_audit_callback = None
+            if strict:
+                for key, value in batch_replay_metrics.items():
+                    replay_metrics[key] += value
+                validation_attempts.extend(self.replay_buffer.validation_attempt_records)
+                self._write_validation_audit(validation_attempts, observations, status="running")
+                if not batch.keys:
+                    continue
             if _repeat_debug_enabled():
                 logger.info("Repeat trainer sample_end partition=val global_step=%s selected=%d seconds=%.3f",
                             self.global_steps, len(batch.keys), time.monotonic() - sample_started)
@@ -1431,6 +1482,17 @@ class PPOTrainer(ABC):
                             reward_extra_infos_dict[key] = [None] * n_prior
                         reward_extra_infos_dict[key].append(value)
                     n_prior += 1
+            if strict:
+                if extra_fields_list is None:
+                    raise RuntimeError("Strict validation requires the published evaluator metadata")
+                final_tags = dict(zip(batch.keys, batch.tags, strict=True))
+                for key, extra in zip(final_keys, extra_fields_list.tolist(), strict=True):
+                    uid, session, _index = key.rsplit("_", 2)
+                    lineage = self._validation_lineage[uid]
+                    info = validation_reward_metadata(extra)
+                    info.update(final_tags[key])
+                    observations.append(dict(info, task_id=lineage["task_id"], session_id=session,
+                                             uid=uid, root_uid=lineage["root_uid"], attempt=lineage["attempt"]))
 
             reward_model = data.pop("reward_model", None)
             if reward_model is not None:
@@ -1506,9 +1568,24 @@ class PPOTrainer(ABC):
         validation_metrics = self._val_metrics_update(
             data_sources, sample_uids, reward_extra_infos_dict, sample_turns
         )
+        if strict:
+            # Historical filtered means remain diagnostic. An exact core mean
+            # is published below only for a completely confirmed fixed roster.
+            validation_metrics = {
+                (key.replace("val-core/", "val-aux/observed_only/", 1) if key.startswith("val-core/") else key): value
+                for key, value in validation_metrics.items()
+            }
+            fixed_metrics, outcomes = self._write_validation_audit(validation_attempts, observations)
+            validation_metrics.update(fixed_metrics)
+            validation_metrics.update(replay_metrics)
+            confirmed_groups = sum(t["unresolved"] == 0 for t in outcomes)
+            validation_metrics["validation/fixed_roster/confirmed_groups"] = confirmed_groups
+            validation_metrics["validation/fixed_roster/unresolved_groups"] = len(outcomes) - confirmed_groups
+            validation_metrics["validation/fixed_roster/expected_groups"] = len(outcomes)
+            validation_metrics["validation/fixed_roster/total_elapsed_seconds"] = time.monotonic() - validation_started
+            self.replay_buffer.validation_deadline_at = None
         success_values = reward_extra_infos_dict.get("acc", reward_extra_infos_dict["reward"])
-        validation_metrics.update(
-            compute_v1_success_ratio_metrics(
+        success_metrics = compute_v1_success_ratio_metrics(
                 batch_keys=success_metric_keys,
                 batch_tags=success_metric_tags,
                 success_values=success_values,
@@ -1518,9 +1595,48 @@ class PPOTrainer(ABC):
                 expected_rollout_count=int(self.config.actor_rollout_ref.rollout.val_kwargs.n),
                 metric_sources=data_sources,
             )
-        )
+        if strict:
+            success_metrics = {
+                key.replace("validation/", "validation/observed_only/", 1): value
+                for key, value in success_metrics.items()
+            }
+        validation_metrics.update(success_metrics)
         validation_metrics.update(self._run_optional_audio_validation())
         return validation_metrics
+
+    def _write_validation_audit(self, attempts, observations, *, status=None, error=None):
+        samples = int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
+        metrics, outcomes = fixed_roster_report(self._validation_roster, observations, samples, attempts)
+        directory = self.config.trainer.get("validation_data_dir") or self.config.trainer.default_local_dir
+        write_json_atomic(
+            Path(directory) / "validation_audit" / f"{self.global_steps}.json",
+            dict(
+                version=1,
+                global_step=self.global_steps,
+                roster=self._validation_roster_provenance,
+                status=status or ("complete" if all(t["unresolved"] == 0 for t in outcomes) else "incomplete"),
+                error=error,
+                updated_at_unix_seconds=time.time(),
+                samples_per_task=samples,
+                completion_threshold=os.getenv("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD"),
+                retry_limit=int(os.getenv("SWE_AGENT_ROLLOUT_VALIDATION_MAX_GROUP_RETRIES", "10")),
+                infrastructure_failure_group_ratio_threshold=os.getenv(
+                    "SWE_AGENT_ROLLOUT_VALIDATION_INFRA_FAILURE_GROUP_RATIO_THRESHOLD"
+                ),
+                group_timeout_seconds=positive_seconds("SWE_AGENT_VALIDATION_GROUP_TIMEOUT_SECONDS", 7200),
+                total_timeout_seconds=positive_seconds("SWE_AGENT_VALIDATION_TOTAL_TIMEOUT_SECONDS", 21600),
+                cleanup_timeout_seconds=positive_seconds("SWE_AGENT_VALIDATION_CLEANUP_TIMEOUT_SECONDS", 300),
+                checkpoint_directory=str(self.config.trainer.default_local_dir),
+                experiment_name=self.config.trainer.get("experiment_name"),
+                project_name=self.config.trainer.get("project_name"),
+                decoding=OmegaConf.to_container(self.config.actor_rollout_ref.rollout.val_kwargs, resolve=True),
+                bounds_are_confidence_intervals=False,
+                metrics=metrics,
+                tasks=outcomes,
+                attempts=attempts,
+            ),
+        )
+        return metrics, outcomes
 
     def _run_optional_audio_validation(self) -> dict[str, float]:
         """Run the opt-in GAGE suite against the live rollout endpoint."""
@@ -1773,6 +1889,7 @@ class PPOTrainer(ABC):
             unverified_threshold=unverified_trajectory_ratio_threshold("val"),
             expected_rollout_count=(int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
                                     if self is not None else None),
+            strict_evaluation=strict_validation_enabled(),
         )
         core_metrics = process_validation_metrics(core_sources, core_uids, core_infos) if core_sources else {}
         metric_dict = {}
@@ -1962,41 +2079,86 @@ class PPOTrainer(ABC):
         """Register validation prompts and retain templates for exact retries."""
         started = time.monotonic()
         if _repeat_debug_enabled():
-            logger.info("Repeat trainer rollout_submit_start partition=val global_step=%s prompts=%d",
-                        self.global_steps, len(batch))
+            logger.info(
+                "Repeat trainer rollout_submit_start partition=val global_step=%s prompts=%d",
+                self.global_steps,
+                len(batch),
+            )
         uid_values = [str(uid) for uid in batch["uid"]]
         for index, uid in enumerate(uid_values):
             self._validation_prompt_templates[uid] = batch[index : index + 1].clone()
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in uid_values]
+        if strict_validation_enabled():
+            if not hasattr(self, "_validation_lineage"):
+                self._validation_lineage = {}
+            for i, uid in enumerate(uid_values):
+                if uid not in self._validation_lineage:
+                    row = {
+                        key: batch[key][i].tolist() if hasattr(batch[key][i], "tolist") else batch[key][i]
+                        for key in ("reward_model", "extra_info", "metric_data_source", "data_source")
+                        if key in batch
+                    }
+                    row = {key: getattr(value, "data", value) for key, value in row.items()}
+                    identity = task_identity(row)
+                    roster_sources = {r["task_id"]: r["source"] for r in self._validation_roster}
+                    if identity["task_id"] not in roster_sources:
+                        raise ValueError(f"Task outside fixed validation roster: {identity['task_id']}")
+                    if identity["source"] != roster_sources[identity["task_id"]]:
+                        raise ValueError(f"Validation source changed for {identity['task_id']}")
+                    if any(r["task_id"] == identity["task_id"] for r in self._validation_lineage.values()):
+                        raise ValueError(f"Repeated task in validation dataloader: {identity['task_id']}")
+                    self._validation_lineage[uid] = dict(identity, root_uid=uid, attempt=0)
+                lineage = self._validation_lineage[uid]
+                tags[i].update(
+                    validation_root_uid=lineage["root_uid"],
+                    validation_attempt=lineage["attempt"],
+                    task_id=lineage["task_id"],
+                    validation_submitted_at=time.monotonic(),
+                )
         tq.kv_batch_put(keys=uid_values, partition_id="val", tags=tags)
         self.agent_loop_manager.generate_sequences(batch)
         if _repeat_debug_enabled():
-            logger.info("Repeat trainer rollout_submit_end partition=val global_step=%s prompts=%d seconds=%.3f",
-                        self.global_steps, len(batch), time.monotonic() - started)
+            logger.info(
+                "Repeat trainer rollout_submit_end partition=val global_step=%s prompts=%d seconds=%.3f",
+                self.global_steps,
+                len(batch),
+                time.monotonic() - started,
+            )
         return len(batch)
 
-    def _refill_validation_groups(self, discarded_uids: list[str]) -> int:
+    def _refill_validation_groups(self, discarded_uids: list[str]) -> int | dict[str, str]:
         """Retry the same validation prompts under fresh group identifiers."""
         replacements = []
+        replacement_uids = {}
         for uid in discarded_uids:
             template = self._validation_prompt_templates.pop(uid, None)
             if template is None:
                 raise RuntimeError(f"Missing validation prompt template for discarded group {uid}")
             previous_retry = template.get("__validation_retry_count__", 0)
             retry = int(getattr(previous_retry, "data", previous_retry)) + 1
-            retry_limit = int(os.environ.get("SWE_AGENT_ROLLOUT_VALIDATION_MAX_GROUP_RETRIES", "2"))
+            retry_limit = int(
+                os.environ.get(
+                    "SWE_AGENT_ROLLOUT_VALIDATION_MAX_GROUP_RETRIES", "10" if strict_validation_enabled() else "2"
+                )
+            )
             if retry_limit < 0:
                 raise ValueError("SWE_AGENT_ROLLOUT_VALIDATION_MAX_GROUP_RETRIES must be nonnegative")
             if retry > retry_limit:
-                raise RuntimeError(f"Validation evaluation unresolved after {retry_limit} group retries: {uid}; "
-                                   "no complete validation score is reported")
+                raise RuntimeError(
+                    f"Validation evaluation unresolved after {retry_limit} group retries: {uid}; "
+                    "no complete validation score is reported"
+                )
             replacement = template.clone()
             replacement["__validation_retry_count__"] = NonTensorData(retry)
             new_uid = str(uuid.uuid4())
+            if strict_validation_enabled():
+                self._validation_lineage[new_uid] = dict(self._validation_lineage[uid], attempt=retry)
+                replacement_uids[uid] = new_uid
             replacement["uid"] = NonTensorStack.from_list([NonTensorData(new_uid)])
             replacements.append(replacement)
         batch = replacements[0] if len(replacements) == 1 else tu.concat_tensordict(replacements)
-        return self._submit_validation_batch(batch)
+        submitted = self._submit_validation_batch(batch)
+        return replacement_uids if strict_validation_enabled() else submitted
 
     def _add_prompts_to_generate(self, num_prompts: int) -> int:
         """Add an exact number of prompts to the AgentLoopManager."""

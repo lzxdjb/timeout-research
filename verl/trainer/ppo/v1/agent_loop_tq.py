@@ -36,7 +36,8 @@ from verl.experimental.agent_loop import (
 from verl.trainer.ppo.v1.repeat_judge_queue import RepeatQueueError, progress_interval_seconds
 from verl.utils.ray_utils import auto_await
 from verl.utils.swe_cutoff_debug import cutoff_debug_enabled, reconcile_cutoff_sessions, write_cutoff_debug_event
-from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+from verl.utils.swe_validation import positive_seconds, strict_validation_enabled
+from verl.utils.tensordict_utils import get_non_tensor_data, list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -279,8 +280,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             uid: self.prompt_tasks[partition_id][uid]
             for uid in uids
             if uid in self.prompt_tasks[partition_id] and not self.prompt_tasks[partition_id][uid].done()
-            and items.get(uid, {}).get("status") != "reward_pending"
-            and not items.get(uid, {}).get("generation_complete", False)
+            and ((validate and strict_validation_enabled()) or (
+                items.get(uid, {}).get("status") != "reward_pending"
+                and not items.get(uid, {}).get("generation_complete", False)))
         }
         cutoff_states = {}
         for uid in tasks_by_uid:
@@ -732,6 +734,17 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "unverified_trajectory": evaluator_group_excluded,
                 }
             )
+            if validate and strict_validation_enabled():
+                # Publish the same strict evidence the final metric uses, before
+                # the sampler counts a task toward the completion threshold.
+                from verl.trainer.ppo.v1.utils import validation_reward_metadata
+
+                info = validation_reward_metadata(extra_fields)
+                for name in ("evaluation_valid", "hidden_pass", "evaluator_invalid_reason",
+                             "observed_infrastructure_failure", "evaluator_failure_excluded",
+                             "partial_hidden_reward_counts_complete", "rebench_failure_kind",
+                             "hidden_failure_phase", "hidden_verifier_staging_ok", "hidden_verifier_setup_ok"):
+                    tags[-1][name] = info.get(name)
 
         if infrastructure_metadata_count or infrastructure_failure_count:
             logger.info(
@@ -802,12 +815,15 @@ class AgentLoopManagerTQ(AgentLoopManager):
             prompts (TensorDict): Input batch from train or validation dataset.
         """
         chunkes = prompts.chunk(len(self.agent_loop_workers))
-        ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
-            ]
-        )
+        refs = [worker.generate_sequences.remote(chunk)
+                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)]
+        if strict_validation_enabled() and get_non_tensor_data(prompts, "validate", False):
+            try:
+                ray.get(refs, timeout=positive_seconds("SWE_AGENT_VALIDATION_CLEANUP_TIMEOUT_SECONDS", 300))
+            except ray.exceptions.GetTimeoutError as error:
+                raise RuntimeError("Validation dispatch was not acknowledged; refusing to resume training") from error
+        else:
+            ray.get(refs)
 
     def cancel_sequences(self, uids: list[str], validate: bool = False) -> int:
         """Cancel the requested prompt groups on whichever workers own them."""
@@ -822,8 +838,16 @@ class AgentLoopManagerTQ(AgentLoopManager):
         cancelled = 0
         snapshot_ref = None
         last_progress = started
+        cleanup_timeout = (positive_seconds("SWE_AGENT_VALIDATION_CLEANUP_TIMEOUT_SECONDS", 300)
+                           if validate and strict_validation_enabled() else None)
         while pending:
-            done, pending = ray.wait(pending, num_returns=1, timeout=interval)
+            remaining = cleanup_timeout - (time.monotonic() - started) if cleanup_timeout else interval
+            if remaining <= 0:
+                raise RuntimeError(
+                    "Validation cancellation was not acknowledged within the cleanup deadline; "
+                    "refusing to resume training while validation workers may still publish"
+                )
+            done, pending = ray.wait(pending, num_returns=1, timeout=min(interval, remaining))
             cancelled += sum(ray.get(done))
             now = time.monotonic()
             if now - last_progress >= interval:

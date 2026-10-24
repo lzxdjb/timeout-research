@@ -27,7 +27,6 @@ from verl.trainer.ppo.v1.replay_buffer import (
     unverified_group_decision,
 )
 
-
 _SUCCESS_RATIO_VARIANTS = (
     "excluding_completion_cutoff",
     "excluding_completion_cutoff_and_infrastructure",
@@ -87,10 +86,22 @@ def validation_reward_metadata(extra: Any) -> dict[str, Any]:
     extra = getattr(extra, "data", extra)
     reward = extra.get("reward_extra_info", {}) if isinstance(extra, dict) else {}
     reward = reward if isinstance(reward, dict) else {}
-    return {**reward, **{
-        key: value for key, value in rollout_diagnostics(extra).items()
-        if key.startswith(("tool_repeat_", "thinking_repeat_"))
-    }}
+    hidden = extra.get("swe_hidden_reward", {}) if isinstance(extra, dict) else {}
+    metadata = hidden.get("metadata", {}) if isinstance(hidden, dict) else {}
+    # The official adjudicator can confirm a model-caused rejection before
+    # tests start. This field is not copied by older agent diagnostic adapters.
+    evidence = {
+        key: metadata[key] for key in ("rebench_failure_kind",) if isinstance(metadata, dict) and key in metadata
+    }
+    return {
+        **evidence,
+        **reward,
+        **{
+            key: value
+            for key, value in rollout_diagnostics(extra).items()
+            if key.startswith(("tool_repeat_", "thinking_repeat_"))
+        },
+    }
 
 
 def flatten_v1_extra_fields(extra_fields: list[Any]) -> dict[str, np.ndarray]:

@@ -250,6 +250,7 @@ def worker_harness(monkeypatch, n=1):
     worker.repeat_debug_slow_seconds = module._repeat_debug_slow_seconds()
     worker.repeat_debug_prompts = {}
     worker.prompt_tasks = {"train": {}, "val": {}}
+    worker.cutoff_session_states = {}
     worker.config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"n": n, "val_kwargs": {"n": n}}}})
     store, publications = {}, []
     async def put(key, partition_id, tag):
@@ -379,6 +380,70 @@ def test_pending_submission_does_not_block_generation_and_is_protected_from_cuto
         await prompt_task
         assert store["train"]["u"]["status"] == "finished"
         assert len(publications) == 1
+    asyncio.run(run())
+
+
+def test_strict_validation_publishes_official_evaluator_evidence(monkeypatch):
+    from verl.experimental.agent_loop import AgentLoopOutput
+    from verl.utils.swe_validation import evaluation_reason
+
+    monkeypatch.setenv("SWE_AGENT_VALIDATION_STRICT_ACCOUNTING", "1")
+
+    async def run():
+        worker, _store, publications = worker_harness(monkeypatch)
+        info = {
+            "evaluation_valid": True,
+            "hidden_pass": 1,
+            "evaluator_invalid_reason": "",
+            "partial_hidden_reward_counts_complete": False,
+        }
+        output = AgentLoopOutput(
+            prompt_ids=[1],
+            response_ids=[2],
+            response_mask=[1],
+            reward_score=1.0,
+            metrics={},
+            extra_fields={"reward_extra_info": info},
+        )
+        await worker._agent_loop_postprocess(output, True, uid="u", session_id=0, global_steps=0)
+        tags = publications[0][2][0]
+        assert tags["evaluation_valid"] and tags["hidden_pass"] == 1
+        assert evaluation_reason(tags) is None
+
+    asyncio.run(run())
+
+
+def test_strict_validation_can_cancel_reward_pending_prompt(monkeypatch):
+    monkeypatch.setenv("SWE_AGENT_VALIDATION_STRICT_ACCOUNTING", "1")
+
+    async def run():
+        worker, store, publications = worker_harness(monkeypatch)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def submit(job_id, job):
+            entered.set()
+            await release.wait()
+            return job_id, 0.1, {"repeat_reward_pending": 0}
+
+        worker.repeat_coordinator = SimpleNamespace(submit=RemoteMethod(submit))
+
+        async def session(*args, **kwargs):
+            await worker._agent_loop_postprocess(
+                fake_output(repeat.RepeatConfig(deferred_enabled=True)), True, uid="u", session_id=0, global_steps=0
+            )
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "u"}, {}, {"validate": True}))
+        worker.prompt_tasks["val"]["u"] = prompt
+        await entered.wait()
+        assert store["val"]["u"]["generation_complete"]
+        cancelling = asyncio.create_task(worker.cancel_sequences(["u"], validate=True))
+        await asyncio.sleep(0)
+        assert prompt.cancelling() and not cancelling.done()
+        release.set()
+        assert await asyncio.wait_for(cancelling, timeout=2) == 1
+        assert prompt.done() and len(publications) == 1
+
     asyncio.run(run())
 
 

@@ -52,6 +52,80 @@ def test_golden_group_admission_excludes_zero_variance_and_rollout_discards():
         **{key: value for key, value in common.items() if key != "infrastructure_failure_count"},
     )
 
+
+def test_strict_validation_retry_and_cutoff_against_real_queue(tq_init, monkeypatch, tmp_path):
+    monkeypatch.setenv("SWE_AGENT_VALIDATION_STRICT_ACCOUNTING", "1")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD", str(2 / 3))
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", ".25")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_MAX_GROUP_RETRIES", "10")
+    _clear_partition("val")
+    roots = [_uid() for _ in range(3)]
+    retried, cancelled = [], []
+
+    def publish(uid, task, *, root=None, attempt=0, passed=0, valid=True):
+        tq.kv_put(
+            key=f"{uid}_0_0",
+            partition_id="val",
+            fields={"input_ids": torch.tensor([1]), "extra_fields": {"reward_extra_info": {}}},
+            tag={"evaluation_valid": valid, "hidden_pass": passed, "infrastructure_failure": not valid},
+        )
+        tq.kv_put(
+            key=uid,
+            partition_id="val",
+            tag={
+                "is_prompt": True,
+                "status": "finished",
+                "global_steps": 0,
+                "task_id": task,
+                "validation_root_uid": root or uid,
+                "validation_attempt": attempt,
+                "validation_submitted_at": time.monotonic(),
+            },
+        )
+
+    def refill(uids):
+        assert uids == [roots[1]]
+        replacement = _uid()
+        retried.append(replacement)
+        publish(replacement, "b", root=roots[1], attempt=1, passed=0)
+        return {roots[1]: replacement}
+
+    def cancel(uids, validate):
+        assert validate
+        cancelled.extend(uids)
+        for uid in uids:
+            tq.kv_put(key=uid, partition_id="val", tag={"status": "failure", "completion_ratio_cutoff": True})
+        return len(uids)
+
+    try:
+        publish(roots[0], "a", passed=1)
+        publish(roots[1], "b", valid=False)
+        tq.kv_put(
+            key=roots[2],
+            partition_id="val",
+            tag={
+                "is_prompt": True,
+                "status": "reward_pending",
+                "global_steps": 0,
+                "task_id": "c",
+                "validation_root_uid": roots[2],
+                "validation_attempt": 0,
+                "validation_submitted_at": time.monotonic(),
+            },
+        )
+        rb = _make_rb(expected_validation_rollout_n=1, validation_refill_fn=refill, cancel_fn=cancel)
+        rb.trainer_config = {"validation_data_dir": str(tmp_path)}
+        batch, metrics = rb.sample(global_steps=0, partition_id="val", batch_size=3)
+        assert set(batch.keys) == {f"{roots[0]}_0_0", f"{retried[0]}_0_0"}
+        assert cancelled == [roots[2]]
+        assert metrics["validation/fixed_roster/recovered_groups"] == 1
+        assert metrics["validation/fixed_roster/unresolved_groups"] == 1
+        assert len(rb.validation_attempt_records) == 4
+        assert len(list((tmp_path / "infrastructure_discard").glob("*.json"))) == 1
+    finally:
+        _clear_partition("val")
+
+
 # Small poll interval so the blocking consumer reacts to producer writes quickly.
 POLL_INTERVAL = 0.05
 

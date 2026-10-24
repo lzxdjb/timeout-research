@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging
 import json
+import logging
 import math
 import os
 import time
@@ -26,6 +26,7 @@ from omegaconf import DictConfig
 from transfer_queue import KVBatchMeta
 
 from verl.utils.skip import SkipManager
+from verl.utils.swe_validation import evaluation_reason, positive_seconds, strict_validation_enabled
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -753,7 +754,7 @@ class ReplayBuffer:
 
         data = tq.kv_list()
         if data is None:
-            return
+            return {}
 
         for partition_id, items in data.items():
             partition = self.partitions[partition_id]
@@ -776,7 +777,11 @@ class ReplayBuffer:
                             self.generation_complete_keys[partition_id].add(key)
                             self.reward_pending_keys[partition_id].add(key)
                         case "reward_error":
-                            raise RuntimeError(f"Deferred repeat reward failed for {key}: {tag.get('repeat_error', '')}")
+                            if partition_id == "val" and strict_validation_enabled():
+                                self.failure_keys[partition_id].add(key)
+                            else:
+                                raise RuntimeError(
+                                    f"Deferred repeat reward failed for {key}: {tag.get('repeat_error', '')}")
                         case "finished":
                             self.finished_keys[partition_id].add(key)
                         case "failure":
@@ -795,6 +800,7 @@ class ReplayBuffer:
             live_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
             for uid in cache.keys() - live_uids:
                 del cache[uid]
+        return data
 
     @staticmethod
     def _metrics_prefix(partition_id: str) -> str:
@@ -1307,6 +1313,8 @@ class ReplayBuffer:
             KVBatchMeta: A batch of data.
             dict: Auxiliary metrics.
         """
+        if partition_id == "val" and strict_validation_enabled():
+            return self._sample_strict_validation(global_steps, batch_size)
         sample_started = time.monotonic()
         last_debug_time = time.time()
         if _repeat_debug_enabled():
@@ -1431,6 +1439,190 @@ class ReplayBuffer:
             logger.info("Repeat replay sample_end partition=%s global_step=%s selected=%d sample_seconds=%.3f",
                         partition_id, global_steps, len(selected_prompt_uids), time.monotonic() - sample_started)
         return result
+
+    def _sample_strict_validation(self, global_steps: int, batch_size: int) -> tuple[KVBatchMeta, dict]:
+        """Wait for confirmed groups against a fixed denominator, with bounded retries.
+
+        Training continues through the original sampler above. A replacement is
+        another attempt on the same root, never another benchmark task/sample.
+        Timed-out and cutoff groups are unresolved, not retry-to-success draws.
+        """
+        if self.trainer_mode != "sync" or not self.expected_rollout_counts.get("val"):
+            raise ValueError("Strict SWE validation requires V1 sync mode and a positive validation n")
+        expected = self.expected_rollout_counts["val"]
+        threshold = self.completion_ratio_thresholds.get("val") or 1.0
+        required = math.ceil(batch_size * threshold)
+        retry_limit = int(os.getenv("SWE_AGENT_ROLLOUT_VALIDATION_MAX_GROUP_RETRIES", "10"))
+        if retry_limit < 0:
+            raise ValueError("SWE_AGENT_ROLLOUT_VALIDATION_MAX_GROUP_RETRIES must be nonnegative")
+        attempt_seconds = positive_seconds("SWE_AGENT_VALIDATION_GROUP_TIMEOUT_SECONDS", 7200)
+        started = time.monotonic()
+        deadline = getattr(self, "validation_deadline_at", None)
+        if deadline is None:
+            deadline = started + positive_seconds("SWE_AGENT_VALIDATION_TOTAL_TIMEOUT_SECONDS", 21600)
+        self.validation_attempt_records = []
+        roots, selected, exhausted = {}, {}, set()
+        retries = 0
+        stop_reason = None
+        first_poll = True
+        last_debug = time.time()
+        audit_callback = getattr(self, "validation_audit_callback", None)
+        while True:
+            # Prompt terminal status and trajectory evidence must come from one
+            # snapshot; a second read can see a newly finished prompt without
+            # the sessions needed to validate it.
+            items = self._sync_metadata_from_transfer_queue().get("val", {})
+            prompts = {key: tag for key, tag in items.items() if tag.get("is_prompt")}
+            if first_poll:
+                roots = {tag.get("validation_root_uid", uid): uid for uid, tag in prompts.items()}
+                if len(roots) != batch_size:
+                    raise RuntimeError(f"Strict validation expected {batch_size} roots, found {len(roots)}")
+                first_poll = False
+            for uid, tag in prompts.items():
+                root = tag.get("validation_root_uid", uid)
+                if roots.get(root) != uid:
+                    raise RuntimeError(f"Unexpected validation prompt or duplicate root: {uid}/{root}")
+            for root, uid in roots.items():
+                if root not in exhausted and uid not in prompts:
+                    raise RuntimeError(f"Validation prompt disappeared before accounting: {uid}")
+            now = time.monotonic()
+            if now >= deadline:
+                stop_reason = "validation_deadline"
+
+            # Finalized and published outcomes alone count toward completion.
+            # A reward-pending group remains inflight, even if generation ended.
+            retry_uids = []
+            for root, uid in list(roots.items()):
+                if root in selected or root in exhausted:
+                    continue
+                tag = prompts.get(uid, {})
+                status = tag.get("status")
+                if status not in {"finished", "failure", "reward_error"}:
+                    continue
+                keys = self._final_session_keys(
+                    [key for key in self.partitions["val"] if self._uid_from_key(key) == uid]
+                )
+                sessions = [self.partitions["val"][key] for key in keys]
+                reasons = [evaluation_reason(info) for info in sessions]
+                complete = (
+                    status != "reward_error" and len(sessions) == expected and all(reason is None for reason in reasons)
+                )
+                reason = next((r for r in reasons if r), None) or (
+                    "missing_terminal_sessions" if len(sessions) != expected else None
+                )
+                record = dict(
+                    root_uid=root,
+                    uid=uid,
+                    task_id=tag.get("task_id"),
+                    attempt=int(tag.get("validation_attempt", 0)),
+                    status=status,
+                    reason=None if complete else reason or "rollout_failure",
+                    sessions=[dict(uid=key, **info) for key, info in zip(keys, sessions, strict=True)],
+                )
+                self.validation_attempt_records.append(record)
+                if complete:
+                    record["disposition"] = "confirmed"
+                    selected[root] = uid
+                    continue
+                if record["attempt"] < retry_limit and stop_reason is None:
+                    retry_uids.append(uid)
+                    record["disposition"] = "retry_requested"
+                else:
+                    exhausted.add(root)
+                    record["disposition"] = "deadline" if stop_reason else "retry_exhausted"
+                if audit_callback:
+                    audit_callback(self.validation_attempt_records)
+                self._persist_infrastructure_discard("val", {uid}, {uid: 1.0})
+                self._clear_groups("val", {uid})
+
+            if audit_callback:
+                audit_callback(self.validation_attempt_records)
+
+            if len(selected) >= required:
+                stop_reason = stop_reason or "completion_ratio_cutoff"
+            active = {root: uid for root, uid in roots.items() if root not in selected and root not in exhausted}
+            if stop_reason is not None:
+                # Do not dispatch retries after the cutoff/deadline. Invalid
+                # attempts already recorded above remain in the fixed roster.
+                for uid in retry_uids:
+                    root = next(r for r, current in roots.items() if current == uid)
+                    exhausted.add(root)
+                    active.pop(root, None)
+                    next(r for r in reversed(self.validation_attempt_records) if r["uid"] == uid)["disposition"] = (
+                        stop_reason
+                    )
+                to_cancel = [uid for uid in active.values() if uid in prompts]
+            else:
+                to_cancel = [
+                    uid
+                    for uid in active.values()
+                    if uid not in retry_uids
+                    and uid in prompts
+                    and now - prompts[uid].get("validation_submitted_at", started) >= attempt_seconds
+                ]
+                if retry_uids:
+                    if self.validation_refill_fn is None:
+                        raise RuntimeError("Strict validation retries require validation_refill_fn")
+                    replacements = self.validation_refill_fn(retry_uids)
+                    if not isinstance(replacements, dict) or set(replacements) != set(retry_uids):
+                        raise RuntimeError("Strict validation refill must return an old-UID to new-UID mapping")
+                    for root, uid in list(roots.items()):
+                        if uid in replacements:
+                            roots[root] = replacements[uid]
+                    retries += len(replacements)
+            if to_cancel:
+                if self.cancel_fn is None:
+                    raise RuntimeError("Strict validation watchdog requires cancellation support")
+                cancelled_records = []
+                for root, uid in active.items():
+                    if uid in to_cancel:
+                        tag = prompts[uid]
+                        record = dict(
+                            root_uid=root,
+                            uid=uid,
+                            task_id=tag.get("task_id"),
+                            attempt=int(tag.get("validation_attempt", 0)),
+                            status="cancellation_requested",
+                            reason=stop_reason or "validation_attempt_timeout",
+                            sessions=[],
+                        )
+                        self.validation_attempt_records.append(record)
+                        cancelled_records.append(record)
+                if audit_callback:
+                    audit_callback(self.validation_attempt_records)
+                # The manager bounds cleanup. Never resume training if workers
+                # fail to acknowledge cancellation and might still publish.
+                self.cancel_fn(to_cancel, validate=True)
+                self._sync_metadata_from_transfer_queue()
+                for record in cancelled_records:
+                    record["status"] = "cancelled"
+                    exhausted.add(record["root_uid"])
+                self._clear_groups("val", set(to_cancel))
+            if stop_reason is not None or len(selected) + len(exhausted) == batch_size:
+                break
+            if retry_uids:
+                continue
+            last_debug = self._wait_for_next_poll("val", last_debug, started)
+
+        self._sync_metadata_from_transfer_queue()
+        snapshot = dict(self.partitions["val"])
+        if audit_callback:
+            audit_callback(self.validation_attempt_records)
+        result = self._materialize_batch("val", list(selected.values()), snapshot)
+        retried_roots = {r["root_uid"] for r in self.validation_attempt_records if r["attempt"] > 0}
+        metrics = {
+            "validation/fixed_roster/retry_attempts": retries,
+            "validation/fixed_roster/retried_groups": len(retried_roots),
+            "validation/fixed_roster/recovered_groups": len(retried_roots & selected.keys()),
+            "validation/fixed_roster/retry_exhausted_groups": sum(
+                r.get("disposition") == "retry_exhausted" for r in self.validation_attempt_records
+            ),
+            "validation/fixed_roster/confirmed_groups": len(selected),
+            "validation/fixed_roster/unresolved_groups": batch_size - len(selected),
+            "validation/fixed_roster/deadline_reached": int(stop_reason == "validation_deadline"),
+            "validation/fixed_roster/elapsed_seconds": time.monotonic() - started,
+        }
+        return result, metrics
 
 
 class ReplayBufferAsync(ReplayBuffer):

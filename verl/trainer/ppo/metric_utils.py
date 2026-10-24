@@ -1119,15 +1119,19 @@ def valid_evaluation_diagnostics(data_sources, infos_dict):
 
 
 def usable_validation_metrics(data_sources, sample_uids, infos_dict, *,
-                              unverified_threshold=None, expected_rollout_count=None):
+                              unverified_threshold=None, expected_rollout_count=None, strict_evaluation=False):
     """Retain confirmed validation siblings only within the configured ratio."""
     from collections import Counter, defaultdict
+
     from verl.trainer.ppo.v1.replay_buffer import trajectory_is_unverified, unverified_group_decision
+    from verl.utils.swe_validation import evaluation_reason
 
     grouped = defaultdict(list)
     tags = []
     for index, key in enumerate(zip(data_sources, sample_uids)):
         tag = {name: values[index] for name, values in infos_dict.items() if index < len(values)}
+        if strict_evaluation and evaluation_reason(tag) is not None:
+            tag = {**tag, "unverified_trajectory": True}
         tags.append(tag)
         grouped[key].append(index)
     expected_by_source = {}
