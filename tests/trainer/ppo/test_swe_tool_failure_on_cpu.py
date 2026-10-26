@@ -296,7 +296,7 @@ def test_actual_actor_disabled_parity_and_enabled_gradient():
 
 
 def run_v1(monkeypatch, enabled, scores, keys=None, tags=None, extras=None, *, thinking=False, tool_repeat=False,
-           python_tests=False):
+           python_tests=False, edit_episodes=False, edit_shadow=False, edit_identical=False, search_shadow=False):
     from transfer_queue import KVBatchMeta
 
     from verl.trainer.ppo.v1 import trainer_base
@@ -324,6 +324,10 @@ def run_v1(monkeypatch, enabled, scores, keys=None, tags=None, extras=None, *, t
                     tool_repeat_penalty_enabled=tool_repeat,
                     tool_repeat_penalty_noop_edits=tool_repeat,
                     tool_repeat_penalty_python_tests=python_tests,
+                    tool_repeat_penalty_edit_noop_episodes=edit_episodes,
+                    tool_repeat_penalty_edit_identical_calls=edit_identical,
+                    tool_repeat_edit_shadow_enabled=edit_shadow,
+                    tool_repeat_search_shadow_enabled=search_shadow,
                     tool_repeat_penalty_cost=0.02,
                     tool_repeat_penalty_cap=0.1,
                     tool_repeat_penalty_warmup_steps=10,

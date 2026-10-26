@@ -321,6 +321,7 @@ profiler:
 
 # Router replay configuration for MoE models
 tool_failure_penalty_enabled: false
+tool_failure_grep_schema_proof_enabled: false
 tool_failure_penalty_cost: 0.02
 tool_failure_penalty_cap: 0.10
 tool_failure_penalty_warmup_steps: 10
@@ -400,6 +401,17 @@ tool_repeat_penalty_python_tests: false
 tool_repeat_penalty_python_test_protected_calls: 20
 tool_repeat_shadow_enabled: false
 tool_repeat_python_test_shadow_enabled: false
+
+# R1–R4 Edit recovery experiment. No activation through existing rule flags.
+tool_repeat_penalty_edit_noop_episodes: false
+tool_repeat_penalty_edit_identical_calls: false
+tool_repeat_penalty_edit_rejection_episodes: false
+tool_repeat_penalty_edit_cost: 0.01
+tool_repeat_edit_shadow_enabled: false
+tool_repeat_edit_feedback_enabled: false
+# Broader command observations are advisory only, never new loss events.
+tool_repeat_command_shadow_enabled: false
+tool_repeat_search_shadow_enabled: false
 
 # Conservative extensions remain off unless independently enabled.
 thinking_repeat_aggregate_enabled: false

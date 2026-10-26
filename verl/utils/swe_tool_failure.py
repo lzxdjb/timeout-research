@@ -105,6 +105,7 @@ def verified_span(event, response, mask):
 def build_cost_weights(
     responses, response_mask, extra_fields, active, *, cost, cap, warmup_steps, step, trajectory_ids=None,
     event_key="tool_failure_events", verifier=None, diagnostic_prefix="tool_failure_", existing_weights=None,
+    event_cost=None,
 ):
     """Validate sparse events and cap trajectory cost before any minibatch split."""
     import torch
@@ -160,21 +161,26 @@ def build_cost_weights(
                 continue
             occupied.update(range(*span))
             seen.add(identity)
-            spans.append(span)
+            requested = cost if event_cost is None else event_cost(event)
+            if not isinstance(requested, (int, float)) or not math.isfinite(requested) or requested < 0:
+                raise ValueError("Event cost must be finite and nonnegative")
+            spans.append((*span, requested))
         if not bool(active[row]) or not spans:
             continue
-        by_trajectory.setdefault(trajectory_ids[row], []).extend((row, start, end) for start, end in spans)
+        by_trajectory.setdefault(trajectory_ids[row], []).extend((row, start, end, requested)
+                                                               for start, end, requested in spans)
     for trajectory, spans in by_trajectory.items():
         spent = (sum(float(existing_weights[i].sum()) for i, key in enumerate(trajectory_ids)
                      if key == trajectory) if existing_weights is not None else 0.0)
-        per_call = (min(cost, cap / len(spans)) * warmup if existing_weights is None
-                    else min(cost * warmup, max(0.0, cap * warmup - spent) / len(spans)))
-        if per_call == 0:
+        requested_total = sum(requested * warmup for _, _, _, requested in spans)
+        scale = min(1.0, max(0.0, cap * warmup - spent) / requested_total) if requested_total else 0.0
+        if scale == 0:
             continue
-        for row, start, end in spans:
+        for row, start, end, requested in spans:
+            per_call = requested * warmup * scale
             weights[row, start:end] = per_call / (end - start)
-        counts["applied"] += len(spans)
-        counts["cost"] += per_call * len(spans)
+            counts["applied"] += per_call > 0
+        counts["cost"] += requested_total * scale
     return weights, counts
 
 

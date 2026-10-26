@@ -100,6 +100,7 @@ def validation_reward_metadata(extra: Any) -> dict[str, Any]:
             key: value
             for key, value in rollout_diagnostics(extra).items()
             if key.startswith(("tool_repeat_", "thinking_repeat_"))
+            and key != "tool_repeat_recovery_audit_json"
         },
     }
 

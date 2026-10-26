@@ -206,6 +206,7 @@ class ActorConfig(BaseConfig):
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
     timeout_prediction: TimeoutPredictionConfig = field(default_factory=TimeoutPredictionConfig)
     tool_failure_penalty_enabled: bool = False
+    tool_failure_grep_schema_proof_enabled: bool = False
     tool_failure_penalty_cost: float = 0.02
     tool_failure_penalty_cap: float = 0.10
     tool_failure_penalty_warmup_steps: int = 10
@@ -225,6 +226,14 @@ class ActorConfig(BaseConfig):
     tool_repeat_penalty_python_test_protected_calls: int = 20
     tool_repeat_shadow_enabled: bool = False
     tool_repeat_python_test_shadow_enabled: bool = False
+    tool_repeat_penalty_edit_noop_episodes: bool = False
+    tool_repeat_penalty_edit_identical_calls: bool = False
+    tool_repeat_penalty_edit_rejection_episodes: bool = False
+    tool_repeat_penalty_edit_cost: float = 0.01
+    tool_repeat_edit_shadow_enabled: bool = False
+    tool_repeat_edit_feedback_enabled: bool = False
+    tool_repeat_command_shadow_enabled: bool = False
+    tool_repeat_search_shadow_enabled: bool = False
     thinking_repeat_penalty_enabled: bool = False
     thinking_repeat_penalty_cost: float = 0.02
     thinking_repeat_penalty_cap: float = 0.10
@@ -259,7 +268,7 @@ class ActorConfig(BaseConfig):
         if self.tool_repeat_penalty_enabled:
             import math
             if (not all(math.isfinite(x) and x >= 0 for x in
-                        (self.tool_repeat_penalty_cost, self.tool_repeat_penalty_cap))
+                        (self.tool_repeat_penalty_cost, self.tool_repeat_penalty_edit_cost, self.tool_repeat_penalty_cap))
                     or self.tool_repeat_penalty_warmup_steps < 0):
                 raise ValueError("Invalid tool-repeat cost, cap, or warmup")
             if self.policy_loss.get("loss_mode", "vanilla") != "vanilla":

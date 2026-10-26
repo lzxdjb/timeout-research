@@ -2562,7 +2562,10 @@ class PPOTrainer(ABC):
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         extra_fields = data.pop("extra_fields").tolist()
-        if tool_repeat_enabled:
+        if (tool_repeat_enabled or tool_config.get("tool_repeat_edit_shadow_enabled", False)
+                or tool_config.get("tool_repeat_edit_feedback_enabled", False)
+                or tool_config.get("tool_repeat_command_shadow_enabled", False)
+                or tool_config.get("tool_repeat_search_shadow_enabled", False)):
             for extra, tag in zip(extra_fields, batch.tags, strict=True):
                 if tag.get("is_padding", False) or not isinstance(extra, dict):
                     continue
@@ -2756,6 +2759,7 @@ class PPOTrainer(ABC):
                     additional["enabled_rules"] = {
                         rule for rule in RULES if tool_config.get("tool_repeat_penalty_" + rule, False)
                     }
+                    additional["edit_cost"] = tool_config.get("tool_repeat_penalty_edit_cost", 0.01)
                 weights, counts = build_cost_weights(
                     data.batch["responses"], data.batch["response_mask"], extra_fields, active,
                     cost=tool_config.get(name + "_penalty_cost", 0.02),

@@ -71,7 +71,14 @@ def rollout_diagnostics(extra) -> dict:
         if value is None or isinstance(value, (bool, int, float)):
             result[key] = value
         elif isinstance(value, str):
-            if key == "repeat_reward_verdict_json" and len(value) > 2048:
+            if key == "tool_repeat_recovery_audit_json":
+                # Compact request-local executor proofs, joined to the transcript
+                # by dispatched call ID. Never silently truncate a JSON proof.
+                if len(value.encode()) <= 512 * 1024:
+                    result[key] = value
+                else:
+                    result["tool_repeat_recovery_audit_error"] = "size_limit"
+            elif key == "repeat_reward_verdict_json" and len(value) > 2048:
                 # Older workers may still return complete vote JSON. Keep a valid
                 # compact summary; the full record belongs in the hashed artifact.
                 try:

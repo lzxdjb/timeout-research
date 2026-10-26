@@ -5,6 +5,8 @@ The first two calls (two cycles for cyclic reads) are protected. A complete
 five-call streak (ten calls by default for shell reads) or >=20-call/five-copy
 read cycle is required before charging. The separately opted-in Python/test
 observed-loop heuristic protects 20 calls; it does not establish program purity.
+The independent edit_identical_calls rule charges each authoritative no-op,
+including the first; it does not require a repetition episode.
 """
 
 import hashlib
@@ -22,6 +24,9 @@ RULES = (
     "noop_writes",
     "shell_reads",
     "python_tests",
+    "edit_noop_episodes",
+    "edit_rejection_episodes",
+    "edit_identical_calls",
 )
 
 
@@ -55,6 +60,15 @@ def _keys(event):
     ):
         return {}
     keys = {}
+    from recipe.swe_agent.edit_recovery import RULES as EDIT_RULES, verified_edit_outcome
+
+    edit = verified_edit_outcome(event)
+    if edit and edit["family"] in {"identical_replacement", "old_string_missing", "multiple_matches", "file_missing"}:
+        rule = EDIT_RULES[0] if edit["family"] == "identical_replacement" else EDIT_RULES[1]
+        keys[rule] = (edit["target"], edit["before"], edit["family"], edit["arguments_sha256"],
+                      edit["match_count"], edit["observation_sha256"])
+        if edit["family"] == "identical_replacement":
+            keys["edit_identical_calls"] = keys[rule]
     from recipe.swe_agent.python_test_repeat_evidence import observed_loop_key
 
     python_key = observed_loop_key(event)
@@ -97,7 +111,18 @@ def detect(events, enabled_rules, *, shell_min_copies=10, python_test_protected_
         raise ValueError("python_test_protected_calls must be an integer >=20")
     selected = {}
     keys = [_keys(e) for e in events]
-    for rule in (r for r in RULES if r in enabled_rules and r != "read_cycles"):
+    if "edit_identical_calls" in enabled_rules:
+        for event, key in zip(events, keys, strict=True):
+            if "edit_identical_calls" in key:
+                selected[event["id"]] = {"edit_identical_calls"}
+    from recipe.swe_agent.edit_recovery import RULES as EDIT_RULES, analyze as analyze_edits
+
+    if set(EDIT_RULES).intersection(enabled_rules):
+        edit_selected, _ = analyze_edits(events)
+        for event_id, rules in edit_selected.items():
+            selected.setdefault(event_id, set()).update(set(rules).intersection(enabled_rules))
+        selected = {k: v for k, v in selected.items() if v}
+    for rule in (r for r in RULES if r in enabled_rules and r not in ("read_cycles", "edit_identical_calls", *EDIT_RULES)):
         run, previous = [], None
 
         def flush(current_run, current_rule):
@@ -194,10 +219,18 @@ def verified_span(event, response, mask):
     return start, end
 
 
-def build_cost_weights(*args, enabled_rules=None, **kwargs):
+def build_cost_weights(*args, enabled_rules=None, edit_cost=0.01, **kwargs):
     from verl.utils.swe_tool_failure import build_cost_weights as build
 
     enabled_rules = set(RULES if enabled_rules is None else enabled_rules)
+    from recipe.swe_agent.edit_recovery import RULES as EDIT_RULES
+
+    def cost_for_event(event):
+        # A call matching an enabled new Edit rule is charged once at its new
+        # cost, even when an older repetition label is also present. Existing
+        # tool-failure weights retain precedence through existing_weights.
+        active = enabled_rules.intersection(event["proof"]["rules"])
+        return edit_cost if active.intersection((*EDIT_RULES, "edit_identical_calls")) else kwargs["cost"]
 
     def verify_enabled(event, response, mask):
         span = verified_span(event, response, mask)
@@ -206,7 +239,8 @@ def build_cost_weights(*args, enabled_rules=None, **kwargs):
         return None
 
     return build(
-        *args, event_key="tool_repeat_events", verifier=verify_enabled, diagnostic_prefix="tool_repeat_", **kwargs
+        *args, event_key="tool_repeat_events", verifier=verify_enabled, diagnostic_prefix="tool_repeat_",
+        event_cost=cost_for_event, **kwargs
     )
 
 
@@ -217,13 +251,27 @@ def _python_test_call(event):
     return is_python_test_call(event)
 
 
-def diagnostics(events, *, shadow=False, python_test_shadow=False):
+def diagnostics(events, *, shadow=False, python_test_shadow=False, edit_shadow=False, command_shadow=False,
+                search_shadow=False):
     """Numeric eligible/abstention counts; shadow candidates never create events."""
     from collections import Counter
 
     from recipe.swe_agent.repetition_reward import digest
 
     out = Counter()
+    if search_shadow:
+        from recipe.swe_agent.search_outcomes import diagnostics as search_diagnostics
+
+        out.update({"tool_repeat_shadow_search_" + k: v for k, v in search_diagnostics(events).items()})
+    if edit_shadow:
+        from recipe.swe_agent.edit_recovery import analyze
+
+        _, edit_counts = analyze(events)
+        out.update({"tool_repeat_shadow_edit_" + k: v for k, v in edit_counts.items()})
+    if command_shadow:
+        from recipe.swe_agent.command_recovery import diagnostics as command_diagnostics
+
+        out.update({"tool_repeat_shadow_command_" + k: v for k, v in command_diagnostics(events).items()})
     for event in events:
         keys = _keys(event)
         for rule in RULES:
