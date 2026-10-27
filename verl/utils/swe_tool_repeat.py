@@ -26,7 +26,10 @@ RULES = (
     "python_tests",
     "edit_noop_episodes",
     "edit_rejection_episodes",
+    "edit_rejection_causes",
     "edit_identical_calls",
+    "command_errors",
+    "command_no_progress",
 )
 
 
@@ -60,7 +63,7 @@ def _keys(event):
     ):
         return {}
     keys = {}
-    from recipe.swe_agent.edit_recovery import RULES as EDIT_RULES, verified_edit_outcome
+    from recipe.swe_agent.edit_recovery import CAUSE_RULE, RULES as EDIT_RULES, rejection_cause_key, verified_edit_outcome
 
     edit = verified_edit_outcome(event)
     if edit and edit["family"] in {"identical_replacement", "old_string_missing", "multiple_matches", "file_missing"}:
@@ -69,6 +72,14 @@ def _keys(event):
                       edit["match_count"], edit["observation_sha256"])
         if edit["family"] == "identical_replacement":
             keys["edit_identical_calls"] = keys[rule]
+        cause = rejection_cause_key(event, edit)
+        if cause is not None:
+            keys[CAUSE_RULE] = cause
+    from recipe.swe_agent.command_evidence import verified as verified_command
+
+    command = verified_command(event)
+    if command is not None:
+        keys[command["rule"]] = command["evidence_sha256"]
     from recipe.swe_agent.python_test_repeat_evidence import observed_loop_key
 
     python_key = observed_loop_key(event)
@@ -103,26 +114,37 @@ def _keys(event):
     return keys
 
 
-def detect(events, enabled_rules, *, shell_min_copies=10, python_test_protected_calls=20):
+def detect(events, enabled_rules, *, shell_min_copies=10, python_test_protected_calls=20,
+           command_window=16, command_protected_calls=2):
     """Return all eligible event IDs, not representative trajectory citations."""
     if type(shell_min_copies) is not int or shell_min_copies < 5:
         raise ValueError("shell_min_copies must be an integer >=5")
     if type(python_test_protected_calls) is not int or python_test_protected_calls < 20:
         raise ValueError("python_test_protected_calls must be an integer >=20")
+    from recipe.swe_agent.command_evidence import RULES as COMMAND_RULES, analyze as analyze_commands
+
     selected = {}
+    if set(COMMAND_RULES).intersection(enabled_rules):
+        command_selected, _ = analyze_commands(events, window=command_window, protected=command_protected_calls)
+        selected = {i: set(rules).intersection(enabled_rules) for i, rules in command_selected.items()
+                    if set(rules).intersection(enabled_rules)}
     keys = [_keys(e) for e in events]
     if "edit_identical_calls" in enabled_rules:
         for event, key in zip(events, keys, strict=True):
             if "edit_identical_calls" in key:
                 selected[event["id"]] = {"edit_identical_calls"}
-    from recipe.swe_agent.edit_recovery import RULES as EDIT_RULES, analyze as analyze_edits
+    from recipe.swe_agent.edit_recovery import CAUSE_RULE, RULES as EDIT_RULES, analyze as analyze_edits, analyze_rejection_causes
 
     if set(EDIT_RULES).intersection(enabled_rules):
         edit_selected, _ = analyze_edits(events)
         for event_id, rules in edit_selected.items():
             selected.setdefault(event_id, set()).update(set(rules).intersection(enabled_rules))
         selected = {k: v for k, v in selected.items() if v}
-    for rule in (r for r in RULES if r in enabled_rules and r not in ("read_cycles", "edit_identical_calls", *EDIT_RULES)):
+    if CAUSE_RULE in enabled_rules:
+        cause_selected, _, _ = analyze_rejection_causes(events)
+        for event_id, rules in cause_selected.items():
+            selected.setdefault(event_id, set()).update(rules)
+    for rule in (r for r in RULES if r in enabled_rules and r not in ("read_cycles", "edit_identical_calls", CAUSE_RULE, *EDIT_RULES, *COMMAND_RULES)):
         run, previous = [], None
 
         def flush(current_run, current_rule):
@@ -168,10 +190,12 @@ def detect(events, enabled_rules, *, shell_min_copies=10, python_test_protected_
     return {event_id: sorted(rules) for event_id, rules in selected.items()}
 
 
-def capture_events(events, enabled_rules, *, shell_min_copies=10, python_test_protected_calls=20):
+def capture_events(events, enabled_rules, *, shell_min_copies=10, python_test_protected_calls=20,
+                   command_window=16, command_protected_calls=2):
     """Attach exact generation alignment to every selected call, once."""
     selected = detect(events, enabled_rules, shell_min_copies=shell_min_copies,
-                      python_test_protected_calls=python_test_protected_calls)
+                      python_test_protected_calls=python_test_protected_calls,
+                      command_window=command_window, command_protected_calls=command_protected_calls)
     captured = []
     for e in events:
         if e["id"] in selected and isinstance(e.get("token_span"), dict):
@@ -219,18 +243,58 @@ def verified_span(event, response, mask):
     return start, end
 
 
-def build_cost_weights(*args, enabled_rules=None, edit_cost=0.01, **kwargs):
+def build_cost_weights(*args, enabled_rules=None, edit_cost=0.01, command_cost=0.01, **kwargs):
+    from collections import Counter, defaultdict
+
     from verl.utils.swe_tool_failure import build_cost_weights as build
 
     enabled_rules = set(RULES if enabled_rules is None else enabled_rules)
-    from recipe.swe_agent.edit_recovery import RULES as EDIT_RULES
+    from recipe.swe_agent.edit_recovery import PENALTY_RULES as EDIT_RULES
+
+    decisions, per_rule = defaultdict(list), Counter()
+
+    def rule_labels(event):
+        proof = event.get("proof") if isinstance(event, dict) else None
+        rules = proof.get("rules") if isinstance(proof, dict) else None
+        return [r for r in RULES if isinstance(rules, list) and r in rules]
+
+    def charged_rule(event):
+        labels = rule_labels(event)
+        active = enabled_rules.intersection(labels)
+        priority = (*EDIT_RULES, "edit_identical_calls", "command_errors", "command_no_progress", *RULES)
+        return next((r for r in priority if r in active), next(iter(labels), "unattributed"))
+
+    def observe(row, event, reason, applied_cost, requested_cost):
+        labels = rule_labels(event)
+        rule = charged_rule(event)
+        if reason == "invalid_span" and labels and not enabled_rules.intersection(labels):
+            reason = "rule_disabled"
+        for label in labels:
+            per_rule[f"rules/{label}/matched"] += 1
+        per_rule[f"rules/{rule}/retained"] += 1
+        per_rule[f"rules/{rule}/applied"] += applied_cost > 0
+        per_rule[f"rules/{rule}/cost"] += applied_cost
+        if applied_cost == 0:
+            per_rule[f"rules/{rule}/skipped/{reason}"] += 1
+        event = event if isinstance(event, dict) else {}
+        proof = event.get("proof") or {}
+        decisions[row].append(dict(event_id=proof.get("event_id") if isinstance(proof, dict) else None,
+            rules=labels, charged_rule=rule, start=event.get("start"), end=event.get("end"),
+            applied=applied_cost > 0, cost=applied_cost, requested_cost=requested_cost, reason=reason,
+            token_count=(event["end"] - event["start"] if type(event.get("start")) is int
+                         and type(event.get("end")) is int else None),
+            cap_scale=(applied_cost / requested_cost if requested_cost else None)))
 
     def cost_for_event(event):
         # A call matching an enabled new Edit rule is charged once at its new
         # cost, even when an older repetition label is also present. Existing
         # tool-failure weights retain precedence through existing_weights.
         active = enabled_rules.intersection(event["proof"]["rules"])
-        return edit_cost if active.intersection((*EDIT_RULES, "edit_identical_calls")) else kwargs["cost"]
+        if active.intersection((*EDIT_RULES, "edit_identical_calls")):
+            return edit_cost
+        if active.intersection({"command_errors", "command_no_progress"}):
+            return command_cost
+        return kwargs["cost"]
 
     def verify_enabled(event, response, mask):
         span = verified_span(event, response, mask)
@@ -238,10 +302,45 @@ def build_cost_weights(*args, enabled_rules=None, edit_cost=0.01, **kwargs):
             return span
         return None
 
-    return build(
+    weights, counts = build(
         *args, event_key="tool_repeat_events", verifier=verify_enabled, diagnostic_prefix="tool_repeat_",
-        event_cost=cost_for_event, **kwargs
+        event_cost=cost_for_event, event_observer=observe, **kwargs
     )
+    # Only numbers enter metrics. The bounded per-row audit is a separate dump
+    # field; "applied" here means cost weights assigned, not optimizer completion.
+    for rule in enabled_rules.intersection(RULES):
+        for key in ("matched", "retained", "applied", "cost"):
+            per_rule.setdefault(f"rules/{rule}/{key}", 0)
+    counts.update(per_rule)
+    extras = args[2] if len(args) > 2 else kwargs.get("extra_fields", [])
+    trajectory_ids = kwargs.get("trajectory_ids")
+    trajectory_ids = list(range(len(extras))) if trajectory_ids is None else trajectory_ids
+    existing = kwargs.get("existing_weights")
+    reserved = {}
+    if existing is not None:
+        for key, spent in zip(trajectory_ids, existing.detach().sum(-1).tolist(), strict=True):
+            reserved[key] = reserved.get(key, 0.) + spent
+    warmup_steps = kwargs.get("warmup_steps", 0)
+    warmup = min(1., max(0., kwargs.get("step", 0) / warmup_steps)) if warmup_steps else 1.
+    for row, extra in enumerate(extras):
+        extra = getattr(extra, "data", extra)
+        if isinstance(extra, dict):
+            for decision in decisions[row]:
+                decision.update(effective_cap=kwargs["cap"], warmup_multiplier=warmup,
+                    failure_reserved_cost=reserved.get(trajectory_ids[row], 0.),
+                    remaining_budget=max(0., kwargs["cap"] * warmup - reserved.get(trajectory_ids[row], 0.)))
+                if decision["cap_scale"] is not None and warmup:
+                    decision["cap_scale"] /= warmup
+                if decision["reason"] == "inactive_sample":
+                    decision["train_exclusion_code"] = extra.get("train_exclusion_code")
+                    decision["train_exclusion_reason"] = extra.get("train_exclusion_reason")
+                    decision["train_sample_mask"] = extra.get("train_sample_mask")
+            encoded = json.dumps(dict(version=1, stage="training_cost_weights", step=kwargs.get("step"),
+                                      events=decisions[row]), separators=(",", ":"))
+            if len(encoded.encode()) > 2 * 1024 * 1024:
+                encoded = json.dumps(dict(version=1, stage="training_cost_weights", error="size_limit"))
+            extra["tool_repeat_application_audit_json"] = encoded
+    return weights, counts
 
 
 def _python_test_call(event):

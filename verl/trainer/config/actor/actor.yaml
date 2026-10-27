@@ -406,9 +406,39 @@ tool_repeat_python_test_shadow_enabled: false
 tool_repeat_penalty_edit_noop_episodes: false
 tool_repeat_penalty_edit_identical_calls: false
 tool_repeat_penalty_edit_rejection_episodes: false
+tool_repeat_penalty_edit_rejection_causes: false
+tool_edit_diagnostics_enabled: false
 tool_repeat_penalty_edit_cost: 0.01
 tool_repeat_edit_shadow_enabled: false
 tool_repeat_edit_feedback_enabled: false
+
+# Opt-in efficient SWE system prompt and tool descriptions.
+tool_efficiency_profile_enabled: false
+
+# Collect command evidence independently of local loss penalties.
+tool_command_diagnostics_enabled: false
+
+# Append concise model-visible feedback when command evidence is collected.
+tool_command_feedback_enabled: false
+
+# Per before/after command snapshot, forwarded to the execution service.
+tool_command_snapshot_timeout_seconds: 2.0
+
+# Penalize repeated, proven command invocation errors.
+tool_repeat_penalty_command_errors: false
+
+# Penalize repeated commands with proven lack of progress.
+tool_repeat_penalty_command_no_progress: false
+
+# Nominal cost per selected command event, within the shared tool cap.
+tool_repeat_penalty_command_cost: 0.01
+
+# Number of tool calls retained for command repetition episodes.
+tool_repeat_penalty_command_window: 16
+
+# Protect the first matching attempts in each command episode.
+tool_repeat_penalty_command_protected_calls: 2
+
 # Broader command observations are advisory only, never new loss events.
 tool_repeat_command_shadow_enabled: false
 tool_repeat_search_shadow_enabled: false

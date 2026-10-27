@@ -1327,6 +1327,12 @@ class PPOTrainer(ABC):
         sample_gts = []
         sample_scores = []
         sample_turns = []
+        # Detailed command proofs are dump-only metadata. Keep one bounded
+        # audit per final session alongside its score, outside metric inputs.
+        sample_command_audits: list[str | None] = []
+        sample_edit_audits: dict[str, list] = {
+            "edit_diagnostics_audit_json": [], "tool_repeat_recovery_audit_json": [],
+        }
         data_sources = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
         dump_all_inputs: list[str] = []
@@ -1468,6 +1474,13 @@ class PPOTrainer(ABC):
             reward_extra_infos_dict["reward"].extend(scores)
 
             extra_fields_list = data.pop("extra_fields", None)
+            sample_command_audits.extend(
+                rollout_diagnostics(extra).get("command_evidence_audit_json")
+                for extra in (extra_fields_list.tolist() if extra_fields_list is not None else [None] * len(scores))
+            )
+            for audit_key, audits in sample_edit_audits.items():
+                audits.extend(rollout_diagnostics(extra).get(audit_key)
+                    for extra in (extra_fields_list.tolist() if extra_fields_list is not None else [None] * len(scores)))
             if extra_fields_list is not None:
                 n_prior = len(reward_extra_infos_dict["reward"]) - len(extra_fields_list.tolist())
                 for extra_field in extra_fields_list.tolist():
@@ -1561,6 +1574,10 @@ class PPOTrainer(ABC):
                 reward_extra_infos_dict={
                     k: [v[i] for i in session_final_indices] for k, v in reward_extra_infos_dict.items()
                 }
+                | ({"command_evidence_audit_json": [sample_command_audits[i] for i in session_final_indices]}
+                   if any(audit is not None for audit in sample_command_audits) else {})
+                | {key: [audits[i] for i in session_final_indices] for key, audits in sample_edit_audits.items()
+                   if any(audit is not None for audit in audits)}
                 | {"uid": dump_all_keys},
                 dump_path=val_data_dir,
             )
@@ -1568,6 +1585,13 @@ class PPOTrainer(ABC):
         validation_metrics = self._val_metrics_update(
             data_sources, sample_uids, reward_extra_infos_dict, sample_turns
         )
+        # Unfiltered diagnostic sums use final sessions, not duplicated dump
+        # fragments. They never replace reward/acc or enter advantage computation.
+        for name, values in reward_extra_infos_dict.items():
+            if name.startswith("edit_diagnostics_"):
+                numeric = [float(v) for v in values if isinstance(v, (int, float, bool)) and np.isfinite(v)]
+                if numeric:
+                    validation_metrics["validation/edit/" + name.removeprefix("edit_diagnostics_") + "/sum"] = sum(numeric)
         if strict:
             # Historical filtered means remain diagnostic. An exact core mean
             # is published below only for a completely confirmed fixed roster.
@@ -1809,6 +1833,19 @@ class PPOTrainer(ABC):
             scores = [scores[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            try:
+                application_audits = tq.kv_batch_get(
+                    keys=batch.keys, partition_id=batch.partition_id,
+                    select_fields=["tool_repeat_application_audit_json"],
+                )["tool_repeat_application_audit_json"]
+                application_audits = (application_audits.tolist() if hasattr(application_audits, "tolist")
+                                      else list(application_audits))
+            except (KeyError, TypeError, ValueError):
+                application_audits = None
+            if application_audits is not None:
+                reward_extra_infos_dict["tool_repeat_application_audit_json"] = [
+                    application_audits[i] for i in sorted_indices
+                ]
             reward_extra_infos_dict["success_value"] = [successes[i] for i in sorted_indices]
             reward_extra_infos_dict["response_tokens"] = [response_tokens[i] for i in sorted_indices]
             reward_extra_infos_dict["is_padding"] = [bool(batch.tags[i].get("is_padding", False)) for i in sorted_indices]
@@ -2565,7 +2602,8 @@ class PPOTrainer(ABC):
         if (tool_repeat_enabled or tool_config.get("tool_repeat_edit_shadow_enabled", False)
                 or tool_config.get("tool_repeat_edit_feedback_enabled", False)
                 or tool_config.get("tool_repeat_command_shadow_enabled", False)
-                or tool_config.get("tool_repeat_search_shadow_enabled", False)):
+                or tool_config.get("tool_repeat_search_shadow_enabled", False)
+                or tool_config.get("tool_command_diagnostics_enabled", False)):
             for extra, tag in zip(extra_fields, batch.tags, strict=True):
                 if tag.get("is_padding", False) or not isinstance(extra, dict):
                     continue
@@ -2574,6 +2612,9 @@ class PPOTrainer(ABC):
                         if isinstance(value, (int, float)) and np.isfinite(value) and value >= 0:
                             name = "tool_repeat/" + key.removeprefix("tool_repeat_")
                             metrics[name] = metrics.get(name, 0) + value
+                    elif key.startswith("command_evidence_") and isinstance(value, (int, float)) and np.isfinite(value) and value >= 0:
+                        name = "command_evidence/" + key.removeprefix("command_evidence_")
+                        metrics[name] = metrics.get(name, 0) + value
         reward_diagnostics = [extra["reward_extra_info"] for extra, tag in zip(extra_fields, batch.tags, strict=True)
                               if not tag.get("is_padding", False) and isinstance(extra, dict)
                               and isinstance(extra.get("reward_extra_info"), dict)]
@@ -2729,6 +2770,16 @@ class PPOTrainer(ABC):
                 if (isinstance(value, (bool, np.bool_)) and bool(value)
                         or isinstance(value, (int, float, np.number)) and np.isfinite(value) and value > 0):
                     active[i] = False
+            for i, extra in enumerate(extra_fields):
+                if isinstance(extra, dict):
+                    code = int(exclusion_codes[i])
+                    reasons = [reason for bit, reason in ((1, "padding"), (2, "completion_ratio_cutoff"),
+                        (4, "tag_mask"), (8, "timeout_prediction"), (16, "infrastructure_filter"),
+                        (32, "evaluator_uncertainty")) if code & bit]
+                    if not bool(active[i]) and not reasons:
+                        reasons = ["infrastructure_or_empty_response"]
+                    extra.update(train_exclusion_code=code, train_exclusion_reason=",".join(reasons) or "none",
+                                 train_sample_mask=bool(active[i]))
             trajectory_ids = [key.rsplit("_", 1)[0] for key in batch.keys]
             normalizer = trajectory_normalizer(active, trajectory_ids)
             for name, enabled in (
@@ -2760,6 +2811,7 @@ class PPOTrainer(ABC):
                         rule for rule in RULES if tool_config.get("tool_repeat_penalty_" + rule, False)
                     }
                     additional["edit_cost"] = tool_config.get("tool_repeat_penalty_edit_cost", 0.01)
+                    additional["command_cost"] = tool_config.get("tool_repeat_penalty_command_cost", 0.01)
                 weights, counts = build_cost_weights(
                     data.batch["responses"], data.batch["response_mask"], extra_fields, active,
                     cost=tool_config.get(name + "_penalty_cost", 0.02),
@@ -2806,6 +2858,10 @@ class PPOTrainer(ABC):
         if tool_repeat_enabled:
             output["tool_repeat_active"] = data.batch["tool_repeat_active"]
             output["tool_repeat_normalizer"] = data.batch["tool_repeat_normalizer"]
+            output["tool_repeat_application_audit_json"] = NonTensorStack.from_list([
+                NonTensorData(extra.get("tool_repeat_application_audit_json", ""))
+                for extra in extra_fields
+            ])
         if thinking_repeat_enabled:
             output["thinking_repeat_active"] = data.batch["thinking_repeat_active"]
             output["thinking_repeat_normalizer"] = data.batch["thinking_repeat_normalizer"]

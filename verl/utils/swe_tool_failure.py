@@ -105,7 +105,7 @@ def verified_span(event, response, mask):
 def build_cost_weights(
     responses, response_mask, extra_fields, active, *, cost, cap, warmup_steps, step, trajectory_ids=None,
     event_key="tool_failure_events", verifier=None, diagnostic_prefix="tool_failure_", existing_weights=None,
-    event_cost=None,
+    event_cost=None, event_observer=None,
 ):
     """Validate sparse events and cap trajectory cost before any minibatch split."""
     import torch
@@ -130,6 +130,10 @@ def build_cost_weights(
     by_trajectory, seen = {}, set()
     response_rows = responses.tolist()
     reserved = {}
+
+    def observe(row, event, reason, applied_cost=0.0, requested_cost=None):
+        if event_observer is not None:
+            event_observer(row, event, reason, applied_cost, requested_cost)
     if existing_weights is not None:
         for row, values in enumerate(existing_weights.detach().gt(0).tolist()):
             if any(values):
@@ -158,28 +162,37 @@ def build_cost_weights(
             if (span is None or occupied.intersection(range(*span)) or identity in seen
                     or already_charged):
                 counts["abstained"] += 1
+                reason = ("invalid_span" if span is None else "duplicate" if identity in seen
+                          else "overlap" if occupied.intersection(range(*span)) else "failure_precedence")
+                observe(row, event, reason)
                 continue
             occupied.update(range(*span))
             seen.add(identity)
             requested = cost if event_cost is None else event_cost(event)
             if not isinstance(requested, (int, float)) or not math.isfinite(requested) or requested < 0:
                 raise ValueError("Event cost must be finite and nonnegative")
-            spans.append((*span, requested))
+            spans.append((*span, requested, event))
         if not bool(active[row]) or not spans:
+            for _, _, requested, event in spans:
+                observe(row, event, "inactive_sample", requested_cost=requested)
             continue
-        by_trajectory.setdefault(trajectory_ids[row], []).extend((row, start, end, requested)
-                                                               for start, end, requested in spans)
+        by_trajectory.setdefault(trajectory_ids[row], []).extend((row, start, end, requested, event)
+                                                               for start, end, requested, event in spans)
     for trajectory, spans in by_trajectory.items():
         spent = (sum(float(existing_weights[i].sum()) for i, key in enumerate(trajectory_ids)
                      if key == trajectory) if existing_weights is not None else 0.0)
-        requested_total = sum(requested * warmup for _, _, _, requested in spans)
+        requested_total = sum(requested * warmup for _, _, _, requested, _ in spans)
         scale = min(1.0, max(0.0, cap * warmup - spent) / requested_total) if requested_total else 0.0
         if scale == 0:
+            for row, _, _, requested, event in spans:
+                observe(row, event, "zero_cost" if requested == 0 else "warmup_zero" if warmup == 0
+                        else "cap_exhausted", requested_cost=requested)
             continue
-        for row, start, end, requested in spans:
+        for row, start, end, requested, event in spans:
             per_call = requested * warmup * scale
             weights[row, start:end] = per_call / (end - start)
             counts["applied"] += per_call > 0
+            observe(row, event, "applied" if per_call > 0 else "zero_cost", per_call, requested)
         counts["cost"] += requested_total * scale
     return weights, counts
 

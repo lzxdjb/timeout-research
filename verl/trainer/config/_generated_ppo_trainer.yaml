@@ -62,6 +62,17 @@ actor_rollout_ref:
     _target_: verl.workers.config.FSDPActorConfig
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
     strategy: fsdp
+    timeout_prediction:
+      _target_: verl.workers.config.TimeoutPredictionConfig
+      enabled: false
+      target_mode: three_class_reward
+      loss_coef: 0.1
+      learning_rate: 0.0001
+      confidence_delta: 0.05
+      use_lagged_predictor: false
+      reward_assignment: terminal
+      normalize_broadcast: false
+      save_optimizer: true
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: null
     ppo_micro_batch_size_per_gpu: null
@@ -144,6 +155,15 @@ actor_rollout_ref:
           steps: null
           stages: ${oc.select:global_profiler.global_tool_config.precision_debugger.stages,null}
           strict: ${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}
+    tool_failure_penalty_enabled: false
+    tool_failure_grep_schema_proof_enabled: false
+    tool_failure_penalty_cost: 0.02
+    tool_failure_penalty_cap: 0.1
+    tool_failure_penalty_warmup_steps: 10
+    thinking_repeat_penalty_enabled: false
+    thinking_repeat_penalty_cost: 0.02
+    thinking_repeat_penalty_cap: 0.1
+    thinking_repeat_penalty_warmup_steps: 10
     router_replay:
       _target_: verl.workers.config.RouterReplayConfig
       mode: disabled
@@ -159,6 +179,51 @@ actor_rollout_ref:
       - re:.*mlp.gate$
       activation_observer: static_minmax
       quantization_config_path: null
+    tool_repeat_penalty_enabled: false
+    tool_repeat_penalty_cost: 0.02
+    tool_repeat_penalty_cap: 0.1
+    tool_repeat_penalty_warmup_steps: 10
+    tool_repeat_penalty_noop_edits: false
+    tool_repeat_penalty_unchanged_reads: false
+    tool_repeat_penalty_read_cycles: false
+    tool_repeat_penalty_contract_rejections: false
+    tool_repeat_penalty_varied_noop_edits: false
+    tool_repeat_penalty_noop_writes: false
+    tool_repeat_penalty_shell_reads: false
+    tool_repeat_penalty_shell_min_copies: 10
+    tool_repeat_penalty_python_tests: false
+    tool_repeat_penalty_python_test_protected_calls: 20
+    tool_repeat_shadow_enabled: false
+    tool_repeat_python_test_shadow_enabled: false
+    tool_repeat_penalty_edit_noop_episodes: false
+    tool_repeat_penalty_edit_identical_calls: false
+    tool_repeat_penalty_edit_rejection_episodes: false
+    tool_repeat_penalty_edit_rejection_causes: false
+    tool_edit_diagnostics_enabled: false
+    tool_repeat_penalty_edit_cost: 0.01
+    tool_repeat_edit_shadow_enabled: false
+    tool_repeat_edit_feedback_enabled: false
+    tool_efficiency_profile_enabled: false
+    tool_command_diagnostics_enabled: false
+    tool_command_feedback_enabled: false
+    tool_command_snapshot_timeout_seconds: 2.0
+    tool_repeat_penalty_command_errors: false
+    tool_repeat_penalty_command_no_progress: false
+    tool_repeat_penalty_command_cost: 0.01
+    tool_repeat_penalty_command_window: 16
+    tool_repeat_penalty_command_protected_calls: 2
+    tool_repeat_command_shadow_enabled: false
+    tool_repeat_search_shadow_enabled: false
+    thinking_repeat_aggregate_enabled: false
+    thinking_repeat_aggregate_max_gap: 4096
+    thinking_repeat_aggregate_min_identities: 3
+    thinking_repeat_aggregate_min_surplus: 512
+    thinking_repeat_aggregate_min_fraction: 0.3
+    thinking_repeat_cross_turn_enabled: false
+    thinking_repeat_cross_turn_min_tokens: 32
+    thinking_repeat_cross_turn_min_copies: 8
+    thinking_repeat_cross_turn_min_surplus: 256
+    thinking_repeat_cross_turn_max_period: 4
     grad_clip: 1.0
     ulysses_sequence_parallel_size: 1
     entropy_from_logits_with_chunking: false
@@ -347,6 +412,9 @@ actor_rollout_ref:
       backend: null
       token2text: false
       max_samples_per_step_per_worker: null
+    limit_images: null
+    enable_audio: false
+    limit_audio: null
     skip_tokenizer_init: true
     enable_rollout_routing_replay: false
     moe_load_balance_metrics_interval: 0

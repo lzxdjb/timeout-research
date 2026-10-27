@@ -60,8 +60,8 @@ def rollout_diagnostics(extra) -> dict:
                   "hidden_reward_seconds", "hidden_tests_seconds", "hidden_patch_check_seconds", "hidden_patch_valid",
                   "verification_invalidated", "submission_after_fresh_verification", "diagnostic_outcome_code",
                   "hidden_pass", "verification_attempted", "verification_passed", "verification_meaningful",
-                  "verification_meaningful_reason"})
-    prefixes = ("trajectory_", "partial_hidden_reward_", "repeat_reward_", "tool_repeat_", "thinking_repeat_", "observed_infrastructure_failure",
+                  "verification_meaningful_reason", "system_prompt_sha256"})
+    prefixes = ("edit_diagnostics_", "command_evidence_", "trajectory_", "partial_hidden_reward_", "repeat_reward_", "tool_repeat_", "thinking_repeat_", "observed_infrastructure_failure",
                 "private_evaluator_", "hidden_test_count", "hidden_test_commands_", "hidden_tests_total_", "hidden_tests_passed_",
                 "oom_", "public_verification_", "public_patch_", "public_hidden_workspace_", "final_patch_")
     result = {"rollout_diagnostic_version": 1}
@@ -71,7 +71,12 @@ def rollout_diagnostics(extra) -> dict:
         if value is None or isinstance(value, (bool, int, float)):
             result[key] = value
         elif isinstance(value, str):
-            if key == "tool_repeat_recovery_audit_json":
+            if key in {"command_evidence_audit_json", "edit_diagnostics_audit_json"}:
+                if len(value.encode()) <= 2 * 1024 * 1024:
+                    result[key] = value
+                else:
+                    result[key.removesuffix("_audit_json") + "_audit_error"] = "size_limit"
+            elif key == "tool_repeat_recovery_audit_json":
                 # Compact request-local executor proofs, joined to the transcript
                 # by dispatched call ID. Never silently truncate a JSON proof.
                 if len(value.encode()) <= 512 * 1024:

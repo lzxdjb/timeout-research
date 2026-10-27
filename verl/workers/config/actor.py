@@ -229,9 +229,20 @@ class ActorConfig(BaseConfig):
     tool_repeat_penalty_edit_noop_episodes: bool = False
     tool_repeat_penalty_edit_identical_calls: bool = False
     tool_repeat_penalty_edit_rejection_episodes: bool = False
+    tool_repeat_penalty_edit_rejection_causes: bool = False
+    tool_edit_diagnostics_enabled: bool = False
     tool_repeat_penalty_edit_cost: float = 0.01
     tool_repeat_edit_shadow_enabled: bool = False
     tool_repeat_edit_feedback_enabled: bool = False
+    tool_efficiency_profile_enabled: bool = False
+    tool_command_diagnostics_enabled: bool = False
+    tool_command_feedback_enabled: bool = False
+    tool_command_snapshot_timeout_seconds: float = 2.0
+    tool_repeat_penalty_command_errors: bool = False
+    tool_repeat_penalty_command_no_progress: bool = False
+    tool_repeat_penalty_command_cost: float = 0.01
+    tool_repeat_penalty_command_window: int = 16
+    tool_repeat_penalty_command_protected_calls: int = 2
     tool_repeat_command_shadow_enabled: bool = False
     tool_repeat_search_shadow_enabled: bool = False
     thinking_repeat_penalty_enabled: bool = False
@@ -265,10 +276,18 @@ class ActorConfig(BaseConfig):
         if (type(self.tool_repeat_penalty_python_test_protected_calls) is not int
                 or self.tool_repeat_penalty_python_test_protected_calls < 20):
             raise ValueError("tool_repeat_penalty_python_test_protected_calls must be >=20")
+        if (type(self.tool_command_snapshot_timeout_seconds) not in (int, float)
+                or not 0 < self.tool_command_snapshot_timeout_seconds <= 60):
+            raise ValueError("tool_command_snapshot_timeout_seconds must be in (0, 60]")
+        if (type(self.tool_repeat_penalty_command_protected_calls) is not int
+                or self.tool_repeat_penalty_command_protected_calls < 2
+                or type(self.tool_repeat_penalty_command_window) is not int
+                or self.tool_repeat_penalty_command_window <= self.tool_repeat_penalty_command_protected_calls):
+            raise ValueError("Command window must exceed protected calls (>=2)")
         if self.tool_repeat_penalty_enabled:
             import math
             if (not all(math.isfinite(x) and x >= 0 for x in
-                        (self.tool_repeat_penalty_cost, self.tool_repeat_penalty_edit_cost, self.tool_repeat_penalty_cap))
+                        (self.tool_repeat_penalty_cost, self.tool_repeat_penalty_edit_cost, self.tool_repeat_penalty_command_cost, self.tool_repeat_penalty_cap))
                     or self.tool_repeat_penalty_warmup_steps < 0):
                 raise ValueError("Invalid tool-repeat cost, cap, or warmup")
             if self.policy_loss.get("loss_mode", "vanilla") != "vanilla":

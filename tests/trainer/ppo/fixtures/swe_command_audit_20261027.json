@@ -1,0 +1,187 @@
+[
+  {
+    "source": "validation_data/three_penalty_more_cases/14.jsonl",
+    "line": 264,
+    "step": 14,
+    "task": "mwaskom__seaborn-3069",
+    "score": 0,
+    "turn": 211,
+    "name": "Bash",
+    "arguments": {
+      "command": "python -c \"print('Ready')\""
+    },
+    "response": "\nexit_code: 0\nReady\n",
+    "excerpt_sha256": "9d6ff0e81f3ca092b123bc97bf0da592adc62ef148b3f720ccf02cda0603d057"
+  },
+  {
+    "source": "validation_data/three_penalty_more_cases/20.jsonl",
+    "line": 83,
+    "step": 20,
+    "task": "django__django-16877",
+    "score": 1,
+    "turn": 140,
+    "name": "Bash",
+    "arguments": {
+      "command": "python << 'PYEND'\n# Read the file content\nwith open('/testbed/tests/template_tests/filter_tests/test_escapeseq.py', 'rb') as f:\n    content = f.read()\n    \n# Update the second assertEqual line - use correct bytes for \"&amp;, &lt; -- &amp;, &lt;\" (the first part should be &, < not &amp;, &lt;)\nlines = content.split(b'\\n')\nlines[20] = b'        self.assertEqual(output, \"&amp;, &lt; -- &amp;, &lt;\")'\n\ncontent = b'\\n'.join(lines)\n\nwith open('/testbed/tests/template_tests/filter_tests/test_escapeseq.py', 'wb') as f:\n    f.write(content)\n\nprint(\"Updated second assertEqual line:\")\nprint(repr(content.split(b'\\n')[20]))\nPYEND"
+    },
+    "response": "\nexit_code: 0\nUpdated second assertEqual line:\nb'        self.assertEqual(output, \"&amp;, &lt; -- &amp;, &lt;\")'\n",
+    "excerpt_sha256": "22bcef2d547ae592f3be8f063f2b47ad1e2af4a4e95584449735860316a74e8c"
+  },
+  {
+    "source": "validation_data/three_penalty_more_cases/20.jsonl",
+    "line": 83,
+    "step": 20,
+    "task": "django__django-16877",
+    "score": 1,
+    "turn": 201,
+    "name": "Bash",
+    "arguments": {
+      "command": "python << 'PYEND'\n# Read the file content\nwith open('/testbed/tests/template_tests/filter_tests/test_escapeseq.py', 'rb') as f:\n    content = f.read()\n    \n# Update the lines correctly\nlines = content.split(b'\\n')\n# test_escapeseq01: both escaped  \nlines[10] = b'        self.assertEqual(output, \"&amp;, &lt; -- &amp;, &lt;\")'\n# test_escapeseq02: first unescaped, second escaped\nlines[21] = b'        self.assertEqual(output, \"&amp;, &lt; -- &amp;, &lt;\")'\n\ncontent = b'\\n'.join(lines)\n\nwith open('/testbed/tests/template_tests/filter_tests/test_escapeseq.py', 'wb') as f:\n    f.write(content)\n\nprint(\"Updated assertEqual lines\")\nprint(\"test_escapeseq01 expected:\", repr(lines[10]))\nprint(\"test_escapeseq02 expected:\", repr(lines[21]))\nPYEND\n\npython tests/runtests.py template_tests.filter_tests.test_escapeseq --settings=test_sqlite --parallel 1 2>&1"
+    },
+    "response": "\nexit_code: 1\nUpdated assertEqual lines\ntest_escapeseq01 expected: b'        self.assertEqual(output, \"&amp;, &lt; -- &amp;, &lt;\")'\ntest_escapeseq02 expected: b'        self.assertEqual(output, \"&amp;, &lt; -- &amp;, &lt;\")'\nTesting against Django installed in '/testbed/django'\nFound 2 test(s).\nSystem check identified no issues (0 silenced).\n.F\n======================================================================\nFAIL: test_escapeseq02 (template_tests.filter_tests.test_escapeseq.EscapeseqTests.test_escapeseq02)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/testbed/django/test/utils.py\", line 443, in inner\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/testbed/tests/template_tests/utils.py\", line 58, in inner\n    func(self)\n  File \"/testbed/tests/template_tests/filter_tests/test_escapeseq.py\", line 21, in test_escapeseq02\n    self.assertEqual(output, \"&amp;, &lt; -- &amp;, &lt;\")\nAssertionError: '&, < -- &amp;, &lt;' != '&amp;, &lt; -- &amp;, &lt;'\n\n----------------------------------------------------------------------\nRan 2 tests in 0.002s\n\nFAILED (failures=1)\n\n[test outcome] failed (confidence: high; framework: unittest; tests_executed: 2; process_exit_code: 1)\n[test guidance] For Django, select the relevant public test label and use --parallel 1 for this sanity run. Avoid running the whole suite through tail, which can hide progress until completion.\n",
+    "excerpt_sha256": "f90133390a26df618e915be6e2f10662de76d896a4d37ebf979b03783ae1912e"
+  },
+  {
+    "source": "validation_data/three_penalty_more_cases/26.jsonl",
+    "line": 15,
+    "step": 26,
+    "task": "django__django-14792",
+    "score": 1,
+    "turn": 147,
+    "name": "Bash",
+    "arguments": {
+      "command": "python3 -c \"\nimport sys\nsys.path.insert(0, '/testbed')\n\nfrom django.utils import timezone\nimport pytz\n\n# The correct timezone names (copied from pytz.all_timezones)\nname1 = 'Etl/G GMT-10'\nname2 = 'Etl/G GMT+10'\n\ntzname = timezone._get_timezone_name(pytz.timezone(name1))\nprint(f'{name1} tzname:', tzname)\n\ntzname = timezone._get_timezone_name(pytz.timezone(name2))\nprint(f'{name2} tzname:', tzname)\n\""
+    },
+    "response": "\nexit_code: 1\nTraceback (most recent call last):\n  File \"<string>\", line 12, in <module>\n  File \"/opt/miniconda3/envs/testbed/lib/python3.8/site-packages/pytz/__init__.py\", line 188, in timezone\n    raise UnknownTimeZoneError(zone)\npytz.exceptions.UnknownTimeZoneError: 'Etl/G GMT-10'\n",
+    "excerpt_sha256": "27e543cfd219652b1bc27bea69d1018fd74fe015d693a03114d08b9bdcc22161"
+  },
+  {
+    "source": "validation_data/three_penalty_more_cases/26.jsonl",
+    "line": 15,
+    "step": 26,
+    "task": "django__django-14792",
+    "score": 1,
+    "turn": 153,
+    "name": "Bash",
+    "arguments": {
+      "command": "python3 -c \"\nimport sys\nsys.path.insert(0, '/testbed')\n\nfrom django.utils import timezone\nimport pytz\n\n# The correct timezone names (copied from pytz.all_timezones)\nname1 = 'Ecl/G GMT-10'\nname2 = 'Ecl/G GMT+10'\n\ntzname = timezone._get_timezone_name(pytz.timezone(name1))\nprint(f'{name1} tzname:', tzname)\n\ntzname = timezone._get_timezone_name(pytz.timezone(name2))\nprint(f'{name2} tzname:', tzname)\n\""
+    },
+    "response": "\nexit_code: 1\nTraceback (most recent call last):\n  File \"<string>\", line 12, in <module>\n  File \"/opt/miniconda3/envs/testbed/lib/python3.8/site-packages/pytz/__init__.py\", line 188, in timezone\n    raise UnknownTimeZoneError(zone)\npytz.exceptions.UnknownTimeZoneError: 'Ecl/G GMT-10'\n",
+    "excerpt_sha256": "a8482d2873f53058a5a3fc00fcdc89c2f61a36a856a186f0b77d060cc9248239"
+  },
+  {
+    "source": "validation_data/three_penalty_more_cases/2.jsonl",
+    "line": 35,
+    "step": 2,
+    "task": "django__django-16662",
+    "score": 0,
+    "turn": 44,
+    "name": "Bash",
+    "arguments": {
+      "command": "cd /testbed && PYTHONPATH=. python -m unittest tests.migrations.test_writer -v 2>&1 | head -200"
+    },
+    "response": "\nexit_code: 0\ntest_writer (unittest.loader._FailedTest.test_writer) ... ERROR\n\n======================================================================\nERROR: test_writer (unittest.loader._FailedTest.test_writer)\n----------------------------------------------------------------------\nImportError: Failed to import test module: test_writer\nTraceback (most recent call last):\n  File \"/opt/miniconda3/envs/testbed/lib/python3.11/unittest/loader.py\", line 162, in loadTestsFromName\n    module = __import__(module_name)\n             ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/testbed/tests/migrations/test_writer.py\", line 15, in <module>\n    import custom_migration_operations.more_operations\nModuleNotFoundError: No module named 'custom_migration_operations'\n\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nFAILED (errors=1)\n\n[test outcome] failed (confidence: low; framework: unittest; tests_executed: 0; process_exit_code: 0)\n[test feedback] A runner or import prerequisite is missing. Read README/CONTRIBUTING, tox.ini or pyproject.toml for the repository's native runner and settings; Django repositories may use tests/runtests.py rather than pytest or manage.py. This does not verify the repair.\n[test feedback] The shell exited 0, but parsed test evidence does not show success. A pipeline can mask the runner's status; run the runner directly or explicitly capture its status.\n[test feedback] unittest reported import-error placeholders. These do not execute the requested test bodies; correct the public test module path and settings.\n[test guidance] For Django, select the relevant public test label and use --parallel 1 for this sanity run. Avoid running the whole suite through tail, which can hide progress until completion.\n[test guidance] Public Django runner found: python tests/runtests.py <public.test.label> --settings=test_sqlite --parallel 1 (from the repository root). Replace <public.test.label> with an existing dotted module under tests/, without the tests/ prefix or .py suffix; discover the label with Grep/Glob.\n",
+    "excerpt_sha256": "488fe9ce80c84ab7667e158baac87c88cd9acf71c387f2e0c2866293fddbc84d"
+  },
+  {
+    "source": "validation_data/three_penalty_more_cases/2.jsonl",
+    "line": 35,
+    "step": 2,
+    "task": "django__django-16662",
+    "score": 0,
+    "turn": 66,
+    "name": "Bash",
+    "arguments": {
+      "command": "cd /testbed && python -c \"\nimport django\nfrom django.conf import settings\nsettings.configure(\n    DEBUG=True,\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],\n    USE_TZ=False,\n)\ndjango.setup()\n\n# Test our fix in migration writer\nfrom django.db.migrations.writer import MigrationWriter\n\n# Test: ensure correct sorting of import statements\ndef test_import_sorting():\n    # Create test cases\n    tests = [\n        # (inputs, expected)\n        (\n            {'import datetime', 'from django.db import migrations'},\n            ['import datetime', 'from django.db import migrations'],\n        ),\n        (\n            {'import django.db', 'from datetime import datetime'},\n            ['import django.db', 'from datetime import datetime'],\n        ),\n        (\n            {'import a', 'import b', 'from c import x'},\n            ['import a', 'import b', 'from c import x'],\n        ),\n        (\n            {'import a', 'from b import x', 'import c', 'from d import y'},\n            ['import a', 'import c', 'from b import x', 'from d import y'],\n        ),\n    ]\n    \n    for inputs, expected in tests:\n        # Apply our sorting\n        module_imports = [imp for imp in inputs if imp.startswith('import ')]\n        from_imports = [imp for imp in inputs if not imp.startswith('import ')]\n        module_imports.sort(key=lambda i: i.split()[1])\n        from_imports.sort(key=lambda i: i.split()[1])\n        sorted_imports = module_imports + from_imports\n        \n        if sorted_imports != expected:\n            print(f'FAIL: {inputs}')\n            print(f'  Expected: {expected}')\n            print(f'  Got:      {sorted_imports}')\n            return False\n    return True\n\nif test_import_sorting():\n    print('PASS: All import sorting tests passed.')\nelse:\n    print('FAIL: Some import sorting tests failed.')\n\""
+    },
+    "response": "\nexit_code: 0\nPASS: All import sorting tests passed.\n",
+    "excerpt_sha256": "d3d83b55bf8273270d88c1187661e3fbb8def89159ac11266f92815595c338ac"
+  },
+  {
+    "source": "validation_data/three_penalty_more_cases/2.jsonl",
+    "line": 35,
+    "step": 2,
+    "task": "django__django-16662",
+    "score": 0,
+    "turn": 68,
+    "name": "Bash",
+    "arguments": {
+      "command": "cd /testbed && python -c \"\nimport django\nfrom django.conf import settings\nsettings.configure(\n    DEBUG=True,\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],\n    USE_TZ=False,\n)\ndjango.setup()\n\n# Test edge cases for import sorting\ndef test_edge_cases():\n    # Test with empty imports\n    test_cases = [\n        # (inputs, expected)\n        ([], []),\n        (['import a'], ['import a']),\n        (['from b import x'], ['from b import x']),\n        (['import a', 'import b'], ['import a', 'import b']),\n        (['from b import x', 'from c import y'], ['from b import x', 'from c import y']),\n        (['import b', 'import a'], ['import a', 'import b']),  # Sorted order\n        (['from y import z', 'from x import w'], ['from x import w', 'from y import z']),  # Sorted order\n        (['import b', 'from a import x'], ['import b', 'from a import x']),  # Correct order (import before from)\n        (['from a import x', 'import b'], ['import b', 'from a import x']),  # Swapped order (corrected)\n    ]\n    \n    all_passed = True\n    for inputs, expected in test_cases:\n        # Apply our sorting\n        module_imports = [imp for imp in inputs if imp.startswith('import ')]\n        from_imports = [imp for imp in inputs if not imp.startswith('import ')]\n        module_imports.sort(key=lambda i: i.split()[1])\n        from_imports.sort(key=lambda i: i.split()[1])\n        sorted_imports = module_imports + from_imports\n        \n        if sorted_imports == expected:\n            print(f'PASS: {inputs} -> {sorted_imports}')\n        else:\n            print(f'FAIL: {inputs}')\n            print(f'  Expected: {expected}')\n            print(f'  Got:      {sorted_imports}')\n            all_passed = False\n    return all_passed\n\nif test_edge_cases():\n    print('\\\\nAll edge case tests passed.')\nelse:\n    print('\\\\nSome edge case tests failed.')\n\""
+    },
+    "response": "\nexit_code: 0\nPASS: [] -> []\nPASS: ['import a'] -> ['import a']\nPASS: ['from b import x'] -> ['from b import x']\nPASS: ['import a', 'import b'] -> ['import a', 'import b']\nPASS: ['from b import x', 'from c import y'] -> ['from b import x', 'from c import y']\nPASS: ['import b', 'import a'] -> ['import a', 'import b']\nPASS: ['from y import z', 'from x import w'] -> ['from x import w', 'from y import z']\nPASS: ['import b', 'from a import x'] -> ['import b', 'from a import x']\nPASS: ['from a import x', 'import b'] -> ['import b', 'from a import x']\n\nAll edge case tests passed.\n",
+    "excerpt_sha256": "0b85ef120a333e627bac671257cc6dc247f80b4bb1edc1a07b458ddb651e8ead"
+  },
+  {
+    "source": "validation_data/three_penalty_more_cases/2.jsonl",
+    "line": 32,
+    "step": 2,
+    "task": "django__django-11433",
+    "score": 0,
+    "turn": 40,
+    "name": "Bash",
+    "arguments": {
+      "command": "cd /testbed && python tests/runtests.py tests.forms_tests.tests.test_forms.FormsTestCase.test_initial_data --settings=test_sqlite --parallel 1 2>&1"
+    },
+    "response": "\nexit_code: 1\nF\n======================================================================\nFAIL: test_initial_data (tests.forms_tests.tests.test_forms.FormsTestCase)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/testbed/tests/forms_tests/tests/test_forms.py\", line 1748, in test_initial_data\n    Password: <input type=\"password\" name=\"password\" required></li>\"\"\"\n  File \"/testbed/django/test/testcases.py\", line 778, in assertHTMLEqual\n    self.fail(self._formatMessage(msg, standardMsg))\nAssertionError: <li>\nUsername:<input maxlength=\"10\" name=\"username\" required type=\"text\">\n</li>< [truncated]... != <li>\n<ul class=\"errorlist\">\n<li>\nThis field is required.\n</li>\n</ul>Username:<in [truncated]...\n  <li>\n+ <ul class=\"errorlist\">\n+ <li>\n+ This field is required.\n+ </li>\n- Username:<input maxlength=\"10\" name=\"username\" required type=\"text\">\n+ </ul>Username:<input maxlength=\"10\" name=\"username\" required type=\"text\">\n? +++++\n\n  </li><li>\n  <ul class=\"errorlist\">\n  <li>\n  This field is required.\n  </li>\n  </ul>Password:<input name=\"password\" required type=\"password\">\n  </li>\n\n----------------------------------------------------------------------\nRan 1 test in 0.006s\n\nFAILED (failures=1)\nTesting against Django installed in '/testbed/django'\nSystem check identified no issues (0 silenced).\n\n[test outcome] failed (confidence: high; framework: unittest; tests_executed: 1; process_exit_code: 1)\n[test guidance] For Django, select the relevant public test label and use --parallel 1 for this sanity run. Avoid running the whole suite through tail, which can hide progress until completion.\n",
+    "excerpt_sha256": "486ef388be32d1442578d649b16f8c01329ac1ebe39b363f49c78279d9b14e97"
+  },
+  {
+    "source": "validation_data/three_penalty_more_cases/2.jsonl",
+    "line": 32,
+    "step": 2,
+    "task": "django__django-11433",
+    "score": 0,
+    "turn": 46,
+    "name": "Bash",
+    "arguments": {
+      "command": "cd /testbed && python tests/runtests.py tests.forms_tests.tests.test_forms --settings=test_sqlite --parallel 1 2>&1 | head -50"
+    },
+    "response": "\nexit_code: 0\n..............................................................................F..................................\n======================================================================\nFAIL: test_initial_data (tests.forms_tests.tests.test_forms.FormsTestCase)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/testbed/tests/forms_tests/tests/test_forms.py\", line 1748, in test_initial_data\n    Password: <input type=\"password\" name=\"password\" required></li>\"\"\"\n  File \"/testbed/django/test/testcases.py\", line 778, in assertHTMLEqual\n    self.fail(self._formatMessage(msg, standardMsg))\nAssertionError: <li>\nUsername:<input maxlength=\"10\" name=\"username\" required type=\"text\">\n</li>< [truncated]... != <li>\n<ul class=\"errorlist\">\n<li>\nThis field is required.\n</li>\n</ul>Username:<in [truncated]...\n  <li>\n+ <ul class=\"errorlist\">\n+ <li>\n+ This field is required.\n+ </li>\n- Username:<input maxlength=\"10\" name=\"username\" required type=\"text\">\n+ </ul>Username:<input maxlength=\"10\" name=\"username\" required type=\"text\">\n? +++++\n\n  </li><li>\n  <ul class=\"errorlist\">\n  <li>\n  This field is required.\n  </li>\n  </ul>Password:<input name=\"password\" required type=\"password\">\n  </li>\n\n----------------------------------------------------------------------\nRan 113 tests in 0.197s\n\nFAILED (failures=1)\nTesting against Django installed in '/testbed/django'\nSystem check identified no issues (0 silenced).\n\n[test outcome] failed (confidence: high; framework: unittest; tests_executed: 113; process_exit_code: 0)\n[test feedback] The shell exited 0, but parsed test evidence does not show success. A pipeline can mask the runner's status; run the runner directly or explicitly capture its status.\n[test guidance] For Django, select the relevant public test label and use --parallel 1 for this sanity run. Avoid running the whole suite through tail, which can hide progress until completion.\n",
+    "excerpt_sha256": "4b95233eca4b95909d295ee001f217ae1b5c23234fa40b12f183e8045bdb1b45"
+  },
+  {
+    "source": "validation_data/cross_thinking_detect_plus_aggressive_tool_and_python_tests_higher_decode_32_16/12.jsonl",
+    "line": 90,
+    "step": 12,
+    "task": "pytest-dev__pytest-7432",
+    "score": 1,
+    "turn": 5,
+    "name": "Bash",
+    "arguments": {
+      "command": "cd /testbed && python -m pytest -rs /tmp/test_skip_issue.py 2>&1"
+    },
+    "response": "\nexit_code: 0\n============================= test session starts ==============================\nplatform linux -- Python 3.9.20, pytest-5.4.1.dev593+ge6e300e72.d20260815, py-1.11.0, pluggy-0.13.1\nrootdir: /tmp\ncollected 2 items\n\n../tmp/test_skip_issue.py ss                                             [100%]\n\n=========================== short test summary info ============================\nSKIPPED [1] ../tmp/test_skip_issue.py:3: unconditional skip\nSKIPPED [1] ../tmp/test_skip_issue.py:7: explicit skip\n============================== 2 skipped in 0.00s ==============================\n\n[test outcome] not_run (confidence: high; framework: pytest; tests_executed: 0; process_exit_code: 0)\n[test feedback] No tests executed (or this only collected tests). This does not verify the repair.\n[test feedback] The shell exited 0, but parsed test evidence does not show success. A pipeline can mask the runner's status; run the runner directly or explicitly capture its status.\n",
+    "audit_label": "expected_skip_exploration",
+    "excerpt_sha256": "cefd3b771a8890fd9fb45b0458be670599f46a58d14a7e5e8ef1ca205a0be47d"
+  },
+  {
+    "source": "validation_data/cross_thinking_detect_plus_aggressive_tool_and_python_tests_higher_decode_32_16/12.jsonl",
+    "line": 90,
+    "step": 12,
+    "task": "pytest-dev__pytest-7432",
+    "score": 1,
+    "turn": 6,
+    "name": "Bash",
+    "arguments": {
+      "command": "cd /testbed && python -m pytest -rs --runxfail /tmp/test_skip_issue.py 2>&1"
+    },
+    "response": "\nexit_code: 0\n============================= test session starts ==============================\nplatform linux -- Python 3.9.20, pytest-5.4.1.dev593+ge6e300e72.d20260815, py-1.11.0, pluggy-0.13.1\nrootdir: /tmp\ncollected 2 items\n\n../tmp/test_skip_issue.py ss                                             [100%]\n\n=========================== short test summary info ============================\nSKIPPED [1] src/_pytest/skipping.py:239: unconditional skip\nSKIPPED [1] src/_pytest/skipping.py:239: explicit skip\n============================== 2 skipped in 0.00s ==============================\n\n[test outcome] not_run (confidence: high; framework: pytest; tests_executed: 0; process_exit_code: 0)\n[test feedback] No tests executed (or this only collected tests). This does not verify the repair.\n[test feedback] The shell exited 0, but parsed test evidence does not show success. A pipeline can mask the runner's status; run the runner directly or explicitly capture its status.\n",
+    "audit_label": "expected_skip_exploration",
+    "excerpt_sha256": "e972bcd7562ba3baf707c5e9f403af1e39e9d66975e770a18c502892d7ae683c"
+  },
+  {
+    "source": "validation_data/cross_thinking_detect_plus_aggressive_tool_and_python_tests_higher_decode_32_16/12.jsonl",
+    "line": 90,
+    "step": 12,
+    "task": "pytest-dev__pytest-7432",
+    "score": 1,
+    "turn": 13,
+    "name": "Bash",
+    "arguments": {
+      "command": "cd /testbed && python -m pytest --runxfail /tmp/test_skip_issue.py 2>&1 | tail -15"
+    },
+    "response": "\nexit_code: 0\n============================= test session starts ==============================\nplatform linux -- Python 3.9.20, pytest-5.4.1.dev593+ge6e300e72.d20260815, py-1.11.0, pluggy-0.13.1\nrootdir: /tmp\ncollected 2 items\n\n../tmp/test_skip_issue.py ss                                             [100%]\n\n============================== 2 skipped in 0.00s ==============================\n\n[test outcome] not_run (confidence: high; framework: pytest; tests_executed: 0; process_exit_code: 0)\n[test feedback] No tests executed (or this only collected tests). This does not verify the repair.\n[test feedback] The shell exited 0, but parsed test evidence does not show success. A pipeline can mask the runner's status; run the runner directly or explicitly capture its status.\n",
+    "audit_label": "expected_skip_exploration",
+    "excerpt_sha256": "7917a2629e4cd9f45d2034fc01151d752afcec1ed1ace13558d16fffee7eb3b5"
+  }
+]

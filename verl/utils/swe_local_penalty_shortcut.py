@@ -39,10 +39,12 @@ def verified_local_penalties(output, actor_config):
             if name == "tool_repeat" and not rules.intersection(event["proof"]["rules"]):
                 continue
             if name == "tool_repeat":
-                from recipe.swe_agent.edit_recovery import RULES as EDIT_RULES
+                from recipe.swe_agent.edit_recovery import PENALTY_RULES as EDIT_RULES
 
                 if rules.intersection(event["proof"]["rules"]).intersection((*EDIT_RULES, "edit_identical_calls")):
                     edit_cost = actor_config.get("tool_repeat_penalty_edit_cost", .01)
+                elif rules.intersection(event["proof"]["rules"]).intersection({"command_errors", "command_no_progress"}):
+                    edit_cost = actor_config.get("tool_repeat_penalty_command_cost", .01)
                 else:
                     edit_cost = actor_config.get("tool_repeat_penalty_cost", .02)
                 if not isinstance(edit_cost, (int, float)) or not math.isfinite(edit_cost) or edit_cost <= 0:

@@ -99,8 +99,8 @@ def validation_reward_metadata(extra: Any) -> dict[str, Any]:
         **{
             key: value
             for key, value in rollout_diagnostics(extra).items()
-            if key.startswith(("tool_repeat_", "thinking_repeat_"))
-            and key != "tool_repeat_recovery_audit_json"
+            if key.startswith(("tool_repeat_", "thinking_repeat_", "command_evidence_", "edit_diagnostics_"))
+            and key not in {"tool_repeat_recovery_audit_json", "command_evidence_audit_json", "edit_diagnostics_audit_json"}
         },
     }
 
