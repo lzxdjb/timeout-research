@@ -368,6 +368,10 @@ class ReplayBuffer:
         expected_rollout_n: int | None = None,
         expected_validation_rollout_n: int | None = None,
         validation_refill_fn=None,
+        cutoff_when_full: bool = False,
+        cutoff_cleanup_timeout_seconds: float = 300.0,
+        requeue_fn=None,
+        release_fn=None,
     ):
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
@@ -382,6 +386,18 @@ class ReplayBuffer:
         self.max_inflight_gen_batches = max_inflight_gen_batches
         self.sync_refill_failed_groups = sync_refill_failed_groups
         self.cancel_fn = cancel_fn
+        self.cutoff_when_full = cutoff_when_full
+        self.cutoff_cleanup_timeout_seconds = float(cutoff_cleanup_timeout_seconds)
+        self.requeue_fn = requeue_fn
+        self.release_fn = release_fn
+        if cutoff_when_full:
+            if trainer_mode != "sync" or filter_groups_metric is None:
+                raise ValueError("cutoff_when_full requires synchronous V1 DAPO group filtering")
+            if (not math.isfinite(self.cutoff_cleanup_timeout_seconds)
+                    or self.cutoff_cleanup_timeout_seconds <= 0):
+                raise ValueError("cutoff_cleanup_timeout_seconds must be positive and finite")
+        elif requeue_fn is not None:
+            raise ValueError("Prompt carry-over requires cutoff_when_full")
         self.completion_ratio_thresholds = {
             partition_id: completion_ratio_threshold(partition_id) for partition_id in COMPLETION_RATIO_ENV
         }
@@ -795,6 +811,8 @@ class ReplayBuffer:
                             self.generation_complete_keys[partition_id].add(key)
                             self.reward_pending_keys[partition_id].add(key)
                         case "reward_error":
+                            if "teacher_error" in tag:
+                                raise RuntimeError(f"Teacher scoring failed for {key}: {tag['teacher_error']}")
                             if partition_id == "val" and strict_validation_enabled():
                                 self.failure_keys[partition_id].add(key)
                             else:
@@ -846,6 +864,8 @@ class ReplayBuffer:
         for uid in uids:
             self.prompt_global_steps[partition_id].pop(uid, None)
             self._dapo_classification_cache[partition_id].pop(uid, None)
+        if partition_id == "train" and self.release_fn is not None:
+            self.release_fn(uids)
 
     @staticmethod
     def _infrastructure_flag(tag: dict) -> bool:
@@ -1183,6 +1203,8 @@ class ReplayBuffer:
         self, partition_id: str, selected_prompt_uids: list[str], partition_snapshot: dict[str, dict]
     ) -> KVBatchMeta:
         tq.kv_clear(partition_id=partition_id, keys=selected_prompt_uids)
+        if partition_id == "train" and self.release_fn is not None:
+            self.release_fn(selected_prompt_uids)
 
         keys, tags = [], []
         selected = set(selected_prompt_uids)
@@ -1325,6 +1347,44 @@ class ReplayBuffer:
             )
         return True, metrics
 
+    def _cutoff_full_dapo_batch(
+        self, partition_id: str, sampleable_keys: set[str], batch_size: int
+    ) -> tuple[list[str], dict[str, dict], dict]:
+        """Freeze selection before cancellation; clear old UIDs only after every worker settles."""
+        selected, _, _ = self._select_prompt_uids(partition_id, sampleable_keys, batch_size)
+        inflight = (self.pending_keys[partition_id] | self.running_keys[partition_id]) - set(selected)
+        surplus = sampleable_keys - set(selected)
+        started = time.monotonic()
+        cancelled = 0
+        if inflight:
+            if self.cancel_fn is None:
+                raise RuntimeError("DAPO cutoff requires an agent-loop cancellation callback")
+            cancelled = int(self.cancel_fn(
+                sorted(inflight), validate=False, dapo_cutoff=True,
+                cleanup_timeout_seconds=self.cutoff_cleanup_timeout_seconds,
+            ))
+        # Cancellation ACK is a publication barrier. Include any trajectory writes that
+        # raced the cutoff in cleanup, without changing the frozen training selection.
+        self._sync_metadata_from_transfer_queue()
+        unselected = inflight | surplus
+        requeued = int(self.requeue_fn(unselected)) if unselected and self.requeue_fn is not None else 0
+        self._clear_groups(partition_id, unselected)
+        seconds = time.monotonic() - started
+        prefix = f"{self._metrics_prefix(partition_id)}/filter_groups"
+        metrics = {
+            f"{prefix}/cutoff_selected_groups": len(selected),
+            f"{prefix}/cutoff_requested_groups": len(inflight),
+            f"{prefix}/cutoff_cancelled_groups": cancelled,
+            f"{prefix}/cutoff_cleanup_seconds": seconds,
+            f"{prefix}/requeued_groups": requeued,
+            f"{prefix}/discarded_surplus_samples": 0 if self.requeue_fn is not None else len(surplus),
+        }
+        logger.info(
+            "DAPO full-batch cutoff selected=%d requested=%d cancelled=%d surplus=%d requeued=%d cleanup_seconds=%.3f",
+            len(selected), len(inflight), cancelled, len(surplus), requeued, seconds,
+        )
+        return selected, dict(self.partitions[partition_id]), metrics
+
     @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
     def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:
         """Sample a batch using synchronous rollout semantics.
@@ -1420,6 +1480,12 @@ class ReplayBuffer:
 
             if dapo_enabled:
                 if has_enough_samples:
+                    if self.cutoff_when_full:
+                        selected_prompt_uids, partition_snapshot, cutoff_metrics = self._cutoff_full_dapo_batch(
+                            partition_id, sampleable_keys, batch_size
+                        )
+                        eviction_metrics.update(cutoff_metrics)
+                        break
                     # Stop speculative dispatch, then drain requests already running under this policy version.
                     draining = True
                     refill_credit = 0

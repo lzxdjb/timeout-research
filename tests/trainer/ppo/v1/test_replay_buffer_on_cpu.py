@@ -119,6 +119,7 @@ def test_strict_validation_retry_and_cutoff_against_real_queue(tq_init, monkeypa
             validation_refill_fn=refill,
             cancel_fn=cancel,
             filter_groups_metric="score" if dapo_enabled else None,
+            cutoff_when_full=dapo_enabled,
             refill_fn=(lambda _n: pytest.fail("Validation must not refill training prompts")) if dapo_enabled else None,
         )
         rb.trainer_config = {"validation_data_dir": str(tmp_path)}
@@ -166,6 +167,7 @@ def _make_rb(
     expected_rollout_n: int | None = None,
     expected_validation_rollout_n: int | None = None,
     validation_refill_fn=None,
+    **cutoff_kwargs,
 ) -> ReplayBuffer:
     """Construct a ReplayBuffer with defaults that keep generic samples on-policy."""
     replay_buffer_cls = ReplayBuffer if trainer_mode == "sync" else ReplayBufferAsync
@@ -186,6 +188,7 @@ def _make_rb(
         expected_rollout_n=expected_rollout_n,
         expected_validation_rollout_n=expected_validation_rollout_n,
         validation_refill_fn=validation_refill_fn,
+        **cutoff_kwargs,
     )
 
 
@@ -1544,6 +1547,7 @@ def test_dapo_combines_failure_and_zero_advantage_filters(tq_init, monkeypatch, 
     boundary = PromptSpec(
         uid=_uid(), status="finished", sessions=8, rewards=[0.0, 1.0] * 4,
         infrastructure_failures=[1, 1] + [0] * 6,
+        global_steps=-1,  # Prioritize the boundary group over equally ranked speculative refills.
     )
     refiller = FakeRefiller("train", global_steps=0, sessions=8, rewards=[0.0, 1.0] * 4)
     rb = _make_rb(filter_groups_metric="acc", refill_fn=refiller, expected_rollout_n=8, train_batch_size=4)
@@ -1614,6 +1618,130 @@ def test_dapo_bounds_combined_refills_and_does_not_refill_failures_while_drainin
             _set_prompt_status("train", slow.uid, "finished", global_steps=0)
             consumer.join(timeout=2)
         _clear_partition("train")
+
+
+@pytest.mark.parametrize("requeue", [False, True])
+def test_dapo_full_batch_freezes_selection_and_cancels_all_unselected(tq_init, monkeypatch, tmp_path, requeue):
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", ".25")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_UNVERIFIED_TRAJECTORY_RATIO_THRESHOLD", ".25")
+    valid = [PromptSpec(uid=_uid(), status="finished", sessions=8, rewards=[0., 1.] * 4) for _ in range(3)]
+    uniform = PromptSpec(uid=_uid(), status="finished", sessions=8, rewards=[-.1] * 8)
+    bad_infra = PromptSpec(uid=_uid(), status="finished", sessions=8, rewards=[0., 1.] * 4,
+                          infrastructure_failures=[1] * 3 + [0] * 5)
+    bad_unverified = PromptSpec(uid=_uid(), status="finished", sessions=8, rewards=[0., 1.] * 4,
+                               unverified=[True] * 3 + [False] * 5)
+    pending = [PromptSpec(uid=_uid(), status=status, sessions=8, rewards=[0., 1.] * 4)
+               for status in ("pending", "running", "reward_pending")]
+    queued, released, cancellations = [], [], []
+
+    def cancel(uids, validate, **kwargs):
+        assert not validate and kwargs == {"dapo_cutoff": True, "cleanup_timeout_seconds": 300.0}
+        assert set(uids) == {spec.uid for spec in pending}
+        cancellations.append(set(uids))
+        # Simulate terminal publication racing the cutoff ACK. It cannot change selection.
+        for uid in uids:
+            tq.kv_put(key=f"{uid}_0_1", partition_id="train", fields={"input_ids": torch.tensor([1])},
+                      tag={"acc": 1.})
+            _set_prompt_status("train", uid, "finished", global_steps=0)
+        return len(uids)
+
+    def requeue_prompts(uids):
+        queued.extend(uids)
+        return len(uids)
+
+    rb = _make_rb(filter_groups_metric="acc", refill_fn=lambda n: pytest.fail("Batch is already full"),
+                  expected_rollout_n=8, train_batch_size=2, cutoff_when_full=True, cancel_fn=cancel,
+                  requeue_fn=requeue_prompts if requeue else None, release_fn=lambda uids: released.extend(uids))
+    rb.trainer_config = {"rollout_data_dir": str(tmp_path)}
+    try:
+        _produce("train", [*valid, uniform, bad_infra, bad_unverified, *pending]).join_and_check()
+        batch, metrics = rb.sample(0, "train", 2)
+        selected = _uids_of(batch.keys)
+        assert len(selected) == 2 and selected <= {spec.uid for spec in valid}
+        unselected = ({spec.uid for spec in valid + pending} - selected)
+        assert len(cancellations) == 1
+        assert set(queued) == (unselected if requeue else set())
+        assert len(queued) == len(set(queued))
+        assert set(released) == {spec.uid for spec in [*valid, uniform, bad_infra, bad_unverified, *pending]}
+        assert not (set((tq.kv_list("train") or {}).get("train", {})) & unselected)
+        assert not any(key.startswith(f"{spec.uid}_") for key in (tq.kv_list("train") or {}).get("train", {})
+                       for spec in pending)
+        assert metrics["training/filter_groups/cutoff_requested_groups"] == 3
+        assert metrics["training/filter_groups/requeued_groups"] == (4 if requeue else 0)
+    finally:
+        _clear_partition("train")
+
+
+def test_dapo_cutoff_cleanup_failure_does_not_materialize_or_requeue(tq_init):
+    valid = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0., 1.])
+    pending = PromptSpec(uid=_uid(), status="running", sessions=2, rewards=[0., 1.])
+
+    def cancel(*args, **kwargs):
+        raise RuntimeError("cleanup deadline")
+
+    rb = _make_rb(filter_groups_metric="acc", refill_fn=lambda n: None, cutoff_when_full=True,
+                  cancel_fn=cancel, requeue_fn=lambda uids: pytest.fail("Cleanup failed"))
+    try:
+        _produce("train", [valid, pending]).join_and_check()
+        with pytest.raises(RuntimeError, match="cleanup deadline"):
+            rb.sample(0, "train", 1)
+        assert valid.uid in tq.kv_list("train")["train"]
+    finally:
+        _clear_partition("train")
+
+
+@pytest.mark.parametrize("finalizer_started", [False, True])
+def test_dapo_cancels_real_ray_judge_and_waits_for_remote_cleanup(tq_init, finalizer_started):
+    import asyncio
+
+    import ray
+
+    from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ
+
+    @ray.remote(num_cpus=0)
+    class Judge:
+        def __init__(self):
+            self.started = False
+            self.cleaned = False
+
+        async def submit(self):
+            self.started = True
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(.05)
+                self.cleaned = True
+
+        async def state(self):
+            return self.started, self.cleaned
+
+    judge = Judge.remote()
+    ref = judge.submit.remote()
+    deadline = time.monotonic() + 10
+    try:
+        while not ray.get(judge.state.remote())[0]:
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        cls = AgentLoopWorkerTQ.__ray_metadata__.modified_class
+        worker = object.__new__(cls)
+        worker.repeat_job_refs = {("train", "u"): [ref]}
+        worker.repeat_finalizers = {}
+
+        async def cancel():
+            async def finalize():
+                await ref
+
+            finalizer = asyncio.create_task(finalize())
+            worker.repeat_finalizers[("train", "u")] = [finalizer]
+            if finalizer_started:
+                await asyncio.sleep(.01)
+            await asyncio.wait_for(worker._cancel_dapo_repeat("train", "u"), timeout=10)
+            assert finalizer.done()
+
+        asyncio.run(cancel())
+        assert ray.get(judge.state.remote()) == (True, True)
+    finally:
+        ray.kill(judge)
 
 
 def test_terminal_eviction_reasons_has_no_cross_call_hidden_state(tq_init, partition_id):

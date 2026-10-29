@@ -20,6 +20,7 @@ from tensordict import TensorDict
 
 from verl.base_config import BaseConfig
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.utils import tensordict_utils as tu
 from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
 from verl.workers.utils.losses import ppo_loss
@@ -106,6 +107,45 @@ def get_distillation_loss_settings(loss_name: str) -> DistillationLossSettings:
     return DISTILLATION_SETTINGS_REGISTRY[loss_name]
 
 
+def _distillation_response_mask(data: TensorDict) -> torch.Tensor:
+    """Return the padded assistant-token mask for rows accepted for training.
+
+    ``response_mask`` also serves rollout diagnostics, so infrastructure filtering
+    deliberately leaves it unchanged. Distillation must apply the same optional
+    sequence-level filter as PPO without modifying the original data.
+    """
+    response_mask = data["response_mask"]
+    if response_mask.is_nested:
+        response_mask = response_mask.to_padded_tensor(False)
+    response_mask = response_mask.bool()
+    train_sample_mask = data.get("train_sample_mask")
+    if train_sample_mask is not None:
+        if train_sample_mask.ndim != 1 or train_sample_mask.shape[0] != response_mask.shape[0]:
+            raise ValueError("train_sample_mask must have shape [batch_size] for distillation")
+        row_mask = train_sample_mask.to(device=response_mask.device, dtype=torch.bool).unsqueeze(-1)
+        response_mask = response_mask & row_mask
+    return response_mask
+
+
+def _opd_tool_failure_weights(config: ActorConfig, loss_config: DistillationLossConfig, data: TensorDict):
+    """Reuse V1's verified local costs only when task PPO is absent.
+
+    Mixed distillation already adds this cost through ``ppo_loss``. Keep that
+    existing path unchanged, including its task-advantage credit gating.
+    """
+    if loss_config.use_task_rewards or not getattr(config, "tool_failure_penalty_enabled", False):
+        return None
+    if not loss_config.use_policy_gradient:
+        raise ValueError("Tool-failure penalty in pure OPD requires use_policy_gradient=True")
+    if config.policy_loss.get("loss_mode", "vanilla") != "vanilla":
+        raise ValueError("Tool-failure penalty currently supports vanilla PPO only")
+    active_global_count = tu.get_non_tensor_data(data, "tool_failure_active_global_count", default=None)
+    if active_global_count is None or "tool_failure_weights" not in data:
+        raise ValueError("Enabled tool-failure penalty requires V1 minibatch cost fields")
+    weights = data["tool_failure_weights"]
+    return weights.to_padded_tensor(0.0) if weights.is_nested else weights
+
+
 def compute_distillation_loss_range(
     distillation_losses: torch.Tensor, response_mask: torch.Tensor
 ) -> dict[str, Metric]:
@@ -114,6 +154,12 @@ def compute_distillation_loss_range(
         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
     else:
         distillation_losses_response = distillation_losses[response_mask.bool()]
+    if distillation_losses_response.numel() == 0:
+        # Keep metric counts aligned across DP ranks for filtered microbatches.
+        return {
+            "distillation/loss_min": Metric(AggregationType.MIN, 0.0),
+            "distillation/loss_max": Metric(AggregationType.MAX, 0.0),
+        }
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
@@ -207,14 +253,35 @@ def distillation_ppo_loss(
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
-    if not distillation_loss_config.use_task_rewards and not distillation_loss_config.use_policy_gradient:
-        # no need to compute policy loss
+    if not distillation_loss_config.use_task_rewards:
+        # PG distillation supplies the policy objective. The optional local cost
+        # stays separate from task rewards and uses the existing V1 normalizer.
         policy_loss = 0.0
         policy_metrics = {}
+        tool_failure_weights = _opd_tool_failure_weights(config, distillation_loss_config, data)
+        if tool_failure_weights is not None:
+            from verl.utils.swe_tool_failure import local_ppo_loss
+
+            log_prob = no_padding_2_padding(model_output["log_probs"], data)
+            old_log_prob = data["old_log_probs"]
+            if old_log_prob.is_nested:
+                old_log_prob = old_log_prob.to_padded_tensor(0.0)
+            rollout_is_weights = data.get("rollout_is_weights")
+            if rollout_is_weights is not None and rollout_is_weights.is_nested:
+                rollout_is_weights = rollout_is_weights.to_padded_tensor(0.0)
+            policy_loss = local_ppo_loss(
+                log_prob,
+                old_log_prob,
+                tool_failure_weights,
+                _distillation_response_mask(data),
+                config,
+                active_global_count=tu.get_non_tensor_data(data, "tool_failure_active_global_count", default=None),
+                dp_size=data["dp_size"],
+                rollout_is_weights=rollout_is_weights,
+            )
+            policy_metrics["actor/tool_failure_loss"] = Metric(value=policy_loss, aggregation=AggregationType.SUM)
     else:
         policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
-        if not distillation_loss_config.use_task_rewards:
-            policy_loss = 0.0
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
@@ -242,6 +309,7 @@ def distillation_loss(
     """
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    tool_failure_weights = _opd_tool_failure_weights(config, loss_config, data)
     distillation_loss_fn = get_distillation_loss_fn(loss_config.loss_mode)
     distillation_losses, distillation_metrics = distillation_loss_fn(
         config=config,
@@ -249,7 +317,7 @@ def distillation_loss(
         model_output=model_output,
         data=data,
     )
-    response_mask = data["response_mask"]
+    response_mask = _distillation_response_mask(data)
     loss_agg_mode = config.loss_agg_mode
 
     distillation_metrics.update(
@@ -258,6 +326,15 @@ def distillation_loss(
     if loss_config.loss_max_clamp is not None:
         # clamping min is for k1 loss which can be negative
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
+
+    if not response_mask.any():
+        # Preserve the autograd graph while avoiding zero local denominators and
+        # min/max reductions on empty tensors. Other microbatches/ranks may train.
+        if loss_config.use_policy_gradient:
+            distillation_metrics.update(
+                {f"distillation/{key}": 0.0 for key in ("pg_clipfrac", "ppo_kl", "pg_clipfrac_lower")}
+            )
+        return distillation_losses.masked_select(response_mask).sum(), distillation_metrics
 
     # global batch info for loss aggregation
     config.global_batch_info["dp_size"] = data["dp_size"]
@@ -274,13 +351,18 @@ def distillation_loss(
         old_log_prob = data["old_log_probs"]
         if old_log_prob.is_nested:
             old_log_prob = data["old_log_probs"].to_padded_tensor(0.0)
-        if response_mask.is_nested:
-            response_mask = response_mask.to_padded_tensor(False)
         rollout_is_weights = data.get("rollout_is_weights", None)
+        if rollout_is_weights is not None and rollout_is_weights.is_nested:
+            rollout_is_weights = rollout_is_weights.to_padded_tensor(0.0)
+        advantages = -distillation_losses.detach()
+        if tool_failure_weights is not None:
+            from verl.utils.swe_tool_failure import gate_positive_credit
+
+            advantages = gate_positive_credit(advantages, tool_failure_weights)
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
-            advantages=-distillation_losses.detach(),
+            advantages=advantages,
             response_mask=response_mask,
             loss_agg_mode=loss_agg_mode,
             config=loss_config,
@@ -290,8 +372,6 @@ def distillation_loss(
         distillation_metrics.update(pg_metrics)
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
-        if response_mask.is_nested:
-            response_mask = response_mask.to_padded_tensor(False)
         distillation_loss = agg_loss(
             loss_mat=distillation_losses,
             loss_mask=response_mask,
@@ -324,11 +404,21 @@ def compute_forward_kl_topk(
     if overlap_count is not None and overlap_token_advantage is not None:
         overlap_count = no_padding_2_padding(overlap_count, data)
         overlap_token_advantage = no_padding_2_padding(overlap_token_advantage, data)
-    if data["response_mask"].is_nested:
-        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
-    else:
-        response_mask_bool = data["response_mask"].bool()
+    response_mask_bool = _distillation_response_mask(data)
     assert distillation_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
+
+    if not response_mask_bool.any():
+        metrics = {
+            "distillation/student_mass": 0.0,
+            "distillation/student_mass_min": Metric(AggregationType.MIN, 0.0),
+            "distillation/student_mass_max": Metric(AggregationType.MAX, 0.0),
+            "distillation/teacher_mass": 0.0,
+            "distillation/teacher_mass_min": Metric(AggregationType.MIN, 0.0),
+            "distillation/teacher_mass_max": Metric(AggregationType.MAX, 0.0),
+        }
+        if overlap_count is not None and overlap_token_advantage is not None:
+            metrics.update({"distillation/overlap_ratio": 0.0, "distillation/overlap_token_advantage": 0.0})
+        return distillation_losses.clamp_min(0.0), metrics
 
     overlap_metrics = {}
     if overlap_count is not None and overlap_token_advantage is not None:
@@ -388,10 +478,7 @@ def compute_distillation_loss_reverse_kl_estimator(
     """
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
     teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
-    if data["response_mask"].is_nested:
-        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
-    else:
-        response_mask_bool = data["response_mask"].bool()
+    response_mask_bool = _distillation_response_mask(data)
     assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
 
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
@@ -399,7 +486,6 @@ def compute_distillation_loss_reverse_kl_estimator(
         logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty=loss_config.loss_mode
     )
     # Since k1 can be negative, log the mean absolute loss.
-    metrics = {
-        "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
-    }
+    mean_abs_loss = distillation_losses[response_mask_bool].abs().mean() if response_mask_bool.any() else 0.0
+    metrics = {"distillation/abs_loss": Metric(AggregationType.MEAN, mean_abs_loss)}
     return distillation_losses, metrics

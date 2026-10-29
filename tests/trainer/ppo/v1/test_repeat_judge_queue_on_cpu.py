@@ -245,6 +245,10 @@ def worker_harness(monkeypatch, n=1):
     worker = object.__new__(cls)
     worker.repeat_coordinator = None
     worker.repeat_finalizers = {}
+    worker.repeat_job_refs = {}
+    worker.dapo_cutoff_uids = set()
+    worker.dapo_cutoff_enabled = False
+    worker.dapo_publications = {}
     worker.repeat_generation_sessions = {}
     worker.repeat_debug = module._repeat_debug_enabled()
     worker.repeat_debug_slow_seconds = module._repeat_debug_slow_seconds()
@@ -352,6 +356,121 @@ def test_cutoff_cancels_unfinished_generation_but_drains_retained_judgment(monke
         assert store["train"]["u"]["completion_ratio_cutoff"]
         assert publications[0][1]["rm_scores"].sum().item() == pytest.approx(.1)
         assert all(t.done() for t in worker.repeat_finalizers.get(("train", "u"), []))
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_dapo_cutoff_cancels_generation_and_deferred_rewards_without_late_writes(monkeypatch, n):
+    async def run():
+        worker, store, publications = worker_harness(monkeypatch, n=n)
+        worker.dapo_cutoff_enabled = True
+        judging, judge_cancelled, generation_cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        release_generation = asyncio.Event()
+
+        async def submit(job_id, job):
+            judging.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                judge_cancelled.set()
+
+        worker.repeat_coordinator = SimpleNamespace(submit=RemoteMethod(submit))
+
+        async def session(params, *, session_id, **kwargs):
+            if session_id == 0:
+                await worker._agent_loop_postprocess(fake_output(repeat.RepeatConfig(deferred_enabled=True)), False,
+                                                    uid="u", session_id=0, global_steps=0)
+            else:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    await release_generation.wait()
+                    generation_cleanup.set()
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "u"}, {}, {"validate": False}))
+        worker.prompt_tasks["train"]["u"] = prompt
+        await asyncio.wait_for(judging.wait(), timeout=2)
+        if n == 1:
+            assert store["train"]["u"]["generation_complete"]
+        cutoff = asyncio.create_task(worker.cancel_sequences(["u"], dapo_cutoff=True))
+        await asyncio.sleep(.01)
+        if n == 2:
+            assert not cutoff.done()
+            release_generation.set()
+        assert await asyncio.wait_for(cutoff, timeout=2) == 1
+        assert judge_cancelled.is_set()
+        assert n == 1 or generation_cleanup.is_set()
+        assert store["train"]["u"]["dapo_cutoff"]
+        assert not store["train"]["u"].get("completion_ratio_cutoff")
+        await asyncio.sleep(.01)
+        assert not publications and not worker.repeat_finalizers and not worker.repeat_job_refs
+        assert not worker.dapo_cutoff_uids
+
+    asyncio.run(run())
+
+
+def test_dapo_cutoff_cancels_judge_even_if_finalizer_has_not_started(monkeypatch):
+    async def run():
+        worker, _, publications = worker_harness(monkeypatch)
+        cancelled = asyncio.Event()
+
+        async def submit():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        ref = asyncio.create_task(submit())
+        await asyncio.sleep(0)
+        finalizer = asyncio.create_task(worker._finalize_repeat(ref, "job", None, False, {"uid": "u"}))
+        worker.repeat_job_refs[("train", "u")] = [ref]
+        worker.repeat_finalizers[("train", "u")] = [finalizer]
+        await worker._cancel_dapo_repeat("train", "u")
+        assert cancelled.is_set() and finalizer.cancelled() and not publications
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_dapo_cutoff_waits_for_publication_already_sent_to_transfer_queue(monkeypatch, deferred):
+    from verl.trainer.ppo.v1 import agent_loop_tq as module
+
+    async def run():
+        worker, store, publications = worker_harness(monkeypatch)
+        worker.dapo_cutoff_enabled = True
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_put = module.tq.async_kv_batch_put
+
+        async def slow_put(**kwargs):
+            entered.set()
+            await release.wait()
+            return await original_put(**kwargs)
+
+        monkeypatch.setattr(module.tq, "async_kv_batch_put", slow_put)
+        if deferred:
+            async def submit(job_id, job):
+                return job_id, .1, {"repeat_reward_pending": 0}
+            worker.repeat_coordinator = SimpleNamespace(submit=RemoteMethod(submit))
+
+        async def session(*args, **kwargs):
+            output = fake_output(repeat.RepeatConfig(deferred_enabled=True))
+            if not deferred:
+                output.extra_fields.pop("_swe_repeat_job")
+            await worker._agent_loop_postprocess(output, False, uid="u", session_id=0, global_steps=0)
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "u"}, {}, {"validate": False}))
+        worker.prompt_tasks["train"]["u"] = prompt
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        cutoff = asyncio.create_task(worker.cancel_sequences(["u"], dapo_cutoff=True))
+        await asyncio.sleep(.01)
+        assert not cutoff.done() and not publications
+        release.set()
+        assert await asyncio.wait_for(cutoff, timeout=2) == 1
+        assert len(publications) == 1 and store["train"]["u"]["dapo_cutoff"]
+        assert not worker.dapo_publications
+
     asyncio.run(run())
 
 
@@ -679,3 +798,29 @@ def test_manager_cancellation_heartbeat_does_not_block_on_snapshot(monkeypatch, 
     assert manager.cancel_sequences(["u"]) == 1
     assert "cancellation/drain progress" in caplog.text
     assert "cancellation/drain end" in caplog.text
+
+
+def test_dapo_manager_times_out_without_acknowledgement(monkeypatch):
+    from verl.trainer.ppo.v1 import agent_loop_tq as module
+
+    manager = object.__new__(module.AgentLoopManagerTQ)
+    forwarded = []
+
+    def remote(*args, **kwargs):
+        forwarded.append(kwargs)
+        return "worker"
+
+    manager.agent_loop_workers = [SimpleNamespace(cancel_sequences=SimpleNamespace(remote=remote))]
+    manager.repeat_coordinator = None
+    tick = [0.]
+
+    def wait(refs, **kwargs):
+        tick[0] += 1
+        return [], refs
+
+    monkeypatch.setattr(module.ray, "wait", wait)
+    monkeypatch.setattr(module.ray, "get", lambda refs: [])
+    monkeypatch.setattr(module.time, "monotonic", lambda: tick[0])
+    with pytest.raises(RuntimeError, match="DAPO cancellation.*cleanup deadline"):
+        manager.cancel_sequences(["u"], dapo_cutoff=True, cleanup_timeout_seconds=2.)
+    assert forwarded == [{"validate": False, "dapo_cutoff": True}]

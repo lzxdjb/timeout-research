@@ -40,6 +40,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
+from verl.trainer.distillation.config_utils import is_pure_distillation, requires_teacher_resource_pool
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -1646,7 +1647,11 @@ class RayPPOTrainer:
         if self.use_teacher_policy:
             from verl.experimental.teacher_loop import MultiTeacherModelManager
 
-            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            teacher_resource_pool = (
+                self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+                if requires_teacher_resource_pool(self.config.distillation)
+                else None
+            )
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
@@ -2456,8 +2461,11 @@ class RayPPOTrainer:
                         task_filter_metrics = apply_training_task_filter(
                             batch,
                             per_sample_infrastructure_filter=(
-                                self.config.algorithm.adv_estimator == AdvantageEstimator.GAE
-                                and int(self.config.actor_rollout_ref.rollout.n) == 1
+                                is_pure_distillation(self.config.get("distillation"))
+                                or (
+                                    self.config.algorithm.adv_estimator == AdvantageEstimator.GAE
+                                    and int(self.config.actor_rollout_ref.rollout.n) == 1
+                                )
                             ),
                         )
                         if self.timeout_prediction_enabled:

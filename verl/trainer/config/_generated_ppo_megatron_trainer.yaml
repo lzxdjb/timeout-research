@@ -969,6 +969,9 @@ algorithm:
     metric: null
     max_num_gen_batches: 0
     max_inflight_gen_batches: 1
+    cutoff_when_full: false
+    requeue_unselected_prompts: false
+    cutoff_cleanup_timeout_seconds: 300.0
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:

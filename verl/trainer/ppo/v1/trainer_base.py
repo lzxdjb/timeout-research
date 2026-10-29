@@ -50,6 +50,7 @@ from verl.single_controller.ray import (
     create_colocated_worker_cls,
 )
 from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation.config_utils import is_pure_distillation, requires_teacher_resource_pool
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.audio_benchmark import run_audio_benchmarks
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -86,6 +87,7 @@ from verl.trainer.ppo.utils import (
     need_reference_policy,
     need_teacher_policy,
 )
+from verl.trainer.ppo.v1.dapo_prompt_queue import DAPOPromptQueue
 from verl.trainer.ppo.v1.replay_buffer import (
     DAPO_FILTERED_REWARD_COUNTS_KEY,
     ReplayBuffer,
@@ -391,6 +393,22 @@ class PPOTrainer(ABC):
         has_custom_sampler = bool(
             custom_sampler is not None and custom_sampler.get("path") and custom_sampler.get("name")
         )
+        filter_groups = self.config.algorithm.get("filter_groups", None) or {}
+        cutoff_when_full = bool(filter_groups.get("cutoff_when_full", False))
+        requeue_prompts = bool(filter_groups.get("requeue_unselected_prompts", False))
+        self._dapo_prompt_queue = None
+        if requeue_prompts and not cutoff_when_full:
+            raise ValueError("requeue_unselected_prompts requires algorithm.filter_groups.cutoff_when_full=True")
+        if cutoff_when_full:
+            if has_custom_sampler or self.trainer_mode != "sync" or not filter_groups.get("enable", False):
+                raise ValueError("cutoff_when_full requires the built-in synchronous V1 DAPO sampler")
+            sync_steps = self.config.trainer.v1.get("sync", {}).get("parameter_sync_step", 1)
+            if sync_steps != 1:
+                raise ValueError("cutoff_when_full requires trainer.v1.sync.parameter_sync_step=1")
+            if golden_replay_enabled():
+                raise ValueError("cutoff_when_full cannot be combined with golden replay")
+            if requeue_prompts:
+                self._dapo_prompt_queue = DAPOPromptQueue()
         if golden_replay_enabled() and has_custom_sampler:
             raise ValueError("Golden replay is supported only with the built-in V1 ReplayBuffer")
         if has_custom_sampler:
@@ -422,7 +440,6 @@ class PPOTrainer(ABC):
                 validation_refill_fn=self._refill_validation_groups,
             )
             if sampler_cls is ReplayBuffer:
-                filter_groups = self.config.algorithm.get("filter_groups", None)
                 max_inflight_gen_batches = 1
                 if filter_groups_metric is not None:
                     max_inflight_gen_batches = filter_groups.get("max_inflight_gen_batches", 1)
@@ -455,6 +472,10 @@ class PPOTrainer(ABC):
                     )
                     else (self.config.data.get("gen_batch_size", None) or train_batch_size),
                     max_inflight_gen_batches=max_inflight_gen_batches,
+                    cutoff_when_full=cutoff_when_full,
+                    cutoff_cleanup_timeout_seconds=filter_groups.get("cutoff_cleanup_timeout_seconds", 300.0),
+                    requeue_fn=self._dapo_prompt_queue.requeue if self._dapo_prompt_queue is not None else None,
+                    release_fn=self._dapo_prompt_queue.release if self._dapo_prompt_queue is not None else None,
                 )
         return sampler_cls(**replay_buffer_kwargs)
 
@@ -608,7 +629,11 @@ class PPOTrainer(ABC):
 
         # 8. initialize teacher loop manager
         if self.use_teacher_policy:
-            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            teacher_resource_pool = (
+                self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+                if requires_teacher_resource_pool(self.config.distillation)
+                else None
+            )
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
@@ -1123,7 +1148,7 @@ class PPOTrainer(ABC):
             self.mapping[Role.RewardModel] = "global_pool"
 
         distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
+        if requires_teacher_resource_pool(distillation_config):
             if distillation_config.n_gpus_per_node <= 0:
                 raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
             if distillation_config.nnodes <= 0:
@@ -1185,6 +1210,11 @@ class PPOTrainer(ABC):
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+        prompt_queue = getattr(self, "_dapo_prompt_queue", None)
+        if prompt_queue is not None:
+            prompt_queue.load(os.path.join(global_step_folder, "dapo_pending_prompts.pt"))
+            logger.info("Restored DAPO pending prompt queue: prompts=%d", len(prompt_queue))
 
         # 5. restore TransferQueue state (async modes). Re-issuing the restored in-flight prompts is
         # deferred to fit() to use the agent_loop_manager.
@@ -1285,6 +1315,10 @@ class PPOTrainer(ABC):
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+
+        prompt_queue = getattr(self, "_dapo_prompt_queue", None)
+        if prompt_queue is not None:
+            prompt_queue.save(os.path.join(local_global_step_folder, "dapo_pending_prompts.pt"))
 
         # save TransferQueue state for async modes so in-flight prompts (already fetched from the
         # dataloader but not yet trained into this checkpoint's weights) survive a restart:
@@ -2082,13 +2116,29 @@ class PPOTrainer(ABC):
                 f"({gen_batch_size}); it is submitted in whole gen_batch_size dataloader fetches."
             )
 
-        chunks = [self._fetch_one_gen_batch() for _ in range(num_prompts // gen_batch_size)]
+        prompt_queue = getattr(self, "_dapo_prompt_queue", None)
+        chunks = []
+        if prompt_queue is not None:
+            # DAPO uses single-prompt dataloader fetches, allowing exact FIFO reuse.
+            if gen_batch_size != 1:
+                raise ValueError("DAPO prompt carry-over requires data.gen_batch_size=1")
+            chunks = prompt_queue.take(num_prompts)
+            logger.info("DAPO prompt carry-over reused=%d pending=%d step=%d",
+                        len(chunks), len(prompt_queue), self.global_steps)
+        remaining = num_prompts - len(chunks)
+        chunks.extend(self._fetch_one_gen_batch() for _ in range(remaining // gen_batch_size))
+        if prompt_queue is not None:
+            for chunk in chunks:
+                tu.assign_non_tensor_data(chunk, "global_steps", self.global_steps)
         batch = chunks[0] if len(chunks) == 1 else tu.concat_tensordict(chunks)
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
         return batch
 
     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
         """Register prompts in TransferQueue and dispatch them for generation."""
+        prompt_queue = getattr(self, "_dapo_prompt_queue", None)
+        if prompt_queue is not None:
+            prompt_queue.register(batch)
         started = time.monotonic()
         if _repeat_debug_enabled():
             logger.info("Repeat trainer rollout_submit_start partition=train global_step=%s prompts=%d",
@@ -2565,9 +2615,10 @@ class PPOTrainer(ABC):
             failure_values[~evaluator_mask.detach().cpu().numpy().astype(bool)] = 0
         data.non_tensor_batch["infrastructure_failure"] = failure_values
         data.non_tensor_batch["infrastructure_failure_code"] = code_values
-        per_sample = self.config.algorithm.adv_estimator == AdvantageEstimator.GAE and int(
-            self.config.actor_rollout_ref.rollout.n
-        ) == 1
+        per_sample = is_pure_distillation(self.config.get("distillation")) or (
+            self.config.algorithm.adv_estimator == AdvantageEstimator.GAE
+            and int(self.config.actor_rollout_ref.rollout.n) == 1
+        )
         timeout_mask = data.batch.get("train_sample_mask")
         task_filter_metrics = apply_training_task_filter(data, per_sample_infrastructure_filter=per_sample)
         if timeout_mask is not None:

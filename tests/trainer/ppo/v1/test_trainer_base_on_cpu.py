@@ -463,6 +463,36 @@ def test_builtin_filter_groups_forwards_configured_inflight_limit():
     assert sampler.max_inflight_gen_batches == 3
 
 
+def test_dapo_cutoff_configuration_is_opt_in_and_forwards_queue_callbacks():
+    default = _trainer_with_filter_groups({"enable": True, "metric": "score"})
+    sampler = default._build_replay_buffer()
+    assert not sampler.cutoff_when_full and sampler.requeue_fn is None
+    trainer = _trainer_with_filter_groups({
+        "enable": True, "metric": "score", "cutoff_when_full": True,
+        "requeue_unselected_prompts": True, "cutoff_cleanup_timeout_seconds": 12.,
+    })
+    sampler = trainer._build_replay_buffer()
+    assert sampler.cutoff_when_full and sampler.cutoff_cleanup_timeout_seconds == 12.
+    assert sampler.requeue_fn == trainer._dapo_prompt_queue.requeue
+    assert sampler.release_fn == trainer._dapo_prompt_queue.release
+
+
+@pytest.mark.parametrize("mode,enabled,cutoff,requeue,sync_steps", [
+    ("sync", True, False, True, 1),
+    ("sync", False, True, False, 1),
+    ("colocate_async", True, True, False, 1),
+    ("sync", True, True, False, 2),
+])
+def test_dapo_cutoff_rejects_unsupported_configurations(mode, enabled, cutoff, requeue, sync_steps):
+    trainer = _trainer_with_filter_groups({
+        "enable": enabled, "metric": "score", "cutoff_when_full": cutoff,
+        "requeue_unselected_prompts": requeue,
+    }, trainer_mode=mode)
+    trainer.config.trainer.v1[mode].parameter_sync_step = sync_steps
+    with pytest.raises(ValueError):
+        trainer._build_replay_buffer()
+
+
 def test_builtin_sync_failure_refill_forces_single_prompt_generation():
     trainer = _trainer_with_filter_groups({"enable": False})
     trainer.config.trainer.v1.sampler.sync_refill_failed_groups = True

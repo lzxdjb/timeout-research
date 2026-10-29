@@ -22,7 +22,7 @@ from verl.utils.config import omega_conf_to_dataclass
 
 from .rollout import RolloutConfig
 
-__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+__all__ = ["DistillationLossConfig", "ExternalTeacherConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -125,6 +125,41 @@ class DistillationLossConfig(BaseConfig):
 
 
 @dataclass
+class ExternalTeacherConfig(BaseConfig):
+    """Connection to an existing vLLM-compatible prompt-logprob server.
+
+    Concurrency is enforced by one shared scoring actor per teacher, rather than
+    independently by every rollout worker. Authentication is read on that actor
+    from ``api_key_env`` so credentials are not included in serialized configs.
+    """
+
+    base_url: Optional[str] = None
+    model_name: Optional[str] = None
+    max_model_len: Optional[int] = None
+    max_concurrent_requests: int = 4
+    request_timeout_s: float = 600.0
+    max_retries: int = 2
+    retry_backoff_s: float = 1.0
+    api_key_env: Optional[str] = None
+    unsupported_token_ids: list[int] = field(default_factory=list)
+
+    def validate(self):
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(self.base_url or "")
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("External distillation teacher requires an http(s) external.base_url.")
+        if not self.model_name:
+            raise ValueError("External distillation teacher requires external.model_name.")
+        if self.max_model_len is None or self.max_model_len < 2:
+            raise ValueError("External distillation teacher requires external.max_model_len >= 2.")
+        if self.max_concurrent_requests < 1 or self.request_timeout_s <= 0:
+            raise ValueError("External teacher concurrency and request timeout must be positive.")
+        if self.max_retries < 0 or self.retry_backoff_s < 0:
+            raise ValueError("External teacher retry count and backoff must be nonnegative.")
+
+
+@dataclass
 class DistillationTeacherModelConfig(BaseConfig):
     """Configuration for on-policy distillation teacher.
 
@@ -146,6 +181,8 @@ class DistillationTeacherModelConfig(BaseConfig):
 
     key: Optional[str] = None
     model_path: Optional[str] = None
+    backend: str = "managed"
+    external: ExternalTeacherConfig = field(default_factory=ExternalTeacherConfig)
     inference: RolloutConfig = field(default_factory=RolloutConfig)
     num_replicas: Optional[int] = 0
 
@@ -159,10 +196,16 @@ class DistillationTeacherModelConfig(BaseConfig):
 
     @property
     def world_size(self) -> int:
+        if self.backend == "external":
+            return 0
         return self.num_replicas * self.per_replica_world_size
 
     def check_configured(self):
-        if self.model_path is None:
+        if self.backend not in {"managed", "external"}:
+            raise ValueError(f"Unknown distillation teacher backend {self.backend!r}.")
+        if self.backend == "external":
+            self.external.validate()
+        elif self.model_path is None:
             raise ValueError("model_path must be specified for distillation teacher model config.")
         if self.key is None:
             raise ValueError("key must be specified for distillation teacher model config.")
@@ -172,6 +215,10 @@ class DistillationTeacherModelConfig(BaseConfig):
     def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
         # Prompt + Response from student are fed into teacher as context
         max_model_len = self.inference.max_model_len
+        if self.backend == "external":
+            if use_topk:
+                raise NotImplementedError("External teachers currently support sampled-token distillation only.")
+            max_model_len = min(max_model_len or self.external.max_model_len, self.external.max_model_len)
         student_prompt_length = self.inference.prompt_length
         student_response_length = self.inference.response_length
         required_context_len = student_prompt_length + student_response_length + 1
@@ -183,7 +230,8 @@ class DistillationTeacherModelConfig(BaseConfig):
             )
         self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
         self.inference.response_length = 1
-        self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
+        if self.backend == "managed":
+            self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
 
     def _validate_topk_logprobs(self, use_topk: bool, topk: Optional[int]) -> None:
         if not use_topk:
@@ -266,6 +314,11 @@ class DistillationConfig(BaseConfig):
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
 
+    @property
+    def has_managed_teachers(self) -> bool:
+        """Whether training must allocate a local teacher GPU resource pool."""
+        return any(teacher.backend == "managed" for teacher in self.teacher_models.values())
+
     def __post_init__(self):
         if not self.enabled:
             return
@@ -290,7 +343,10 @@ class DistillationConfig(BaseConfig):
         assert "teacher_model" in self.teacher_models
         if len(self.teacher_models) == 1:
             # Single teacher occupies the entire teacher resource pool.
-            teacher_model = self.teacher_models["teacher_model"]
+            teacher_model = omega_conf_to_dataclass(
+                self.teacher_models["teacher_model"], dataclass_type=DistillationTeacherModelConfig
+            )
+            self.teacher_models["teacher_model"] = teacher_model
             inference = teacher_model.inference
             per_replica = (
                 inference.tensor_model_parallel_size
@@ -298,12 +354,12 @@ class DistillationConfig(BaseConfig):
                 * inference.pipeline_model_parallel_size
             )
             pool_size = self.n_gpus_per_node * self.nnodes
-            if pool_size % per_replica != 0:
+            if teacher_model.backend == "managed" and pool_size % per_replica != 0:
                 raise ValueError(
                     f"Single teacher's per_replica_world_size ({per_replica}) must divide the distillation "
                     f"resource pool size ({self.n_gpus_per_node=} * {self.nnodes=} = {pool_size})."
                 )
-            teacher_model.num_replicas = pool_size // per_replica
+            teacher_model.num_replicas = pool_size // per_replica if teacher_model.backend == "managed" else 0
             teacher_model.key = "default"
         else:
             # Multiple teachers: remove default single teacher config

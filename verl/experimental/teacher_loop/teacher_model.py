@@ -168,7 +168,7 @@ class MultiTeacherModelManager:
     def __init__(
         self,
         config: DictConfig,
-        resource_pool: RayResourcePool,
+        resource_pool: RayResourcePool = None,
     ):
         """
         Initialize the multi-teacher model manager.
@@ -185,15 +185,19 @@ class MultiTeacherModelManager:
         self.server_addresses: dict[str, list[str]] = {}
         self.server_handles: dict[str, list] = {}
         self.load_balancer_handle: dict[str, object] = {}
+        self.external_scoring_handles: dict[str, object] = {}
 
         self._initialize_teacher_model_managers()
 
     def _initialize_teacher_model_managers(self):
         teacher_models = self.distillation_config.teacher_models
-        split_sizes = [teacher.world_size for teacher in teacher_models.values()]
-        split_pools = split_resource_pool(self.resource_pool, split_size=split_sizes)
+        managed_teachers = {key: teacher for key, teacher in teacher_models.items() if teacher.backend == "managed"}
+        if managed_teachers and self.resource_pool is None:
+            raise ValueError("Managed distillation teachers require a GPU resource pool.")
+        split_sizes = [teacher.world_size for teacher in managed_teachers.values()]
+        split_pools = split_resource_pool(self.resource_pool, split_size=split_sizes) if managed_teachers else []
 
-        for (key, teacher_model_config), teacher_pool in zip(teacher_models.items(), split_pools, strict=True):
+        for (key, teacher_model_config), teacher_pool in zip(managed_teachers.items(), split_pools, strict=True):
             manager = TeacherModelManager(
                 distillation_config=self.distillation_config,
                 teacher_model_config=teacher_model_config,
@@ -204,6 +208,18 @@ class MultiTeacherModelManager:
             self.server_handles[key] = manager.server_handles
             self.load_balancer_handle[key] = manager.load_balancer_handle
 
+        for key, teacher_model_config in teacher_models.items():
+            if teacher_model_config.backend != "external":
+                continue
+            import ray
+
+            from verl.experimental.teacher_loop.external_teacher import ExternalTeacherScorer
+
+            handle = ray.remote(ExternalTeacherScorer).options(num_cpus=0).remote(teacher_model_config.external)
+            # Detect model-alias and context mistakes before student rollouts consume resources.
+            ray.get(handle.validate_connection.remote())
+            self.external_scoring_handles[key] = handle
+
     def get_client(self) -> dict[str, LLMServerClient]:
         """Get the LLMServerClient for each teacher model."""
         teacher_clients = {}
@@ -212,4 +228,9 @@ class MultiTeacherModelManager:
                 config=self.config,
                 load_balancer_handle=manager.load_balancer_handle,
             )
+        if self.external_scoring_handles:
+            from verl.experimental.teacher_loop.external_teacher import ExternalTeacherClient
+
+            for key, handle in self.external_scoring_handles.items():
+                teacher_clients[key] = ExternalTeacherClient(config=self.config, scoring_handle=handle)
         return teacher_clients

@@ -83,6 +83,20 @@ teacher_models:
     _target_: verl.workers.config.DistillationTeacherModelConfig
     key: null
     model_path: null
+    # managed: launch Ray inference workers; external: score with an existing HTTP teacher.
+    backend: managed
+    external:
+      _target_: verl.workers.config.ExternalTeacherConfig
+      base_url: null
+      model_name: null
+      max_model_len: null
+      # Shared across all rollout workers for this teacher.
+      max_concurrent_requests: 4
+      request_timeout_s: 600.0
+      max_retries: 2
+      retry_backoff_s: 1.0
+      api_key_env: null
+      unsupported_token_ids: []
     num_replicas: 0
     inference:
       _target_: verl.workers.config.RolloutConfig

@@ -17,6 +17,7 @@
 
 import asyncio
 import logging
+import math
 import os
 import time
 from typing import Any
@@ -33,6 +34,7 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from verl.experimental.teacher_loop.errors import TeacherScoringError
 from verl.trainer.ppo.v1.repeat_judge_queue import RepeatQueueError, progress_interval_seconds
 from verl.utils.ray_utils import auto_await
 from verl.utils.swe_cutoff_debug import cutoff_debug_enabled, reconcile_cutoff_sessions, write_cutoff_debug_event
@@ -93,6 +95,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         tq.init()
         self.repeat_coordinator = None
         self.repeat_finalizers = {}
+        self.repeat_job_refs = {}
+        self.dapo_cutoff_uids = set()
+        self.dapo_cutoff_enabled = bool(
+            self.config.get("algorithm", {}).get("filter_groups", {}).get("cutoff_when_full", False)
+        )
+        self.dapo_publications = {}
         self.repeat_generation_sessions = {}
         self.repeat_debug = _repeat_debug_enabled()
         self.repeat_debug_slow_seconds = _repeat_debug_slow_seconds()
@@ -272,8 +280,68 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 )
             )
 
-    async def cancel_sequences(self, uids: list[str], validate: bool = False) -> int:
+    async def _await_tq_publication(self, partition_id: str, uid: str, operation):
+        if partition_id != "train" or not self.dapo_cutoff_enabled:
+            return await operation
+        # Cancelling a local await does not stop a TransferQueue RPC already sent
+        # to Ray. Shield and retain that operation until the cutoff cleanup barrier.
+        task = asyncio.create_task(operation)
+        self.dapo_publications.setdefault((partition_id, str(uid)), []).append(task)
+        return await asyncio.shield(task)
+
+    async def _put_prompt_tag(self, *, key, partition_id, tag):
+        return await self._await_tq_publication(
+            partition_id, key, tq.async_kv_put(key=key, partition_id=partition_id, tag=tag)
+        )
+
+    async def _cancel_dapo_repeat(self, partition_id: str, uid: str) -> None:
+        """Settle deferred jobs as well as their publication tasks before acknowledging cutoff."""
+        key = (partition_id, uid)
+        refs = self.repeat_job_refs.get(key, [])
+        for ref in refs:
+            if isinstance(ref, ray.ObjectRef):
+                ray.cancel(ref)
+            elif isinstance(ref, asyncio.Future):
+                ref.cancel()
+        finalizers = self.repeat_finalizers.get(key, [])
+        for task in finalizers:
+            task.cancel()
+        if finalizers:
+            await _settle_session_tasks(finalizers)
+
+        async def settle_ref(ref):
+            try:
+                await ref
+            except (ray.exceptions.RayError, asyncio.CancelledError):
+                pass  # Cancelled/failed remote jobs cannot publish a retained reward.
+
+        if refs:
+            await asyncio.gather(*(settle_ref(ref) for ref in refs))
+
+    async def _cancel_dapo_sequences(self, uids: list[str]) -> int:
+        tasks = {uid: self.prompt_tasks["train"][uid] for uid in uids
+                 if uid in self.prompt_tasks["train"] and not self.prompt_tasks["train"][uid].done()}
+        keys = {("train", str(uid)) for uid in tasks}
+        self.dapo_cutoff_uids.update(keys)
+        try:
+            for task in tasks.values():
+                task.cancel()
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                    raise RuntimeError("DAPO rollout cancellation cleanup failed") from result
+            for uid in tasks:
+                await tq.async_kv_put(key=uid, partition_id="train", tag={"status": "failure", "dapo_cutoff": True})
+            return len(tasks)
+        finally:
+            self.dapo_cutoff_uids.difference_update(keys)
+
+    async def cancel_sequences(self, uids: list[str], validate: bool = False, *, dapo_cutoff: bool = False) -> int:
         """Cancel prompt groups and wait until their sessions release resources."""
+        if dapo_cutoff:
+            if validate:
+                raise ValueError("DAPO cutoff applies only to training")
+            return await self._cancel_dapo_sequences(uids)
         partition_id = "val" if validate else "train"
         items = (tq.kv_list(partition_id) or {}).get(partition_id, {}) if self.repeat_coordinator is not None else {}
         tasks_by_uid = {
@@ -354,6 +422,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         self._repeat_debug_event("prompt_start", partition_id, str(uid))
         tasks = []
         self.repeat_finalizers[(partition_id, str(uid))] = []
+        self.repeat_job_refs[(partition_id, str(uid))] = []
         config = self.config.actor_rollout_ref.rollout
         n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
         do_sample = prompt.pop("__do_sample__", True)
@@ -377,7 +446,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             self.cutoff_session_states[state_key] = session_state
         self.repeat_generation_sessions[state_key] = (n, set())
         try:
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
+            await self._put_prompt_tag(key=uid, partition_id=partition_id, tag={"status": "running"})
             self._repeat_debug_event("prompt_running", partition_id, str(uid))
             run_sampling_params = dict(sampling_params)
             if not trajectory["validate"] and not do_sample:
@@ -423,8 +492,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             queue_error = next((error for error in session_errors if isinstance(error, RepeatQueueError)), None)
             if queue_error is not None:
                 raise queue_error
+            teacher_error = next((error for error in session_errors if isinstance(error, TeacherScoringError)), None)
+            if teacher_error is not None:
+                raise teacher_error
             if self.repeat_coordinator is not None:
-                await tq.async_kv_put(key=uid, partition_id=partition_id,
+                await self._put_prompt_tag(key=uid, partition_id=partition_id,
                                       tag={"status": "reward_pending", "generation_complete": True})
                 self._repeat_debug_event("prompt_reward_pending", partition_id, str(uid),
                                          seconds=time.monotonic() - prompt_started)
@@ -438,7 +510,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 status = "failure"
             else:
                 status = "finished"
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
+            await self._put_prompt_tag(key=uid, partition_id=partition_id, tag={"status": status})
             if session_state is not None:
                 session_state["terminal_status"] = status
             self._repeat_debug_event("prompt_finished", partition_id, str(uid), status=status,
@@ -448,13 +520,22 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                                      seconds=time.monotonic() - prompt_started)
             for task in tasks:
                 task.cancel()
-            if tasks:
-                await _settle_session_tasks(tasks)
+            cleanup_errors = await _settle_session_tasks(tasks) if tasks else []
 
+            if (partition_id, str(uid)) in self.dapo_cutoff_uids:
+                cleanup_error = next(
+                    (error for error in cleanup_errors if not isinstance(error, asyncio.CancelledError)), None
+                )
+                if cleanup_error is not None:
+                    raise RuntimeError("DAPO generation session cleanup failed") from cleanup_error
+                # No partial-rollout admission and no retained-judgment barrier:
+                # the original input will be regenerated under the next policy.
+                # Deferred jobs/publications are settled in finally below.
+                raise
             try:
                 await self._join_repeat(partition_id, str(uid))
             except Exception as error:
-                await tq.async_kv_put(key=uid, partition_id=partition_id,
+                await self._put_prompt_tag(key=uid, partition_id=partition_id,
                                       tag={"status": "reward_error", "repeat_error": str(error)[:1000]})
                 self._repeat_debug_event("prompt_terminal", partition_id, str(uid), status="reward_error",
                                          seconds=time.monotonic() - prompt_started,
@@ -464,7 +545,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             if self.repeat_coordinator is not None and progress and len(progress[1]) == progress[0]:
                 # Cutoff raced the final generation completion. Every rollout was
                 # complete before cancellation; preserve the fully finalized group.
-                await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
+                await self._put_prompt_tag(key=uid, partition_id=partition_id, tag={"status": "finished"})
                 self._repeat_debug_event("prompt_terminal", partition_id, str(uid), status="finished",
                                          seconds=time.monotonic() - prompt_started)
                 return
@@ -482,7 +563,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     partition_id=partition_id,
                     tags=trajectory_tags,
                 )
-            await tq.async_kv_put(
+            await self._put_prompt_tag(
                 key=uid,
                 partition_id=partition_id,
                 tag={"status": "failure", "completion_ratio_cutoff": True},
@@ -502,17 +583,27 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 await self._join_repeat(partition_id, str(uid))
             except Exception as reward_error:
                 e = reward_error
-            status = "reward_error" if isinstance(e, RepeatQueueError) else "failure"
+            # Reuse the existing fatal postprocessing-error channel. A missing
+            # teacher target must stop training rather than silently refill the
+            # prompt with an easier or shorter trajectory.
+            status = "reward_error" if isinstance(e, (RepeatQueueError, TeacherScoringError)) else "failure"
             if session_state is not None:
                 session_state["terminal_status"] = status
             tag = {"status": status}
-            if status == "reward_error":
+            if isinstance(e, TeacherScoringError):
+                tag["teacher_error"] = str(e)[:1000]
+            elif status == "reward_error":
                 tag["repeat_error"] = str(e)[:1000]
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag=tag)
+            await self._put_prompt_tag(key=uid, partition_id=partition_id, tag=tag)
             self._repeat_debug_event("prompt_terminal", partition_id, str(uid), status=status,
                                      seconds=time.monotonic() - prompt_started,
                                      error_type=type(e).__name__)
         finally:
+            if (partition_id, str(uid)) in self.dapo_cutoff_uids:
+                await self._cancel_dapo_repeat(partition_id, str(uid))
+                errors = await _settle_session_tasks(self.dapo_publications.get((partition_id, str(uid)), []))
+                if errors:
+                    raise RuntimeError("DAPO TransferQueue publication cleanup failed") from errors[0]
             if session_state is not None and session_state.get("cancel_reason") is None:
                 self._record_cutoff_group_census(
                     partition_id, str(uid), session_state,
@@ -522,6 +613,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 )
             self.repeat_debug_prompts.pop((partition_id, str(uid)), None)
             self.repeat_finalizers.pop((partition_id, str(uid)), None)
+            self.repeat_job_refs.pop((partition_id, str(uid)), None)
+            self.dapo_publications.pop((partition_id, str(uid)), None)
             self.repeat_generation_sessions.pop((partition_id, str(uid)), None)
             self.cutoff_session_states.pop((partition_id, str(uid)), None)
 
@@ -618,7 +711,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             if len(completed) == expected:
                 # Mark completion before bounded admission: a full queue is not a
                 # generation straggler and must not bias completion-ratio cutoff.
-                await tq.async_kv_put(key=uid, partition_id=partition_id,
+                await self._put_prompt_tag(key=uid, partition_id=partition_id,
                                       tag={"status": "running", "generation_complete": True})
                 self._repeat_debug_event("prompt_generation_complete", partition_id, str(uid),
                                          sessions=len(completed), expected=expected)
@@ -634,6 +727,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 ref = self.repeat_coordinator.submit.remote(job_id, job)
             except Exception as error:
                 raise RepeatQueueError("Repeat queue handoff failed") from error
+            self.repeat_job_refs.setdefault((partition_id, str(uid)), []).append(ref)
             self._repeat_debug_event("repeat_job_submitted", partition_id, str(uid),
                                      session=session_id, job_id=job_id)
             task = asyncio.create_task(self._finalize_repeat(ref, job_id, outputs[0], validate, kwargs))
@@ -758,12 +852,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 infrastructure_failure_count,
             )
 
-        await tq.async_kv_batch_put(
+        await self._await_tq_publication(partition_id, str(uid), tq.async_kv_batch_put(
             keys=keys,
             fields=list_of_dict_to_tensordict(fields),
             tags=tags,
             partition_id="train" if not validate else "val",
-        )
+        ))
         cutoff_state = self.cutoff_session_states.get((partition_id, str(uid)))
         if cutoff_state is not None:
             cutoff_state["published"].add(int(session_id))
@@ -825,13 +919,19 @@ class AgentLoopManagerTQ(AgentLoopManager):
         else:
             ray.get(refs)
 
-    def cancel_sequences(self, uids: list[str], validate: bool = False) -> int:
+    def cancel_sequences(
+        self, uids: list[str], validate: bool = False, *, dapo_cutoff: bool = False,
+        cleanup_timeout_seconds: float = 300.0,
+    ) -> int:
         """Cancel the requested prompt groups on whichever workers own them."""
         if not uids:
             return 0
+        if dapo_cutoff and (validate or not math.isfinite(cleanup_timeout_seconds) or cleanup_timeout_seconds <= 0):
+            raise ValueError("DAPO training cutoff requires a positive finite cleanup timeout")
         started = time.monotonic()
         interval = progress_interval_seconds()
-        pending = [worker.cancel_sequences.remote(uids, validate=validate)
+        cancellation_kwargs = {"dapo_cutoff": True} if dapo_cutoff else {}
+        pending = [worker.cancel_sequences.remote(uids, validate=validate, **cancellation_kwargs)
                    for worker in self.agent_loop_workers]
         logger.info("Rollout cancellation/drain start partition=%s groups=%d workers=%d",
                     "val" if validate else "train", len(uids), len(pending))
@@ -840,12 +940,14 @@ class AgentLoopManagerTQ(AgentLoopManager):
         last_progress = started
         cleanup_timeout = (positive_seconds("SWE_AGENT_VALIDATION_CLEANUP_TIMEOUT_SECONDS", 300)
                            if validate and strict_validation_enabled() else None)
+        if dapo_cutoff:
+            cleanup_timeout = cleanup_timeout_seconds
         while pending:
             remaining = cleanup_timeout - (time.monotonic() - started) if cleanup_timeout else interval
             if remaining <= 0:
                 raise RuntimeError(
-                    "Validation cancellation was not acknowledged within the cleanup deadline; "
-                    "refusing to resume training while validation workers may still publish"
+                    f"{'DAPO' if dapo_cutoff else 'Validation'} cancellation was not acknowledged "
+                    "within the cleanup deadline; refusing to resume training while workers may still publish"
                 )
             done, pending = ray.wait(pending, num_returns=1, timeout=min(interval, remaining))
             cancelled += sum(ray.get(done))

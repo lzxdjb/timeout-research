@@ -94,6 +94,15 @@ algorithm:
     # Maximum Sync DAPO prompt batches concurrently in flight, measured in train-batch units
     max_inflight_gen_batches: 1
 
+    # Sync V1 only: freeze a full usable batch and cancel all remaining rollout groups
+    cutoff_when_full: False
+
+    # Retry original cancelled/surplus prompts FIFO under the next policy, with fresh UIDs
+    requeue_unselected_prompts: False
+
+    # Fail before training if workers do not acknowledge cancellation/cleanup in time
+    cutoff_cleanup_timeout_seconds: 300.0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 

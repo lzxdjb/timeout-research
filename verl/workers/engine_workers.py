@@ -309,6 +309,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 maybe_fix_3d_position_ids(mini_batch_td)
+                if tu.get_non_tensor_data(data, key="normalize_distillation_mask", default=False):
+                    from verl.trainer.distillation.batch_utils import prepare_distillation_minibatch
+
+                    prepare_distillation_minibatch(mini_batch_td, self.engine.get_data_parallel_group())
                 if "tool_failure_weights" in mini_batch_td:
                     # Compute once per actual minibatch, before dynamic
                     # microbatching. Include active rows with no rejected call.
@@ -749,6 +753,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        if self.distillation_enabled:
+            tu.assign_non_tensor(data, normalize_distillation_mask=True)
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
