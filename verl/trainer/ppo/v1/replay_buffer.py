@@ -448,15 +448,21 @@ class ReplayBuffer:
         if any(value is not None for value in self.completion_ratio_thresholds.values()):
             if self.trainer_mode != "sync":
                 raise ValueError("Completion-ratio rollout cutoff is supported only in V1 synchronous trainer mode")
-            if self.filter_groups_metric is not None:
-                raise ValueError("Completion-ratio rollout cutoff cannot be combined with synchronous group filtering")
+            if self.filter_groups_metric is not None and self.completion_ratio_thresholds["train"] is not None:
+                raise ValueError(
+                    "Training completion-ratio rollout cutoff cannot be combined with synchronous group filtering"
+                )
         if any(value is not None for value in self.infrastructure_failure_ratio_thresholds.values()):
             if self.trainer_mode != "sync":
                 raise ValueError("Infrastructure group filtering is supported only in V1 synchronous trainer mode")
             for partition_id, count in self.expected_rollout_counts.items():
                 if self.infrastructure_failure_ratio_thresholds[partition_id] is None:
                     continue
-                if self.completion_ratio_thresholds[partition_id] is None:
+                # DAPO training replaces rejected groups until the usable batch is full,
+                # independently of completion-ratio cancellation. Preserve the legacy
+                # requirement for non-DAPO training and for validation.
+                dapo_training = partition_id == "train" and self.filter_groups_metric is not None
+                if self.completion_ratio_thresholds[partition_id] is None and not dapo_training:
                     name = COMPLETION_RATIO_ENV[partition_id]
                     raise ValueError(f"Infrastructure group filtering requires {name}")
                 if not isinstance(count, int) or count <= 0:
@@ -1015,7 +1021,10 @@ class ReplayBuffer:
             return False
 
     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
-        """Finished groups whose configured DAPO metric is identical across all trajectories.
+        """Terminal groups whose DAPO metric is identical across verified final sessions.
+
+        Use the same final-session selection as GRPO. Unverified placeholders and
+        intermediate outputs must not introduce artificial reward variance.
 
         Returns the filtered uids and a ``{shared_metric_value: group_count}`` breakdown built in the
         same scope, so the diagnostic (which reward level the no-signal groups collapse to) travels
@@ -1024,15 +1033,21 @@ class ReplayBuffer:
         if partition_id == "val" or self.filter_groups_metric is None:
             return set(), Counter()
 
-        finished_uids = self.finished_keys[partition_id]
+        materializable_uids = {self._uid_from_key(key) for key in self.partitions[partition_id]}
+        finished_uids = self.finished_keys[partition_id] | (self.failure_keys[partition_id] & materializable_uids)
         classification_cache = self._dapo_classification_cache[partition_id]
         for uid in classification_cache.keys() - finished_uids:
             del classification_cache[uid]
 
         new_finished_uids = finished_uids - classification_cache.keys()
-        trajectory_keys = [key for key in self.partitions[partition_id] if key.split("_")[0] in new_finished_uids]
+        final_keys = self._final_session_keys(
+            [key for key in self.partitions[partition_id] if self._uid_from_key(key) in new_finished_uids]
+        )
+        trajectory_keys = [
+            key for key in final_keys if not trajectory_is_unverified(self.partitions[partition_id][key])
+        ]
         metrics_by_uid: dict[str, list[float]] = defaultdict(list)
-        missing_metric_uids = new_finished_uids - {key.split("_")[0] for key in trajectory_keys}
+        missing_metric_uids = new_finished_uids - {self._uid_from_key(key) for key in final_keys}
 
         if trajectory_keys:
             data = tq.kv_batch_get(
@@ -1061,7 +1076,11 @@ class ReplayBuffer:
 
         for uid in new_finished_uids:
             values = metrics_by_uid[uid]
-            classification_cache[uid] = float(values[0]) if len(values) > 1 and float(np.std(values)) == 0.0 else None
+            # Exact equality also catches identical shaped decimal rewards, whose
+            # floating-point standard deviation can round to a nonzero value.
+            classification_cache[uid] = (
+                values[0] if len(values) > 1 and all(value == values[0] for value in values) else None
+            )
 
         filtered_rewards = {uid: reward for uid, reward in classification_cache.items() if reward is not None}
         return set(filtered_rewards), Counter(filtered_rewards.values())
@@ -1335,6 +1354,7 @@ class ReplayBuffer:
         eviction_metrics: dict = {}
         dapo_enabled = partition_id != "val" and self.filter_groups_metric is not None
         refill_credit = 0
+        infrastructure_refill_credit = 0
         draining = False
         max_inflight_prompts = 0
         cutoff_requested = False
@@ -1347,24 +1367,33 @@ class ReplayBuffer:
             self._sync_metadata_from_transfer_queue()
 
             discarded_uids, infrastructure_metrics = self._discard_infrastructure_groups(partition_id)
-            eviction_metrics.update({key: value for key, value in infrastructure_metrics.items()
-                                     if "/unverified_group_filter/" in key})
+            if not dapo_enabled or not discarded_uids:
+                eviction_metrics.update({key: value for key, value in infrastructure_metrics.items()
+                                         if "/unverified_group_filter/" in key
+                                         and (not dapo_enabled or not key.endswith("/discarded_groups"))})
             if discarded_uids:
                 _accumulate_eviction_metrics(eviction_metrics, infrastructure_metrics, stale_count=0)
-                if not cutoff_requested:
-                    if partition_id == "val":
-                        self.validation_refill_fn(sorted(discarded_uids))
-                    else:
-                        self.refill_fn(len(discarded_uids))
-                    prefix = self._metrics_prefix(partition_id)
-                    refill_key = f"{prefix}/infrastructure_group_filter/refilled_groups"
-                    eviction_metrics[refill_key] = eviction_metrics.get(refill_key, 0) + len(discarded_uids)
-                    logger.info(
-                        "V1 infrastructure group filter refilled partition=%s groups=%d",
-                        partition_id,
-                        len(discarded_uids),
-                    )
-                continue
+                if dapo_enabled:
+                    # Share DAPO's bounded dispatcher instead of immediately refilling
+                    # failures, which could over-dispatch or prolong the drain phase.
+                    if not draining:
+                        refill_credit += len(discarded_uids)
+                        infrastructure_refill_credit += len(discarded_uids)
+                else:
+                    if not cutoff_requested:
+                        if partition_id == "val":
+                            self.validation_refill_fn(sorted(discarded_uids))
+                        else:
+                            self.refill_fn(len(discarded_uids))
+                        prefix = self._metrics_prefix(partition_id)
+                        refill_key = f"{prefix}/infrastructure_group_filter/refilled_groups"
+                        eviction_metrics[refill_key] = eviction_metrics.get(refill_key, 0) + len(discarded_uids)
+                        logger.info(
+                            "V1 infrastructure group filter refilled partition=%s groups=%d",
+                            partition_id,
+                            len(discarded_uids),
+                        )
+                    continue
 
             cutoff_requested, completion_ratio_metrics = self._maybe_apply_completion_ratio_cutoff(
                 partition_id, batch_size, cutoff_requested
@@ -1394,6 +1423,7 @@ class ReplayBuffer:
                     # Stop speculative dispatch, then drain requests already running under this policy version.
                     draining = True
                     refill_credit = 0
+                    infrastructure_refill_credit = 0
                 elif not draining:
                     refill_credit += 2 * dapo_count + failed_count
 
@@ -1406,6 +1436,14 @@ class ReplayBuffer:
                         assert self.refill_fn is not None
                         self.refill_fn(dispatch_count)
                         refill_credit -= dispatch_count
+                        infrastructure_dispatch_count = min(infrastructure_refill_credit, dispatch_count)
+                        if infrastructure_dispatch_count:
+                            infrastructure_refill_credit -= infrastructure_dispatch_count
+                            prefix = self._metrics_prefix(partition_id)
+                            refill_key = f"{prefix}/infrastructure_group_filter/refilled_groups"
+                            eviction_metrics[refill_key] = (
+                                eviction_metrics.get(refill_key, 0) + infrastructure_dispatch_count
+                            )
                         continue
 
             can_select = (

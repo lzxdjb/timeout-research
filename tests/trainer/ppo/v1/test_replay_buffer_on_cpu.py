@@ -53,7 +53,8 @@ def test_golden_group_admission_excludes_zero_variance_and_rollout_discards():
     )
 
 
-def test_strict_validation_retry_and_cutoff_against_real_queue(tq_init, monkeypatch, tmp_path):
+@pytest.mark.parametrize("dapo_enabled", [False, True])
+def test_strict_validation_retry_and_cutoff_against_real_queue(tq_init, monkeypatch, tmp_path, dapo_enabled):
     monkeypatch.setenv("SWE_AGENT_VALIDATION_STRICT_ACCOUNTING", "1")
     monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD", str(2 / 3))
     monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", ".25")
@@ -113,7 +114,13 @@ def test_strict_validation_retry_and_cutoff_against_real_queue(tq_init, monkeypa
                 "validation_submitted_at": time.monotonic(),
             },
         )
-        rb = _make_rb(expected_validation_rollout_n=1, validation_refill_fn=refill, cancel_fn=cancel)
+        rb = _make_rb(
+            expected_validation_rollout_n=1,
+            validation_refill_fn=refill,
+            cancel_fn=cancel,
+            filter_groups_metric="score" if dapo_enabled else None,
+            refill_fn=(lambda _n: pytest.fail("Validation must not refill training prompts")) if dapo_enabled else None,
+        )
         rb.trainer_config = {"validation_data_dir": str(tmp_path)}
         batch, metrics = rb.sample(global_steps=0, partition_id="val", batch_size=3)
         assert set(batch.keys) == {f"{roots[0]}_0_0", f"{retried[0]}_0_0"}
@@ -256,6 +263,7 @@ class PromptSpec:
     global_steps: int = 0
     rewards: list[float] | None = None
     infrastructure_failures: list[int] | None = None
+    unverified: list[bool] | None = None
     trajectory_keys: list[str] = field(default_factory=list)
 
 
@@ -275,6 +283,8 @@ class RolloutProducer(threading.Thread):
                     key = _trajectory_key(spec.uid, session_id)
                     fields = {"input_ids": torch.tensor([1, 2, 3])}
                     tag = {"is_prompt": False, "seq_len": 3, "global_steps": spec.global_steps}
+                    if spec.unverified is not None:
+                        tag["unverified_trajectory"] = spec.unverified[session_id]
                     if spec.rewards is not None:
                         fields["extra_fields"] = {"reward_extra_info": {"acc": float(spec.rewards[session_id])}}
                     if spec.infrastructure_failures is not None:
@@ -580,6 +590,43 @@ def test_infrastructure_group_filter_requires_completion_ratio(monkeypatch) -> N
 
     with pytest.raises(ValueError, match="SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD"):
         _make_rb(refill_fn=lambda _n: None, expected_rollout_n=8)
+
+
+def test_dapo_training_keeps_failure_filters_without_completion_cutoff(monkeypatch):
+    monkeypatch.delenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", raising=False)
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_UNVERIFIED_TRAJECTORY_RATIO_THRESHOLD", "0.25")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD", "0.98")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+    rb = _make_rb(
+        filter_groups_metric="score",
+        refill_fn=lambda _n: None,
+        expected_rollout_n=8,
+        expected_validation_rollout_n=1,
+        validation_refill_fn=lambda _uids: None,
+    )
+    assert rb.completion_ratio_thresholds == {"train": None, "val": 0.98}
+    assert rb.infrastructure_failure_ratio_thresholds["train"] == 0.25
+    assert rb.unverified_ratio_thresholds["train"] == 0.25
+
+
+@pytest.mark.parametrize("completion_ratio", ["0.85", "1.0"])
+def test_dapo_still_rejects_training_completion_cutoff(monkeypatch, completion_ratio):
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD", completion_ratio)
+    with pytest.raises(ValueError, match="Training completion-ratio"):
+        _make_rb(filter_groups_metric="score", refill_fn=lambda _n: None)
+
+
+def test_dapo_preserves_validation_infrastructure_cutoff_requirement(monkeypatch):
+    monkeypatch.delenv("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD", raising=False)
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_VALIDATION_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+    with pytest.raises(ValueError, match="SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD"):
+        _make_rb(
+            filter_groups_metric="score",
+            refill_fn=lambda _n: None,
+            expected_validation_rollout_n=1,
+            validation_refill_fn=lambda _uids: None,
+        )
 
 
 def test_validation_infrastructure_filter_does_not_require_training_refill(monkeypatch) -> None:
@@ -1417,6 +1464,156 @@ def test_dapo_classification_cache_fetches_only_new_finished_groups(tq_init, par
         ]
     finally:
         _clear_partition(partition_id)
+
+
+@pytest.mark.parametrize("status", ["finished", "failure"])
+@pytest.mark.parametrize("shared_reward", [0.0, 1.0, -0.1])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_dapo_compares_only_verified_final_session_rewards(monkeypatch, status, shared_reward, mixed):
+    rb = _make_rb(filter_groups_metric="score", refill_fn=lambda _n: None)
+    getattr(rb, f"{status}_keys")["train"].add("group")
+    rb.partitions["train"] = {
+        **{f"group_{i}_0": {} for i in range(8)},
+        "group_0_1": {},
+    }
+    rb.partitions["train"]["group_6_0"] = {"unverified_trajectory": True}
+    rb.partitions["train"]["group_7_0"] = {"evaluator_group_excluded": True}
+    scores = {key: shared_reward for key in rb.partitions["train"]}
+    scores["group_0_0"] = -1000.0  # Intermediate output must not affect final-session variance.
+    scores["group_6_0"] = float("nan")
+    scores["group_7_0"] = 1000.0
+    if mixed:
+        scores["group_5_0"] = shared_reward + 1.0
+    requested_keys = []
+
+    def fetch(*, keys, **kwargs):
+        requested_keys.extend(keys)
+        return {"extra_fields": [{"reward_extra_info": {"score": scores[key]}} for key in keys]}
+
+    monkeypatch.setattr(tq, "kv_batch_get", fetch)
+    filtered, counts = rb._dapo_filtered_keys("train")
+    assert filtered == (set() if mixed else {"group"})
+    assert dict(counts) == ({} if mixed else {shared_reward: 1})
+    assert set(requested_keys) == {"group_0_1", *(f"group_{i}_0" for i in range(1, 6))}
+
+
+@pytest.mark.parametrize("rejection", ["infrastructure", "unverified", "both"])
+def test_dapo_failure_filters_do_not_refill_when_batch_is_already_full(
+    tq_init, monkeypatch, tmp_path, rejection
+):
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_UNVERIFIED_TRAJECTORY_RATIO_THRESHOLD", "0.25")
+    bad = PromptSpec(
+        uid=_uid(), status="finished", sessions=8, rewards=[0.0] * 8,
+        infrastructure_failures=[1] * 3 + [0] * 5 if rejection != "unverified" else None,
+        unverified=[False] * 3 + [True] * 3 + [False] * 2 if rejection != "infrastructure" else None,
+    )
+    good = [PromptSpec(uid=_uid(), status="finished", sessions=8, rewards=[0.0, 1.0] * 4) for _ in range(2)]
+    refiller = FakeRefiller("train", global_steps=0, sessions=8, rewards=[0.0, 1.0] * 4)
+    rb = _make_rb(filter_groups_metric="acc", refill_fn=refiller, expected_rollout_n=8, train_batch_size=3)
+    rb.trainer_config = {"rollout_data_dir": str(tmp_path)}
+    try:
+        _produce("train", [bad, *good]).join_and_check()
+        batch, metrics = rb.sample(global_steps=0, partition_id="train", batch_size=2)
+        assert _uids_of(batch.keys) == {spec.uid for spec in good}
+        assert refiller.calls == []
+        assert metrics["training/infrastructure_group_filter/discarded_groups"] == 1
+        assert metrics.get("training/filter_groups/evicted_samples", 0) == 0
+        assert metrics.get("training/infrastructure_group_filter/refilled_groups", 0) == 0
+        if rejection != "infrastructure":
+            assert metrics["training/unverified_group_filter/discarded_groups"] == 1
+    finally:
+        _clear_partition("train")
+
+
+def test_dapo_combines_failure_and_zero_advantage_filters(tq_init, monkeypatch, tmp_path):
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_UNVERIFIED_TRAJECTORY_RATIO_THRESHOLD", "0.25")
+    bad_infra = PromptSpec(
+        uid=_uid(), status="finished", sessions=8, rewards=[0.0, 1.0] * 4,
+        infrastructure_failures=[1] * 3 + [0] * 5,
+    )
+    bad_unverified = PromptSpec(
+        uid=_uid(), status="failure", sessions=8, rewards=[0.0, 1.0] * 4,
+        unverified=[True] * 3 + [False] * 5,
+    )
+    uniform_verified = PromptSpec(
+        uid=_uid(), status="finished", sessions=8, rewards=[1.0] * 6 + [0.0, 0.0],
+        unverified=[False] * 6 + [True] * 2,
+    )
+    boundary = PromptSpec(
+        uid=_uid(), status="finished", sessions=8, rewards=[0.0, 1.0] * 4,
+        infrastructure_failures=[1, 1] + [0] * 6,
+    )
+    refiller = FakeRefiller("train", global_steps=0, sessions=8, rewards=[0.0, 1.0] * 4)
+    rb = _make_rb(filter_groups_metric="acc", refill_fn=refiller, expected_rollout_n=8, train_batch_size=4)
+    rb.trainer_config = {"rollout_data_dir": str(tmp_path)}
+    try:
+        _produce("train", [bad_infra, bad_unverified, uniform_verified, boundary]).join_and_check()
+        batch, metrics = rb.sample(global_steps=0, partition_id="train", batch_size=4)
+        selected = _uids_of(batch.keys)
+        assert len(selected) == 4 and boundary.uid in selected
+        assert not selected & {bad_infra.uid, bad_unverified.uid, uniform_verified.uid}
+        assert refiller.calls == [4]  # One per failure-filter rejection, two per uniform group.
+        assert metrics["training/infrastructure_group_filter/discarded_groups"] == 2
+        assert metrics["training/infrastructure_group_filter/refilled_groups"] == 2
+        assert metrics["training/unverified_group_filter/discarded_groups"] == 1
+        assert metrics["training/filter_groups/evicted_samples"] == 1
+        assert metrics["training/filter_groups/discarded_surplus_samples"] == 1
+    finally:
+        _clear_partition("train")
+
+
+def test_dapo_bounds_combined_refills_and_does_not_refill_failures_while_draining(tq_init, monkeypatch, tmp_path):
+    monkeypatch.setenv("SWE_AGENT_ROLLOUT_TRAINING_INFRA_FAILURE_GROUP_RATIO_THRESHOLD", "0.25")
+    bad = PromptSpec(
+        uid=_uid(), status="finished", sessions=8, rewards=[0.0, 1.0] * 4,
+        infrastructure_failures=[1] * 3 + [0] * 5,
+    )
+    uniform = PromptSpec(uid=_uid(), status="finished", sessions=8, rewards=[0.0] * 8)
+    slow = PromptSpec(
+        uid=_uid(), status="running", sessions=8, rewards=[0.0, 1.0] * 4,
+        infrastructure_failures=[1] * 3 + [0] * 5,
+    )
+    refiller = FakeRefiller("train", global_steps=0, sessions=8, rewards=[0.0, 1.0] * 4)
+    drain_started = threading.Event()
+
+    def bounded_refill(count):
+        pending = len(rb.pending_keys["train"]) + len(rb.running_keys["train"])
+        assert pending + count <= 3
+        return refiller(count)
+
+    rb = _make_rb(
+        filter_groups_metric="acc", refill_fn=bounded_refill, expected_rollout_n=8, train_batch_size=3,
+    )
+    rb.trainer_config = {"rollout_data_dir": str(tmp_path)}
+    original_wait = rb._wait_for_next_poll
+
+    def wait(*args):
+        if len(rb.finished_keys["train"]) >= 3:
+            drain_started.set()
+        return original_wait(*args)
+
+    monkeypatch.setattr(rb, "_wait_for_next_poll", wait)
+    consumer = SampleConsumer(rb, "train", batch_size=3)
+    try:
+        _produce("train", [bad, uniform, slow]).join_and_check()
+        consumer.start()
+        assert drain_started.wait(timeout=10)
+        assert refiller.calls == [2, 1]
+        assert consumer.is_alive()
+        _set_prompt_status("train", slow.uid, "finished", global_steps=0)
+        batch = consumer.result_or_raise()
+        assert _uids_of(batch.keys) == set(refiller.produced_uids)
+        assert refiller.calls == [2, 1]
+        assert consumer.metrics["training/infrastructure_group_filter/discarded_groups"] == 2
+        assert consumer.metrics["training/infrastructure_group_filter/refilled_groups"] == 1
+        assert consumer.metrics["training/filter_groups/evicted_samples"] == 1
+    finally:
+        if consumer.is_alive():
+            _set_prompt_status("train", slow.uid, "finished", global_steps=0)
+            consumer.join(timeout=2)
+        _clear_partition("train")
 
 
 def test_terminal_eviction_reasons_has_no_cross_call_hidden_state(tq_init, partition_id):
