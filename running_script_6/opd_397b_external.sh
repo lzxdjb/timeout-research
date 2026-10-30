@@ -117,8 +117,9 @@ export SWE_AGENT_ROLLOUT_CLAIM_RETRY_TIMEOUT_SECONDS="${SWE_AGENT_ROLLOUT_CLAIM_
 
 # Keep the baseline tool prompt/observations and conservative tool-failure
 # penalty. Disable other auxiliary objectives, including inherited shell flags.
-export SWE_AGENT_EFFICIENCY_PROFILE=1
-export SWE_AGENT_TOOL_COMMAND_FEEDBACK_ENABLED=1
+export SWE_AGENT_TOOL_CONFIG_PATH="$SWE_SOURCE/recipe/swe_agent/config/tool_config_claude_like.yaml"
+export SWE_AGENT_EFFICIENCY_PROFILE=0
+export SWE_AGENT_TOOL_COMMAND_FEEDBACK_ENABLED=0
 export SWE_AGENT_TOOL_COMMAND_DIAGNOSTICS_ENABLED=1
 # Pure OPD skips hidden evaluation by default; opt-in task rewards reuse GRPO.
 # Validate before launching workers, including inherited skip flags.
