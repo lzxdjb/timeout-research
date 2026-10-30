@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -272,6 +273,8 @@ class DistillationConfig(BaseConfig):
 
     enabled (bool):
         Whether on-policy distillation is enabled.
+    skip_hidden_reward (bool):
+        Skip terminal SWE hidden tests during pure OPD training; validation is unchanged.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -308,6 +311,10 @@ class DistillationConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
 
     enabled: bool = False
+    skip_hidden_reward: bool = False
+    cancel_pending_on_cutoff: bool = False
+    phase_timing: bool = False
+    cutoff_cleanup_timeout_s: float = 120.0
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
@@ -320,6 +327,15 @@ class DistillationConfig(BaseConfig):
         return any(teacher.backend == "managed" for teacher in self.teacher_models.values())
 
     def __post_init__(self):
+        if self.skip_hidden_reward and (not self.enabled or self.distillation_loss.use_task_rewards):
+            raise ValueError("skip_hidden_reward requires enabled distillation with use_task_rewards=False")
+        if self.cancel_pending_on_cutoff:
+            if not self.enabled:
+                raise ValueError("cancel_pending_on_cutoff requires enabled distillation")
+            if not math.isfinite(self.cutoff_cleanup_timeout_s) or self.cutoff_cleanup_timeout_s <= 0:
+                raise ValueError("distillation.cutoff_cleanup_timeout_s must be positive and finite")
+        if self.phase_timing and not self.enabled:
+            raise ValueError("phase_timing requires enabled distillation")
         if not self.enabled:
             return
 

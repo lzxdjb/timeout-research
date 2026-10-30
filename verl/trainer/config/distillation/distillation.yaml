@@ -13,6 +13,18 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
+# Skip terminal SWE hidden-test evaluation during pure OPD training only.
+# Validation still computes task rewards. Requires trainer.use_v1=True.
+skip_hidden_reward: false
+
+# Pure or mixed OPD/V1 training: explicitly cancel remote generation and teacher RPCs
+# for unfinished groups, then await cleanup before materializing the batch.
+cancel_pending_on_cutoff: false
+cutoff_cleanup_timeout_s: 120.0
+
+# Include finished, failed and cancelled work in per-phase timing diagnostics.
+phase_timing: false
+
 # distillation loss config
 distillation_loss:
 

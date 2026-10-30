@@ -22,11 +22,14 @@ import asyncio
 import logging
 import math
 import os
+import time
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import aiohttp
 
 from verl.experimental.teacher_loop.errors import TeacherScoringError
+from verl.utils.async_rpc import PhaseMetrics, RPCCancellationError, await_cancellable_ray_ref
 from verl.workers.config.distillation import ExternalTeacherConfig
 from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import TokenOutput
@@ -77,7 +80,7 @@ class ExternalTeacherScorer:
     exercised without starting Ray. The manager wraps it with ``ray.remote``.
     """
 
-    def __init__(self, config: ExternalTeacherConfig):
+    def __init__(self, config: ExternalTeacherConfig, phase_timing: bool = False):
         config.validate()
         self.config = config
         self._base_url = config.base_url.rstrip("/")
@@ -86,6 +89,30 @@ class ExternalTeacherScorer:
         self._semaphore = asyncio.Semaphore(config.max_concurrent_requests)
         self._session: Optional[aiohttp.ClientSession] = None
         self._unsupported_ids = set(config.unsupported_token_ids)
+        self._phase_timing = phase_timing
+        self._phase_metrics = PhaseMetrics()
+
+    @contextmanager
+    def _timed_phase(self, phase: str):
+        if not self._phase_timing:
+            yield
+            return
+        started = time.perf_counter()
+        outcome = "completed"
+        try:
+            yield
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except BaseException:
+            outcome = "failed"
+            raise
+        finally:
+            self._phase_metrics.record(phase, time.perf_counter() - started, outcome)
+
+    async def pop_opd_phase_metrics(self) -> dict[str, dict[str, float]]:
+        """Return settled phase counters, including cancelled requests, and reset."""
+        return self._phase_metrics.pop()
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -144,6 +171,10 @@ class ExternalTeacherScorer:
         return {"model_name": self.config.model_name, "max_model_len": served_limit}
 
     async def score(self, prompt_ids: list[int], sampling_params: dict[str, Any]) -> dict[str, list]:
+        with self._timed_phase("teacher_score"):
+            return await self._score(prompt_ids, sampling_params)
+
+    async def _score(self, prompt_ids: list[int], sampling_params: dict[str, Any]) -> dict[str, list]:
         if not prompt_ids or any(
             isinstance(token, bool) or not isinstance(token, int) or token < 0 for token in prompt_ids
         ):
@@ -163,8 +194,13 @@ class ExternalTeacherScorer:
             "add_special_tokens": False,
             "return_token_ids": True,
         }
-        async with self._semaphore:
-            result = await self._request("POST", "/completions", payload)
+        with self._timed_phase("teacher_queue"):
+            await self._semaphore.acquire()
+        try:
+            with self._timed_phase("teacher_http"):
+                result = await self._request("POST", "/completions", payload)
+        finally:
+            self._semaphore.release()
         return parse_prompt_logprobs(result, prompt_ids)
 
     async def close(self):
@@ -194,8 +230,12 @@ class ExternalTeacherClient(LLMServerClient):
         try:
             if any(data is not None and len(data) > 0 for data in (image_data, video_data, audio_data)):
                 raise NotImplementedError("External teacher OPD currently supports text-only trajectories.")
-            extra_fields = await self._scoring_handle.score.remote(prompt_ids, sampling_params)
+            scoring_ref = self._scoring_handle.score.remote(prompt_ids, sampling_params)
+            extra_fields = await await_cancellable_ray_ref(scoring_ref)
             return TokenOutput(token_ids=[], extra_fields=extra_fields)
+        except (RPCCancellationError, TeacherScoringError):
+            # Cleanup failures must reach the trainer's fatal-error channel.
+            raise
         except Exception as exc:
             # V1 normally treats agent exceptions as failed rollouts and may
             # refill them. Teacher outages and malformed targets must instead

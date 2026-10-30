@@ -77,6 +77,10 @@ def _launcher_env(target: Path, source: Path, model: Path) -> dict[str, str]:
     env.pop("SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD", None)
     env.pop("SWE_AGENT_ROLLOUT_TRAINING_RESPONSE_LENGTH", None)
     env.pop("SWE_AGENT_ROLLOUT_VALIDATION_RESPONSE_LENGTH", None)
+    env.pop("SWE_AGENT_TRAINING_SKIP_HIDDEN_REWARD", None)
+    env.pop("SWE_AGENT_OPD_CANCEL_ON_CUTOFF", None)
+    env.pop("SWE_AGENT_OPD_PHASE_TIMING", None)
+    env.pop("SWE_AGENT_OPD_CUTOFF_CLEANUP_TIMEOUT_SECONDS", None)
     env.update(
         {
             "TARGET_VERL": str(target),
@@ -109,7 +113,47 @@ def test_launcher_exports_granular_timeout_defaults_and_accepts_commit_prefix(tm
 
     for name, expected in TIMEOUT_DEFAULTS.items():
         assert exported[name] == expected
+    assert exported["SWE_AGENT_TRAINING_SKIP_HIDDEN_REWARD"] == "0"
+    assert exported["SWE_AGENT_OPD_CANCEL_ON_CUTOFF"] == "0"
+    assert exported["SWE_AGENT_OPD_PHASE_TIMING"] == "0"
+    assert exported["SWE_AGENT_OPD_CUTOFF_CLEANUP_TIMEOUT_SECONDS"] == "120"
     assert f"({revision}, recipe=clean)" in result.stdout
+
+
+def test_launcher_maps_skip_hidden_reward_to_distillation_config(tmp_path: Path) -> None:
+    target, source, model, _revision = _create_fake_checkouts(tmp_path)
+    example = target / "examples" / "grpo_trainer" / "run_qwen3_5_35b_megatron.sh"
+    example.write_text('#!/usr/bin/env bash\nprintf "config:%s\\n" "$@"\n/usr/bin/env\n', encoding="utf-8")
+    env = _launcher_env(target, source, model)
+    env["SWE_AGENT_TRAINING_SKIP_HIDDEN_REWARD"] = "1"
+
+    result = subprocess.run([str(LAUNCHER)], env=env, check=True, text=True, capture_output=True)
+
+    assert "config:distillation.skip_hidden_reward=1" in result.stdout.splitlines()
+    assert _exported_environment(result.stdout)["SWE_AGENT_TRAINING_SKIP_HIDDEN_REWARD"] == "1"
+
+
+def test_launcher_maps_opd_cutoff_and_timing_options_to_distillation_config(tmp_path: Path) -> None:
+    target, source, model, _revision = _create_fake_checkouts(tmp_path)
+    example = target / "examples" / "grpo_trainer" / "run_qwen3_5_35b_megatron.sh"
+    example.write_text('#!/usr/bin/env bash\nprintf "config:%s\\n" "$@"\n/usr/bin/env\n', encoding="utf-8")
+    env = _launcher_env(target, source, model)
+    env.update(
+        SWE_AGENT_OPD_CANCEL_ON_CUTOFF="1",
+        SWE_AGENT_OPD_PHASE_TIMING="1",
+        SWE_AGENT_OPD_CUTOFF_CLEANUP_TIMEOUT_SECONDS="45",
+    )
+
+    result = subprocess.run([str(LAUNCHER)], env=env, check=True, text=True, capture_output=True)
+
+    lines = result.stdout.splitlines()
+    assert "config:distillation.cancel_pending_on_cutoff=1" in lines
+    assert "config:distillation.phase_timing=1" in lines
+    assert "config:distillation.cutoff_cleanup_timeout_s=45" in lines
+    exported = _exported_environment(result.stdout)
+    assert exported["SWE_AGENT_OPD_CANCEL_ON_CUTOFF"] == "1"
+    assert exported["SWE_AGENT_OPD_PHASE_TIMING"] == "1"
+    assert exported["SWE_AGENT_OPD_CUTOFF_CLEANUP_TIMEOUT_SECONDS"] == "45"
 
 
 def test_launcher_preserves_explicit_timeout_overrides(tmp_path: Path) -> None:

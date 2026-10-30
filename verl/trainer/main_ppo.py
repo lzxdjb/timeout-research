@@ -40,7 +40,16 @@ def run_ppo(config, task_runner_class) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    from verl.trainer.distillation.config_utils import (
+        opd_cancel_on_cutoff,
+        opd_phase_timing_enabled,
+        should_skip_hidden_reward,
+    )
     from verl.trainer.ppo.v1.repeat_judge_queue import validate_deferred_config
+
+    should_skip_hidden_reward(config)
+    opd_cancel_on_cutoff(config)
+    opd_phase_timing_enabled(config)
     validate_deferred_config(config)
 
     if config.actor_rollout_ref.actor.get("tool_repeat_penalty_enabled", False):

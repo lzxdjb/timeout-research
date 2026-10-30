@@ -28,6 +28,7 @@ from verl.experimental.teacher_loop.external_teacher import (
     ExternalTeacherScorer,
     parse_prompt_logprobs,
 )
+from verl.utils.async_rpc import RPCCancellationError, rollout_request_scope
 from verl.workers.config.distillation import (
     DistillationConfig,
     DistillationLossConfig,
@@ -197,7 +198,8 @@ def test_http_exact_ids_retries_and_shared_concurrency():
                 max_model_len=16,
                 max_concurrent_requests=2,
                 retry_backoff_s=0,
-            )
+            ),
+            phase_timing=True,
         )
         try:
             assert (await scorer.validate_connection())["model_name"] == "teacher"
@@ -209,6 +211,13 @@ def test_http_exact_ids_retries_and_shared_concurrency():
             assert all(payload["prompt"] == [[20, 100, 200]] for payload in received)
             assert all(payload["add_special_tokens"] is False and payload["return_token_ids"] for payload in received)
             assert all(payload["max_tokens"] == 1 and payload["prompt_logprobs"] == 0 for payload in received)
+            metrics = await scorer.pop_opd_phase_metrics()
+            # The transient retry is part of one HTTP scoring phase. The
+            # startup connection check does not contaminate rollout counters.
+            for phase in ("teacher_queue", "teacher_http", "teacher_score"):
+                assert metrics[phase]["count"] == 5
+                assert metrics[phase]["completed_count"] == 5
+                assert metrics[phase]["failed_count"] == metrics[phase]["cancelled_count"] == 0
         finally:
             await scorer.close()
             await runner.cleanup()
@@ -272,5 +281,229 @@ def test_client_returns_existing_token_output_and_marks_scoring_errors_fatal():
             await client.generate("test", prompt_ids=[20, 100], sampling_params={})
         with pytest.raises(TeacherScoringError, match="text-only"):
             await client.generate("test", prompt_ids=[20, 100], sampling_params={}, audio_data=[b"audio"])
+
+    asyncio.run(run())
+
+
+def test_phase_timing_records_cancelled_queue_without_starting_http():
+    async def run():
+        scorer = ExternalTeacherScorer(_external(max_concurrent_requests=1), phase_timing=True)
+        http_entered = asyncio.Event()
+        release_http = asyncio.Event()
+
+        async def request(*_args):
+            http_entered.set()
+            await release_http.wait()
+            return _payload([20, 100])
+
+        scorer._request = AsyncMock(side_effect=request)
+        active = asyncio.create_task(scorer.score([20, 100], {}))
+        await http_entered.wait()
+        queued = asyncio.create_task(scorer.score([20, 100], {}))
+        await asyncio.sleep(0)
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        release_http.set()
+        await active
+        assert scorer._request.await_count == 1
+        metrics = await scorer.pop_opd_phase_metrics()
+        assert metrics["teacher_score"]["count"] == 2
+        assert metrics["teacher_score"]["completed_count"] == 1
+        assert metrics["teacher_score"]["cancelled_count"] == 1
+        assert metrics["teacher_queue"]["count"] == 2
+        assert metrics["teacher_queue"]["cancelled_count"] == 1
+        assert metrics["teacher_http"]["count"] == 1
+        assert metrics["teacher_http"]["completed_count"] == 1
+        assert metrics["teacher_queue"]["seconds_sum"] > 0
+        assert await scorer.pop_opd_phase_metrics() == {}
+
+    asyncio.run(run())
+
+
+def test_cancelled_active_score_releases_capacity_and_actor_is_reusable():
+    async def run():
+        scorer = ExternalTeacherScorer(_external(max_concurrent_requests=1), phase_timing=True)
+        http_entered = asyncio.Event()
+        active_http = 0
+
+        async def request(*_args):
+            nonlocal active_http
+            active_http += 1
+            try:
+                http_entered.set()
+                await asyncio.Event().wait()
+            finally:
+                active_http -= 1
+
+        scorer._request = AsyncMock(side_effect=request)
+        active = asyncio.create_task(scorer.score([20, 100], {}))
+        await http_entered.wait()
+        active.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+        assert active_http == 0
+        scorer._request = AsyncMock(return_value=_payload([20, 100]))
+        result = await asyncio.wait_for(scorer.score([20, 100], {}), timeout=1)
+        assert result["prompt_ids"] == [[100], [0]]
+        metrics = await scorer.pop_opd_phase_metrics()
+        for phase in ("teacher_http", "teacher_score"):
+            assert metrics[phase]["count"] == 2
+            assert metrics[phase]["cancelled_count"] == 1
+            assert metrics[phase]["completed_count"] == 1
+            assert metrics[phase]["failed_count"] == 0
+
+    asyncio.run(run())
+
+
+def test_real_http_cancellation_closes_response_without_retry_and_next_score_succeeds():
+    async def run():
+        entered, disconnected = asyncio.Event(), asyncio.Event()
+        calls = 0
+
+        async def complete(request):
+            nonlocal calls
+            data = await request.json()
+            calls += 1
+            if calls != 1:
+                return web.json_response(_payload(data["prompt"][0]))
+            response = web.StreamResponse(headers={"Content-Type": "application/json"})
+            await response.prepare(request)
+            await response.write(b"{")
+            entered.set()
+            for _ in range(200):
+                if request.transport is None or request.transport.is_closing():
+                    disconnected.set()
+                    break
+                await asyncio.sleep(0.01)
+            return response
+
+        app = web.Application()
+        app.router.add_post("/v1/completions", complete)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        config = ExternalTeacherConfig(
+            base_url=f"http://127.0.0.1:{port}",
+            model_name="teacher",
+            max_model_len=16,
+            max_concurrent_requests=1,
+            max_retries=2,
+            retry_backoff_s=0,
+        )
+        scorer = ExternalTeacherScorer(config, phase_timing=True)
+        try:
+            active = asyncio.create_task(scorer.score([20, 100], {}))
+            await asyncio.wait_for(entered.wait(), 3)
+            active.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await active
+            await asyncio.wait_for(disconnected.wait(), 3)
+            result = await asyncio.wait_for(scorer.score([20, 100], {}), 3)
+            assert result["prompt_ids"] == [[100], [0]]
+            assert calls == 2  # One cancelled call, one new call; cancellation never retries.
+            metrics = await scorer.pop_opd_phase_metrics()
+            for phase in ("teacher_http", "teacher_score"):
+                assert metrics[phase]["count"] == 2
+                assert metrics[phase]["cancelled_count"] == 1
+                assert metrics[phase]["completed_count"] == 1
+        finally:
+            await scorer.close()
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_phase_timing_failure_preserves_error_and_default_is_disabled():
+    async def run():
+        for enabled in (False, True):
+            scorer = ExternalTeacherScorer(_external(), phase_timing=enabled)
+            scorer._request = AsyncMock(side_effect=RuntimeError("teacher unavailable"))
+            with pytest.raises(RuntimeError, match="teacher unavailable"):
+                await scorer.score([20, 100], {})
+            metrics = await scorer.pop_opd_phase_metrics()
+            if not enabled:
+                assert metrics == {}
+                continue
+            assert metrics["teacher_score"]["failed_count"] == 1
+            assert metrics["teacher_http"]["failed_count"] == 1
+            assert metrics["teacher_queue"]["completed_count"] == 1
+            for phase in metrics.values():
+                assert phase["count"] == sum(
+                    phase[f"{outcome}_count"] for outcome in ("completed", "cancelled", "failed")
+                )
+                assert phase["seconds_sum"] >= phase["seconds_max"] >= 0
+
+    asyncio.run(run())
+
+
+def test_client_propagates_rpc_cleanup_failure_without_reward_fallback(monkeypatch):
+    async def run():
+        async def score(*_args):
+            return {}
+
+        failure = RPCCancellationError("teacher cleanup timed out")
+        await_ref = AsyncMock(side_effect=failure)
+        monkeypatch.setattr("verl.experimental.teacher_loop.external_teacher.await_cancellable_ray_ref", await_ref)
+        client = ExternalTeacherClient(config=None, scoring_handle=SimpleNamespace(score=SimpleNamespace(remote=score)))
+        with pytest.raises(RPCCancellationError) as exc_info:
+            await client.generate("test", prompt_ids=[20, 100], sampling_params={})
+        assert exc_info.value is failure
+        # The mocked awaiter deliberately never consumes the coroutine.
+        await_ref.call_args.args[0].close()
+
+    asyncio.run(run())
+
+
+def test_client_cutoff_cancels_actor_score_and_settles_metrics_before_return(monkeypatch):
+    async def run():
+        scorer = ExternalTeacherScorer(_external(max_concurrent_requests=1), phase_timing=True)
+        entered = asyncio.Event()
+        cleaned = asyncio.Event()
+
+        async def request(*_args):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+
+        scorer._request = AsyncMock(side_effect=request)
+        refs = []
+
+        class Ref:
+            def __init__(self, tokens, params):
+                self.task = asyncio.create_task(scorer.score(tokens, params))
+
+            def __await__(self):
+                return self.task.__await__()
+
+        def score(tokens, params):
+            ref = Ref(tokens, params)
+            refs.append(ref)
+            return ref
+
+        def cancel(ref, *, force):
+            assert not force
+            ref.task.cancel()
+
+        monkeypatch.setattr("verl.utils.async_rpc.ray.cancel", cancel)
+        client = ExternalTeacherClient(config=None, scoring_handle=SimpleNamespace(score=SimpleNamespace(remote=score)))
+        with rollout_request_scope(cancel_on_cutoff=True, cleanup_timeout_s=1):
+            task = asyncio.create_task(client.generate("test", prompt_ids=[20, 100], sampling_params={}))
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert cleaned.is_set()
+        assert refs[0].task.done()
+        metrics = await scorer.pop_opd_phase_metrics()
+        assert metrics["teacher_http"]["cancelled_count"] == 1
+        assert metrics["teacher_score"]["cancelled_count"] == 1
+        scorer._request = AsyncMock(return_value=_payload([20, 100]))
+        output = await asyncio.wait_for(client.generate("next", prompt_ids=[20, 100], sampling_params={}), timeout=1)
+        assert output.extra_fields["prompt_ids"] == [[100], [0]]
 
     asyncio.run(run())

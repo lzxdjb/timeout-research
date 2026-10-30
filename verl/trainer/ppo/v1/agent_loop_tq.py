@@ -35,7 +35,15 @@ from verl.experimental.agent_loop import (
     get_trajectory_info,
 )
 from verl.experimental.teacher_loop.errors import TeacherScoringError
+from verl.trainer.distillation.config_utils import (
+    opd_cancel_on_cutoff,
+    opd_cleanup_timeout_s,
+    opd_phase_timing_enabled,
+    should_skip_hidden_reward,
+)
 from verl.trainer.ppo.v1.repeat_judge_queue import RepeatQueueError, progress_interval_seconds
+from verl.trainer.ppo.v1.utils import hidden_reward_was_skipped
+from verl.utils.async_rpc import RPCCancellationError
 from verl.utils.ray_utils import auto_await
 from verl.utils.swe_cutoff_debug import cutoff_debug_enabled, reconcile_cutoff_sessions, write_cutoff_debug_event
 from verl.utils.swe_validation import positive_seconds, strict_validation_enabled
@@ -70,6 +78,25 @@ async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseExce
     return [result for result in results if isinstance(result, BaseException)]
 
 
+def _summarize_opd_phase_metrics(snapshots: list[dict]) -> dict[str, float]:
+    """Reduce actor-local snapshots without dropping cancelled/discarded work."""
+    phases: dict[str, dict[str, float]] = {}
+    for snapshot in snapshots:
+        for phase, values in snapshot.items():
+            merged = phases.setdefault(phase, {})
+            for name, value in values.items():
+                merged[name] = (
+                    max(merged.get(name, 0.0), value) if name == "seconds_max" else merged.get(name, 0.0) + value
+                )
+    metrics = {}
+    for phase, values in phases.items():
+        prefix = f"opd_phase/{phase}"
+        for name, value in values.items():
+            metrics[f"{prefix}/{'seconds_total' if name == 'seconds_sum' else name}"] = float(value)
+        metrics[f"{prefix}/seconds_mean"] = values.get("seconds_sum", 0.0) / max(values.get("count", 0), 1)
+    return metrics
+
+
 def _infrastructure_failure_from_extra_fields(extra_fields) -> bool:
     """Read the SWE infrastructure marker from either supported metadata layout."""
     extra_fields = extra_fields if isinstance(extra_fields, dict) else {}
@@ -100,6 +127,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         self.dapo_cutoff_enabled = bool(
             self.config.get("algorithm", {}).get("filter_groups", {}).get("cutoff_when_full", False)
         )
+        self.opd_cutoff_enabled = opd_cancel_on_cutoff(self.config)
         self.dapo_publications = {}
         self.repeat_generation_sessions = {}
         self.repeat_debug = _repeat_debug_enabled()
@@ -281,13 +309,33 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             )
 
     async def _await_tq_publication(self, partition_id: str, uid: str, operation):
-        if partition_id != "train" or not self.dapo_cutoff_enabled:
+        if partition_id != "train" or not (
+            self.dapo_cutoff_enabled or getattr(self, "opd_cutoff_enabled", False)
+        ):
             return await operation
         # Cancelling a local await does not stop a TransferQueue RPC already sent
         # to Ray. Shield and retain that operation until the cutoff cleanup barrier.
         task = asyncio.create_task(operation)
         self.dapo_publications.setdefault((partition_id, str(uid)), []).append(task)
         return await asyncio.shield(task)
+
+    async def _settle_opd_publications(self, partition_id: str, uid: str) -> None:
+        """An OPD cancellation acknowledgement is also a queue-write barrier."""
+        if partition_id != "train" or not getattr(self, "opd_cutoff_enabled", False):
+            return
+        tasks = self.dapo_publications.get((partition_id, str(uid)), [])
+        if not tasks:
+            return
+        settlement = asyncio.ensure_future(_settle_session_tasks(tasks))
+        try:
+            errors = await asyncio.wait_for(asyncio.shield(settlement), timeout=opd_cleanup_timeout_s(self.config))
+        except asyncio.TimeoutError as error:
+            # Keep observing dispatched writes, but never acknowledge an unsafe
+            # cutoff or allow the trainer to proceed after the deadline.
+            settlement.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+            raise RPCCancellationError("OPD TransferQueue publication cleanup exceeded its deadline") from error
+        if errors:
+            raise RPCCancellationError("OPD TransferQueue publication cleanup failed") from errors[0]
 
     async def _put_prompt_tag(self, *, key, partition_id, tag):
         return await self._await_tq_publication(
@@ -362,7 +410,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         for task in tasks_by_uid.values():
             task.cancel()
         if tasks_by_uid:
-            await asyncio.gather(*tasks_by_uid.values(), return_exceptions=True)
+            results = await asyncio.gather(*tasks_by_uid.values(), return_exceptions=True)
+            if getattr(self, "opd_cutoff_enabled", False) and not validate:
+                for result in results:
+                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                        raise RPCCancellationError("OPD rollout cancellation cleanup failed") from result
 
         # Preserve trajectories that were published before cancellation. They are valid
         # partial rollouts for completion-ratio reward prediction; groups with no
@@ -495,6 +547,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             teacher_error = next((error for error in session_errors if isinstance(error, TeacherScoringError)), None)
             if teacher_error is not None:
                 raise teacher_error
+            cleanup_error = next((error for error in session_errors if isinstance(error, RPCCancellationError)), None)
+            if cleanup_error is not None:
+                raise cleanup_error
+            await self._settle_opd_publications(partition_id, str(uid))
             if self.repeat_coordinator is not None:
                 await self._put_prompt_tag(key=uid, partition_id=partition_id,
                                       tag={"status": "reward_pending", "generation_complete": True})
@@ -521,6 +577,18 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             for task in tasks:
                 task.cancel()
             cleanup_errors = await _settle_session_tasks(tasks) if tasks else []
+
+            if getattr(self, "opd_cutoff_enabled", False) and partition_id == "train":
+                cleanup_error = next(
+                    (error for error in cleanup_errors
+                     if isinstance(error, (TeacherScoringError, RPCCancellationError))),
+                    None,
+                )
+                if cleanup_error is not None:
+                    raise RPCCancellationError("OPD generation/teacher session cleanup failed") from cleanup_error
+                # Settle writes that raced cancellation before inspecting or
+                # marking partial output. No teacher-pending group is protected.
+                await self._settle_opd_publications(partition_id, str(uid))
 
             if (partition_id, str(uid)) in self.dapo_cutoff_uids:
                 cleanup_error = next(
@@ -586,12 +654,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # Reuse the existing fatal postprocessing-error channel. A missing
             # teacher target must stop training rather than silently refill the
             # prompt with an easier or shorter trajectory.
-            status = "reward_error" if isinstance(e, (RepeatQueueError, TeacherScoringError)) else "failure"
+            status = "reward_error" if isinstance(
+                e, (RepeatQueueError, TeacherScoringError, RPCCancellationError)
+            ) else "failure"
             if session_state is not None:
                 session_state["terminal_status"] = status
             tag = {"status": status}
             if isinstance(e, TeacherScoringError):
                 tag["teacher_error"] = str(e)[:1000]
+            elif isinstance(e, RPCCancellationError):
+                tag["teacher_error"] = "OPD cancellation cleanup failed: " + str(e)[:1000]
             elif status == "reward_error":
                 tag["repeat_error"] = str(e)[:1000]
             await self._put_prompt_tag(key=uid, partition_id=partition_id, tag=tag)
@@ -604,6 +676,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 errors = await _settle_session_tasks(self.dapo_publications.get((partition_id, str(uid)), []))
                 if errors:
                     raise RuntimeError("DAPO TransferQueue publication cleanup failed") from errors[0]
+            await self._settle_opd_publications(partition_id, str(uid))
             if session_state is not None and session_state.get("cancel_reason") is None:
                 self._record_cutoff_group_census(
                     partition_id, str(uid), session_state,
@@ -705,7 +778,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         postprocess_started = time.monotonic()
         self._repeat_debug_event("postprocess_entered", partition_id, str(uid), session=session_id)
         outputs = output if isinstance(output, list) else [output]
-        if outputs and self.repeat_coordinator is not None and not outputs[-1].extra_fields.get("_swe_repeat_finalized"):
+        if (outputs and self.repeat_coordinator is not None
+                and not outputs[-1].extra_fields.get("_swe_repeat_finalized")):
             expected, completed = self.repeat_generation_sessions[(partition_id, str(uid))]
             completed.add(session_id)
             if len(completed) == expected:
@@ -739,7 +813,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
 
-        await self._compute_score(outputs, kwargs=kwargs)
+        if should_skip_hidden_reward(self.config, validate=validate):
+            # The SWE loop must have skipped the evaluator itself. Never fall
+            # back to a reward worker if an outdated agent omitted the marker.
+            if any(not hidden_reward_was_skipped(o.extra_fields) or o.reward_score != 0.0 for o in outputs):
+                raise RuntimeError(
+                    "skip_hidden_reward requires SWE outputs marked hidden_reward_skipped with a zero "
+                    "transport placeholder; update the SWE source checkout"
+                )
+        else:
+            await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]
         # TODO: Support output:list[AgentLoopOutput]
@@ -878,7 +961,9 @@ class AgentLoopManagerTQ(AgentLoopManager):
         """Create agent loop manager."""
         instance = cls(*args, **kwargs)
         from verl.trainer.ppo.v1.repeat_judge_queue import (
-            RepeatJudgeCoordinatorActor, deferred_enabled, validate_deferred_config,
+            RepeatJudgeCoordinatorActor,
+            deferred_enabled,
+            validate_deferred_config,
         )
         instance.repeat_coordinator = None
         if deferred_enabled():
@@ -919,6 +1004,28 @@ class AgentLoopManagerTQ(AgentLoopManager):
         else:
             ray.get(refs)
 
+    def pop_opd_phase_metrics(self) -> dict[str, float]:
+        """Collect interval counters from workers and the shared scoring actors.
+
+        Collect after sampling and cutoff cleanup, independently of selected
+        trajectory rows. Thus cancelled requests and infrastructure refills also
+        contribute. Async training reports work settled since the last snapshot.
+        """
+        if not opd_phase_timing_enabled(self.config):
+            return {}
+        refs = [worker.pop_opd_phase_metrics.remote() for worker in self.agent_loop_workers]
+        for client in (self.teacher_client or {}).values():
+            handle = getattr(client, "_scoring_handle", None)
+            if handle is not None:
+                refs.append(handle.pop_opd_phase_metrics.remote())
+        try:
+            snapshots = ray.get(refs, timeout=opd_cleanup_timeout_s(self.config))
+        except ray.exceptions.GetTimeoutError as error:
+            raise RuntimeError("OPD phase timing snapshot exceeded its deadline") from error
+        metrics = _summarize_opd_phase_metrics(snapshots)
+        logger.info("OPD phase timings (concurrent seconds; includes cancelled/failed work): %s", metrics)
+        return metrics
+
     def cancel_sequences(
         self, uids: list[str], validate: bool = False, *, dapo_cutoff: bool = False,
         cleanup_timeout_seconds: float = 300.0,
@@ -942,11 +1049,15 @@ class AgentLoopManagerTQ(AgentLoopManager):
                            if validate and strict_validation_enabled() else None)
         if dapo_cutoff:
             cleanup_timeout = cleanup_timeout_seconds
+        opd_cutoff = opd_cancel_on_cutoff(getattr(self, "config", None), validate=validate)
+        if opd_cutoff:
+            cleanup_timeout = opd_cleanup_timeout_s(self.config)
+        cutoff_name = "OPD" if opd_cutoff else "DAPO" if dapo_cutoff else "Validation"
         while pending:
             remaining = cleanup_timeout - (time.monotonic() - started) if cleanup_timeout else interval
             if remaining <= 0:
                 raise RuntimeError(
-                    f"{'DAPO' if dapo_cutoff else 'Validation'} cancellation was not acknowledged "
+                    f"{cutoff_name} cancellation was not acknowledged "
                     "within the cleanup deadline; refusing to resume training while workers may still publish"
                 )
             done, pending = ray.wait(pending, num_returns=1, timeout=min(interval, remaining))

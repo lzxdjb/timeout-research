@@ -31,6 +31,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -49,6 +50,17 @@ from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation.config_utils import (
+    opd_cancel_on_cutoff,
+    opd_cleanup_timeout_s,
+    opd_phase_timing_enabled,
+)
+from verl.utils.async_rpc import (
+    PhaseMetrics,
+    raise_if_rpc_cleanup_failed,
+    record_rpc_phase,
+    rollout_request_scope,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
@@ -515,6 +527,7 @@ class AgentLoopWorker:
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self._opd_phase_metrics = PhaseMetrics()
 
         rollout_config, model_config = config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
@@ -577,6 +590,10 @@ class AgentLoopWorker:
             if sampling_rate is not None:
                 mm_processor_kwargs["sampling_rate"] = int(sampling_rate)
         return mm_processor_kwargs
+
+    async def pop_opd_phase_metrics(self) -> dict:
+        """Return actor-local phase totals, including cancelled trajectories."""
+        return self._opd_phase_metrics.pop()
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -708,8 +725,27 @@ class AgentLoopWorker:
             # without adding a private field to every dataset row.
             runtime_kwargs = dict(kwargs)
             runtime_kwargs["_agent_loop_validate"] = bool(trajectory.get("validate", False))
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **runtime_kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            validate = bool(trajectory.get("validate", False))
+            recorder = (
+                self._opd_phase_metrics.record if opd_phase_timing_enabled(self.config, validate=validate) else None
+            )
+            with rollout_request_scope(
+                cancel_on_cutoff=opd_cancel_on_cutoff(self.config, validate=validate),
+                cleanup_timeout_s=opd_cleanup_timeout_s(self.config),
+                record_phase=recorder,
+            ):
+                started = time.monotonic()
+                outcome = "failed"
+                try:
+                    output: AgentLoopOutput = await agent_loop.run(sampling_params, **runtime_kwargs)
+                    raise_if_rpc_cleanup_failed()
+                    outcome = "completed"
+                except asyncio.CancelledError:
+                    outcome = "cancelled"
+                    raise
+                finally:
+                    record_rpc_phase("agent_loop", time.monotonic() - started, outcome)
+                return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
         self,
@@ -1076,12 +1112,21 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                sequence_ids=prompt_ids + response_ids,
-                multi_modal_data=output.multi_modal_data,
-                mm_processor_kwargs=output.mm_processor_kwargs,
-                routing_key=routing_key,
-            )
+            started = time.monotonic()
+            outcome = "failed"
+            try:
+                teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+                    sequence_ids=prompt_ids + response_ids,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                    routing_key=routing_key,
+                )
+                outcome = "completed"
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
+            finally:
+                record_rpc_phase("teacher_target", time.monotonic() - started, outcome)
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 

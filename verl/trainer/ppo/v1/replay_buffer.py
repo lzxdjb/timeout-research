@@ -59,7 +59,8 @@ def rollout_diagnostics(extra) -> dict:
     exact.update({"hidden_verifier_staging_ok", "hidden_verifier_setup_ok", "hidden_failure_phase_code",
                   "hidden_reward_seconds", "hidden_tests_seconds", "hidden_patch_check_seconds", "hidden_patch_valid",
                   "verification_invalidated", "submission_after_fresh_verification", "diagnostic_outcome_code",
-                  "hidden_pass", "verification_attempted", "verification_passed", "verification_meaningful",
+                  "hidden_pass", "hidden_reward_skipped", "hidden_reward_scored", "hidden_reward_status",
+                  "reward_placeholder", "verification_attempted", "verification_passed", "verification_meaningful",
                   "verification_meaningful_reason", "system_prompt_sha256"})
     prefixes = ("edit_diagnostics_", "command_evidence_", "trajectory_", "partial_hidden_reward_", "repeat_reward_", "tool_repeat_", "thinking_repeat_", "observed_infrastructure_failure",
                 "private_evaluator_", "hidden_test_count", "hidden_test_commands_", "hidden_tests_total_", "hidden_tests_passed_",

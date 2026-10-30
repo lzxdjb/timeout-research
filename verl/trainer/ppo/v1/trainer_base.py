@@ -50,7 +50,12 @@ from verl.single_controller.ray import (
     create_colocated_worker_cls,
 )
 from verl.trainer.distillation import is_distillation_enabled
-from verl.trainer.distillation.config_utils import is_pure_distillation, requires_teacher_resource_pool
+from verl.trainer.distillation.config_utils import (
+    is_pure_distillation,
+    opd_phase_timing_enabled,
+    requires_teacher_resource_pool,
+    should_skip_hidden_reward,
+)
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.audio_benchmark import run_audio_benchmarks
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -104,6 +109,7 @@ from verl.trainer.ppo.v1.utils import (
     compute_v1_success_ratio_metrics,
     compute_v1_trajectory_debug_metrics,
     flatten_v1_extra_fields,
+    hidden_reward_was_skipped,
     v1_success_values,
     validation_reward_metadata,
 )
@@ -855,11 +861,16 @@ class PPOTrainer(ABC):
                 logger.info("Repeat trainer sample_end partition=train global_step=%s selected=%d seconds=%.3f",
                             self.global_steps, len(batch.keys), time.monotonic() - sample_started)
             metrics.update(off_policy_metrics)
+            if opd_phase_timing_enabled(self.config):
+                metrics.update(self.agent_loop_manager.pop_opd_phase_metrics())
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
-        if self.reward_loop_manager.reward_loop_worker_handles is None:
+        if (
+            self.reward_loop_manager.reward_loop_worker_handles is None
+            and not should_skip_hidden_reward(self.config)
+        ):
             with marked_timer("reward", timing_raw, color="yellow"):
                 batch = self._compute_reward_colocate(batch, metrics=metrics)
 
@@ -1841,9 +1852,12 @@ class PPOTrainer(ABC):
             inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
             outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
             scores = data["rm_scores"].sum(dim=1).tolist()
-            successes = v1_success_values(
-                extra_fields.tolist() if extra_fields is not None else [{} for _ in scores], scores
-            )
+            rollout_extra = extra_fields.tolist() if extra_fields is not None else [{} for _ in scores]
+            successes = v1_success_values(rollout_extra, scores)
+            scores = [
+                None if hidden_reward_was_skipped(extra) else score
+                for extra, score in zip(rollout_extra, scores, strict=True)
+            ]
 
             reward_model = data.pop("reward_model", None)
             if reward_model is not None:
@@ -2795,21 +2809,27 @@ class PPOTrainer(ABC):
             data, is_metrics = compute_rollout_correction_and_add_to_batch(data, rollout_corr_config)
             metrics.update(is_metrics)
 
-        # 3. compute advantages
-        data = compute_advantage_for_multi_trajectories(
-            data,
-            batch_keys=batch.keys,
-            adv_estimator=self.config.algorithm.adv_estimator,
-            gamma=self.config.algorithm.gamma,
-            lam=self.config.algorithm.lam,
-            num_repeat=self.config.actor_rollout_ref.rollout.n,
-            norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
-            config=self.config.algorithm,
-        )
-        metrics.update(data.meta_info.get("grpo_metrics", {}))
+        # 3. Pure OPD can omit hidden evaluation entirely. Keep the queue's
+        # shared actor schema neutral while preserving masks and local penalties.
+        if should_skip_hidden_reward(self.config):
+            data.batch["advantages"] = torch.zeros_like(data.batch["token_level_rewards"])
+            data.batch["returns"] = torch.zeros_like(data.batch["token_level_rewards"])
+            metrics["distillation/task_advantage_skipped"] = 1.0
+        else:
+            data = compute_advantage_for_multi_trajectories(
+                data,
+                batch_keys=batch.keys,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                config=self.config.algorithm,
+            )
+            metrics.update(data.meta_info.get("grpo_metrics", {}))
 
-        # Apply only after GRPO's session-level scalar broadcasting. Keep the
-        # terminal task reward intact, including valid missing-submission -0.1.
+        # Apply after any task-advantage broadcasting. The OPD branch still
+        # needs verified local cost spans, activity masks, and normalizers.
         if local_penalty_enabled:
             from verl.utils.swe_tool_failure import gate_positive_credit, trajectory_normalizer
 
@@ -3227,7 +3247,19 @@ class PPOTrainer(ABC):
                 accumulator=self._rollout_moe_lb_metrics_accumulator,
             )
         )
-        metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+        data_metrics = compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic)
+        skip_hidden_reward = bool(should_skip_hidden_reward(self.config))
+        if skip_hidden_reward:
+            # Zero reward/advantage tensors satisfy the shared queue schema;
+            # they carry no observed hidden-test outcome or PPO signal.
+            data_metrics = {
+                key: value
+                for key, value in data_metrics.items()
+                if not key.startswith(("critic/", "training/partial_reward/"))
+            }
+            metrics["training/hidden_reward_scored"] = 0.0
+            metrics["training/hidden_reward_skipped"] = 1.0
+        metrics.update(data_metrics)
         try:
             mask_values = tq.kv_batch_get(
                 keys=rollout_batch.keys,
@@ -3246,26 +3278,35 @@ class PPOTrainer(ABC):
                 response_tokens=response_length.tolist(),
                 train_mask=mask_values,
                 expected_rollout_count=int(self.config.actor_rollout_ref.rollout.n),
-                include_grpo_groups=self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO,
+                include_grpo_groups=(
+                    not skip_hidden_reward and self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO
+                ),
             )
         )
-        metrics.update(
-            compute_v1_success_ratio_metrics(
-                batch_keys=rollout_batch.keys,
-                batch_tags=rollout_batch.tags,
-                success_values=success_values,
-                prefix="training",
-                unverified_threshold=unverified_trajectory_ratio_threshold("train"),
-                infrastructure_failure_ratio_threshold=infrastructure_failure_ratio_threshold("train"),
-                expected_rollout_count=int(self.config.actor_rollout_ref.rollout.n),
-                metric_sources=metric_sources,
+        if skip_hidden_reward:
+            for label in ("success", "failure"):
+                for key in list(metrics):
+                    if key.startswith(f"trajectory_debug/{label}/"):
+                        metrics.pop(key)
+        else:
+            metrics.update(
+                compute_v1_success_ratio_metrics(
+                    batch_keys=rollout_batch.keys,
+                    batch_tags=rollout_batch.tags,
+                    success_values=success_values,
+                    prefix="training",
+                    unverified_threshold=unverified_trajectory_ratio_threshold("train"),
+                    infrastructure_failure_ratio_threshold=infrastructure_failure_ratio_threshold("train"),
+                    expected_rollout_count=int(self.config.actor_rollout_ref.rollout.n),
+                    metric_sources=metric_sources,
+                )
             )
-        )
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self._get_n_gpus_for_throughput()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
         gradient_norm = metrics.get("actor/grad_norm", None)
-        metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
+        if not skip_hidden_reward:
+            metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
 
         # 3. other auxiliary metrics
         if non_padding_mask.any():

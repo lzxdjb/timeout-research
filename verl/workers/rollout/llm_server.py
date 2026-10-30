@@ -21,6 +21,7 @@ Utility classes for manage and request LLM servers:
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -31,6 +32,7 @@ from omegaconf import DictConfig
 
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import normalize_token_ids
+from verl.utils.async_rpc import await_cancellable_ray_ref, record_rpc_phase
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tracking import RLInsightLogger
@@ -220,7 +222,11 @@ class LLMServerClient:
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
-        server_id, handle = await self._load_balancer.acquire_server.remote(request_id=request_id)
+        server_id, handle = await await_cancellable_ray_ref(
+            self._load_balancer.acquire_server.remote(request_id=request_id),
+            cancel_remote=False,
+            on_cancel_result=lambda result: self._release_server(result[0]),
+        )
         return server_id, handle
 
     def _release_server(self, server_id: str) -> None:
@@ -259,8 +265,11 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        server_id, server = await self._acquire_server(request_id)
+        started = time.monotonic()
+        outcome = "failed"
+        server_id = None
         try:
+            server_id, server = await self._acquire_server(request_id)
             multimodal_kwargs = {}
             if audio_data is not None:
                 multimodal_kwargs["audio_data"] = audio_data
@@ -271,22 +280,30 @@ class LLMServerClient:
             priority_kwargs = (
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
-            output: TokenOutput = await server.generate.remote(
-                request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=image_data,
-                video_data=video_data,
-                **multimodal_kwargs,
-                **priority_kwargs,
-                **kwargs,
+            output: TokenOutput = await await_cancellable_ray_ref(
+                server.generate.remote(
+                    request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    image_data=image_data,
+                    video_data=video_data,
+                    **multimodal_kwargs,
+                    **priority_kwargs,
+                    **kwargs,
+                )
             )
             global_steps = output.extra_fields.get("global_steps")
             output.extra_fields.setdefault("min_global_steps", global_steps)
             output.extra_fields.setdefault("max_global_steps", global_steps)
+            outcome = "completed"
             return output
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
         finally:
-            self._release_server(server_id)
+            if server_id is not None:
+                self._release_server(server_id)
+            record_rpc_phase("student_rpc", time.monotonic() - started, outcome)
 
 
 class FullyAsyncLLMServerClient(LLMServerClient):

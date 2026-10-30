@@ -53,6 +53,16 @@ def _optional_finite_float(value: Any) -> float | None:
     return numeric if np.isfinite(numeric) else None
 
 
+def hidden_reward_was_skipped(extra: Any) -> bool:
+    """Distinguish an intentional OPD placeholder from a measured task score."""
+    extra = getattr(extra, "data", extra)
+    if not isinstance(extra, dict):
+        return False
+    reward_info = extra.get("reward_extra_info", {})
+    reward_info = reward_info if isinstance(reward_info, dict) else {}
+    return extra.get("hidden_reward_skipped", reward_info.get("hidden_reward_skipped", 0)) in (1, True)
+
+
 def v1_success_values(extra_fields: list[Any], fallback_scores: list[Any]) -> list[float | None]:
     """Use V1's validation-core success convention for trajectory metrics.
 
@@ -74,11 +84,16 @@ def v1_success_values(extra_fields: list[Any], fallback_scores: list[Any]) -> li
         reward_info = extra.get("reward_extra_info", {})
         reward_info = reward_info if isinstance(reward_info, dict) else {}
         has_accuracy = has_accuracy or "acc" in reward_info
-        accuracy_values.append(_optional_finite_float(reward_info.get("acc")))
+        accuracy_values.append(
+            None if hidden_reward_was_skipped(extra) else _optional_finite_float(reward_info.get("acc"))
+        )
 
     if has_accuracy:
         return accuracy_values
-    return [_optional_finite_float(score) for score in fallback_scores]
+    return [
+        None if hidden_reward_was_skipped(extra) else _optional_finite_float(score)
+        for extra, score in zip(extra_fields, fallback_scores, strict=True)
+    ]
 
 
 def validation_reward_metadata(extra: Any) -> dict[str, Any]:
@@ -189,8 +204,30 @@ def compute_v1_trajectory_debug_metrics(
             value = extra["reward_extra_info"].get(name)
         return _optional_finite_float(value)
 
+    # Count sessions, rather than intermediate outputs or padded duplicates.
+    # Missing markers remain unknown; a neutral transport score proves no test.
+    coverage_marked = any(
+        hidden_reward_was_skipped(extra_fields[row]) or field(row, "hidden_reward_scored") in (0.0, 1.0)
+        for row in rows
+    )
+    if coverage_marked:
+        skipped_count = sum(hidden_reward_was_skipped(extra_fields[row]) for row in rows)
+        scored_count = sum(
+            not hidden_reward_was_skipped(extra_fields[row]) and field(row, "hidden_reward_scored") == 1.0
+            for row in rows
+        )
+        for label, count in (
+            ("skipped", skipped_count),
+            ("scored", scored_count),
+            ("unknown", len(rows) - skipped_count - scored_count),
+        ):
+            metrics[f"trajectory_debug/hidden_reward_{label}_count"] = float(count)
+            metrics[f"trajectory_debug/hidden_reward_{label}_fraction"] = count / len(rows) if rows else 0.0
+
     # A positive shaped/partial reward is not proof that the task was solved.
     def solved(row: int) -> bool | None:
+        if hidden_reward_was_skipped(extra_fields[row]):
+            return None
         value = field(row, "raw_score")
         if value is None:
             value = _optional_finite_float(success_values[row])
@@ -452,6 +489,8 @@ class MetricsAggregator:
 
     def _get_metric_weight(self, metric_name: str, metrics: dict[str, Any], sample_count: int) -> int:
         """Return the sample weight used when reducing per-iteration average metrics."""
+        if metric_name.startswith("opd_phase/") and metric_name.endswith("/seconds_mean"):
+            return int(metrics.get(f"{metric_name.rsplit('/', 1)[0]}/count", 0))
         if metric_name.startswith("trajectory_debug/") and metric_name.endswith("_mean"):
             label = metric_name.split("/", 2)[1]
             return int(
@@ -484,6 +523,10 @@ class MetricsAggregator:
         return sample_count
 
     def _get_aggregation_type(self, metric_name: str) -> str:
+        if metric_name.startswith("opd_phase/") and (
+            metric_name.endswith("/count") or metric_name.endswith("_count")
+        ):
+            return "sum"
         if metric_name.startswith("grpo/") and metric_name.endswith("_groups"):
             return "sum"
         if metric_name.startswith("trajectory_debug/") and (
@@ -491,7 +534,7 @@ class MetricsAggregator:
             or metric_name.endswith("_groups")
             or metric_name.endswith("_sessions")
             or metric_name.endswith("_total")
-            or metric_name.endswith("_eligible_count")
+            or metric_name.endswith("_count")
         ):
             return "sum"
         for agg_type, metric_list in self.aggregation_rules.items():
@@ -552,6 +595,16 @@ class MetricsAggregator:
             aggregated["trajectory_debug/trainable_token_fraction"] = (
                 aggregated.get("trajectory_debug/trainable_response_tokens_total", 0.0) / total if total else 0.0
             )
+        if "trajectory_debug/hidden_reward_skipped_count" in aggregated:
+            sessions = aggregated.get("trajectory_debug/final_sessions", 0.0)
+            scored = aggregated.get("trajectory_debug/hidden_reward_scored_count", 0.0)
+            skipped = aggregated["trajectory_debug/hidden_reward_skipped_count"]
+            # Sessions from older workers may omit coverage markers entirely.
+            aggregated["trajectory_debug/hidden_reward_unknown_count"] = max(0.0, sessions - skipped - scored)
+            for label in ("skipped", "scored", "unknown"):
+                aggregated[f"trajectory_debug/hidden_reward_{label}_fraction"] = (
+                    aggregated[f"trajectory_debug/hidden_reward_{label}_count"] / sessions if sessions else 0.0
+                )
         if {"global_seqlen/minmax_diff", "global_seqlen/max", "global_seqlen/min"}.issubset(aggregated):
             aggregated["global_seqlen/minmax_diff"] = aggregated["global_seqlen/max"] - aggregated["global_seqlen/min"]
 

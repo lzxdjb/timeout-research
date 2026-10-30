@@ -95,6 +95,10 @@ def test_teacher_failure_is_published_as_fatal_postprocessing_error(monkeypatch)
     )
     worker.repeat_coordinator = None
     worker.repeat_finalizers = {}
+    worker.repeat_job_refs = {}
+    worker.dapo_cutoff_uids = set()
+    worker.dapo_cutoff_enabled = False
+    worker.dapo_publications = {}
     worker.repeat_generation_sessions = {}
     worker.repeat_debug_prompts = {}
     worker.repeat_debug = False

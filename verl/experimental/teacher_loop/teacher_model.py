@@ -215,7 +215,14 @@ class MultiTeacherModelManager:
 
             from verl.experimental.teacher_loop.external_teacher import ExternalTeacherScorer
 
-            handle = ray.remote(ExternalTeacherScorer).options(num_cpus=0).remote(teacher_model_config.external)
+            handle = (
+                ray.remote(ExternalTeacherScorer)
+                .options(num_cpus=0)
+                .remote(
+                    teacher_model_config.external,
+                    phase_timing=getattr(self.distillation_config, "phase_timing", False),
+                )
+            )
             # Detect model-alias and context mistakes before student rollouts consume resources.
             ray.get(handle.validate_connection.remote())
             self.external_scoring_handles[key] = handle
