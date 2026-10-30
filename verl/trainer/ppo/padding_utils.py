@@ -274,6 +274,13 @@ def construct_minimal_padding_template(
         template_sample["routed_experts"] = routed_experts
     else:
         template_sample.pop("routed_experts", None)
+    for key in ("teacher_logprobs", "teacher_ids"):
+        teacher_tensor = template_sample.get(key)
+        if isinstance(teacher_tensor, torch.Tensor):
+            # OPD converts full-sequence targets before applying the loss mask.
+            # Synthetic rows need aligned, finite placeholders instead of the
+            # real trajectory's targets, including for top-k distillation.
+            template_sample[key] = teacher_tensor.new_zeros((input_ids.size(0), *teacher_tensor.shape[1:]))
 
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
     template_tag.update(
