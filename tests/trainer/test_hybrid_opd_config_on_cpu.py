@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf
 
-from verl.trainer.distillation.config_utils import opd_cancel_on_cutoff, should_skip_hidden_reward
+from verl.trainer.distillation.config_utils import (
+    opd_cancel_on_cutoff,
+    opd_wait_for_scoring_on_cutoff,
+    should_skip_hidden_reward,
+)
 from verl.workers.config.distillation import (
     DistillationConfig,
     DistillationLossConfig,
@@ -64,6 +68,42 @@ def test_hybrid_dataclass_keeps_external_teacher_without_gpu_pool():
     assert not config.skip_hidden_reward
     assert not config.has_managed_teachers
     assert config.n_gpus_per_node == config.nnodes == 0
+    assert not config.wait_for_scoring_on_cutoff
+
+
+@pytest.mark.parametrize("convert", [dict, OmegaConf.create, _namespace])
+@pytest.mark.parametrize("task_rewards", [False, True])
+def test_scoring_drain_is_explicit_and_training_only(convert, task_rewards):
+    raw = {
+        "trainer": {"use_v1": True},
+        "distillation": {
+            "enabled": True,
+            "cancel_pending_on_cutoff": True,
+            "distillation_loss": {"use_task_rewards": task_rewards},
+        },
+    }
+    assert not opd_wait_for_scoring_on_cutoff(convert(raw))
+    raw["distillation"]["wait_for_scoring_on_cutoff"] = True
+    assert opd_wait_for_scoring_on_cutoff(convert(raw))
+    assert not opd_wait_for_scoring_on_cutoff(convert(raw), validate=True)
+    raw["distillation"]["cancel_pending_on_cutoff"] = False
+    with pytest.raises(ValueError, match="requires cancel_pending_on_cutoff"):
+        opd_wait_for_scoring_on_cutoff(convert(raw))
+
+
+def test_scoring_drain_dataclass_round_trip_and_dependencies():
+    config = _hybrid_config(wait_for_scoring_on_cutoff=True)
+    assert config.wait_for_scoring_on_cutoff
+    with pytest.raises(ValueError, match="requires cancel_pending_on_cutoff"):
+        DistillationConfig(wait_for_scoring_on_cutoff=True)
+    with pytest.raises(ValueError, match="requires enabled distillation"):
+        opd_wait_for_scoring_on_cutoff(
+            {"distillation": {"wait_for_scoring_on_cutoff": True, "cancel_pending_on_cutoff": True}}
+        )
+    with pytest.raises(ValueError, match="trainer.use_v1"):
+        opd_wait_for_scoring_on_cutoff(
+            {"distillation": {"enabled": True, "wait_for_scoring_on_cutoff": True, "cancel_pending_on_cutoff": True}}
+        )
 
 
 def test_hybrid_still_rejects_skip_hidden_reward():

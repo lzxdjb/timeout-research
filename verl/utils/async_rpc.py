@@ -17,6 +17,40 @@ class RPCCancellationError(RuntimeError):
     """A cancelled rollout could not establish that remote work had settled."""
 
 
+@dataclass
+class GenerationCutoffState:
+    """Worker-local phase shared with one session, including its child tasks."""
+
+    scoring_started: bool = False
+    cutoff_requested: bool = False
+
+
+_generation_cutoff: ContextVar[GenerationCutoffState | None] = ContextVar("generation_cutoff", default=None)
+
+
+@contextmanager
+def generation_cutoff_scope(state: GenerationCutoffState | None):
+    token = _generation_cutoff.set(state)
+    try:
+        yield
+    finally:
+        _generation_cutoff.reset(token)
+
+
+def mark_scoring_started() -> None:
+    """Protect the whole scoring pipeline before its first await.
+
+    Cutoff selection and this transition run on the same worker event loop.
+    A session already selected for cancellation must not start scoring, even
+    if custom agent code swallowed the original CancelledError.
+    """
+    state = _generation_cutoff.get()
+    if state is not None:
+        if state.cutoff_requested:
+            raise asyncio.CancelledError
+        state.scoring_started = True
+
+
 class PhaseMetrics:
     """Small actor-local accumulator; snapshots preserve cancelled work too."""
 

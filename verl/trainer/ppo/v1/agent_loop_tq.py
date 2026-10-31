@@ -39,11 +39,12 @@ from verl.trainer.distillation.config_utils import (
     opd_cancel_on_cutoff,
     opd_cleanup_timeout_s,
     opd_phase_timing_enabled,
+    opd_wait_for_scoring_on_cutoff,
     should_skip_hidden_reward,
 )
 from verl.trainer.ppo.v1.repeat_judge_queue import RepeatQueueError, progress_interval_seconds
 from verl.trainer.ppo.v1.utils import hidden_reward_was_skipped
-from verl.utils.async_rpc import RPCCancellationError
+from verl.utils.async_rpc import GenerationCutoffState, RPCCancellationError, generation_cutoff_scope
 from verl.utils.ray_utils import auto_await
 from verl.utils.swe_cutoff_debug import cutoff_debug_enabled, reconcile_cutoff_sessions, write_cutoff_debug_event
 from verl.utils.swe_validation import positive_seconds, strict_validation_enabled
@@ -128,6 +129,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             self.config.get("algorithm", {}).get("filter_groups", {}).get("cutoff_when_full", False)
         )
         self.opd_cutoff_enabled = opd_cancel_on_cutoff(self.config)
+        self.opd_scoring_sessions: dict[tuple[str, str], list[tuple[asyncio.Task, GenerationCutoffState]]] = {}
         self.dapo_publications = {}
         self.repeat_generation_sessions = {}
         self.repeat_debug = _repeat_debug_enabled()
@@ -407,8 +409,30 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 state["cancel_reason"] = "completion_ratio_cutoff"
                 state["cutoff_requested_at"] = time.time()
                 cutoff_states[uid] = state
-        for task in tasks_by_uid.values():
-            task.cancel()
+        drain_scoring = opd_wait_for_scoring_on_cutoff(getattr(self, "config", None), validate=validate)
+        for uid, task in tasks_by_uid.items():
+            sessions = getattr(self, "opd_scoring_sessions", {}).get((partition_id, str(uid)))
+            if drain_scoring and sessions is not None:
+                # Do not cancel the parent gather: that would propagate into
+                # hidden evaluation and queued/running teacher requests.
+                # Phase transition and selection have no await between them.
+                cancelled_sessions = 0
+                draining_sessions = 0
+                for session_task, state in sessions:
+                    if session_task.done():
+                        continue
+                    if state.scoring_started:
+                        draining_sessions += 1
+                    else:
+                        state.cutoff_requested = True
+                        session_task.cancel()
+                        cancelled_sessions += 1
+                logger.info("OPD generation cutoff uid=%s cancelled_sessions=%d draining_scoring_sessions=%d",
+                            uid, cancelled_sessions, draining_sessions)
+            else:
+                # Includes prompts not yet started/registered; no scoring can
+                # exist before registration on this worker's event loop.
+                task.cancel()
         if tasks_by_uid:
             results = await asyncio.gather(*tasks_by_uid.values(), return_exceptions=True)
             if getattr(self, "opd_cutoff_enabled", False) and not validate:
@@ -479,6 +503,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
         do_sample = prompt.pop("__do_sample__", True)
         state_key = (partition_id, str(uid))
+        drain_scoring = opd_wait_for_scoring_on_cutoff(self.config, validate=trajectory["validate"])
+        scoring_sessions = [] if drain_scoring else None
+        scoring_controls = [GenerationCutoffState() for _ in range(n)] if drain_scoring else None
         session_state = self.cutoff_session_states.get(state_key) if cutoff_debug_enabled() else None
         if cutoff_debug_enabled() and session_state is None:
             session_state = {
@@ -508,15 +535,17 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 if session_state is not None:
                     session_state["started"].add(session_id)
                 try:
-                    result = await self._run_agent_loop(
-                        run_sampling_params,
-                        trajectory=trajectory,
-                        trace=trace,
-                        session_id=session_id,
-                        **({"_swe_cutoff_context": session_state} if session_state is not None else {}),
-                        **({"_swe_repeat_deferred_supported": True} if self.repeat_coordinator is not None else {}),
-                        **prompt,
-                    )
+                    control = scoring_controls[session_id] if scoring_controls is not None else None
+                    with generation_cutoff_scope(control):
+                        result = await self._run_agent_loop(
+                            run_sampling_params,
+                            trajectory=trajectory,
+                            trace=trace,
+                            session_id=session_id,
+                            **({"_swe_cutoff_context": session_state} if session_state is not None else {}),
+                            **({"_swe_repeat_deferred_supported": True} if self.repeat_coordinator is not None else {}),
+                            **prompt,
+                        )
                 except asyncio.CancelledError:
                     if session_state is not None:
                         session_state["cancelled"].add(session_id)
@@ -531,9 +560,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     return result
 
             tasks = []
+            if scoring_sessions is not None:
+                if not hasattr(self, "opd_scoring_sessions"):
+                    self.opd_scoring_sessions = {}
+                self.opd_scoring_sessions[state_key] = scoring_sessions
             for i in range(n):
                 task = asyncio.create_task(run_session(i))
                 tasks.append(task)
+                if scoring_sessions is not None:
+                    scoring_sessions.append((task, scoring_controls[i]))
 
             # Publish a terminal status only after every session settles, so no sibling can write after
             # ReplayBuffer clears a failed group.
@@ -550,6 +585,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             cleanup_error = next((error for error in session_errors if isinstance(error, RPCCancellationError)), None)
             if cleanup_error is not None:
                 raise cleanup_error
+            if scoring_sessions is not None and any(state.cutoff_requested for _, state in scoring_sessions):
+                # All retained scoring has settled. Reuse the existing partial
+                # group/publication path without changing sample eligibility.
+                raise asyncio.CancelledError
             await self._settle_opd_publications(partition_id, str(uid))
             if self.repeat_coordinator is not None:
                 await self._put_prompt_tag(key=uid, partition_id=partition_id,
@@ -690,6 +729,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             self.dapo_publications.pop((partition_id, str(uid)), None)
             self.repeat_generation_sessions.pop((partition_id, str(uid)), None)
             self.cutoff_session_states.pop((partition_id, str(uid)), None)
+            getattr(self, "opd_scoring_sessions", {}).pop(state_key, None)
 
     @staticmethod
     def _record_cutoff_group_census(
@@ -1052,6 +1092,11 @@ class AgentLoopManagerTQ(AgentLoopManager):
         opd_cutoff = opd_cancel_on_cutoff(getattr(self, "config", None), validate=validate)
         if opd_cutoff:
             cleanup_timeout = opd_cleanup_timeout_s(self.config)
+        if opd_wait_for_scoring_on_cutoff(getattr(self, "config", None), validate=validate) and not dapo_cutoff:
+            # Hidden evaluation and teacher queue/HTTP requests retain their
+            # own timeouts. The RPC cancellation helper still bounds generation
+            # acknowledgement; scoring/publication are normal work, not cleanup.
+            cleanup_timeout = None
         cutoff_name = "OPD" if opd_cutoff else "DAPO" if dapo_cutoff else "Validation"
         while pending:
             remaining = cleanup_timeout - (time.monotonic() - started) if cleanup_timeout else interval

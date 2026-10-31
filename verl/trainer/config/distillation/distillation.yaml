@@ -22,6 +22,11 @@ skip_hidden_reward: false
 cancel_pending_on_cutoff: false
 cutoff_cleanup_timeout_s: 120.0
 
+# With explicit OPD cutoff, cancel generation only and drain the complete
+# scoring/publication pipeline. Normal scoring is outside the cleanup deadline.
+# SWE release failures become warnings with tracked background cleanup retries.
+wait_for_scoring_on_cutoff: false
+
 # Include finished, failed and cancelled work in per-phase timing diagnostics.
 phase_timing: false
 

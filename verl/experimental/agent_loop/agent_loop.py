@@ -57,6 +57,7 @@ from verl.trainer.distillation.config_utils import (
 )
 from verl.utils.async_rpc import (
     PhaseMetrics,
+    mark_scoring_started,
     raise_if_rpc_cleanup_failed,
     record_rpc_phase,
     rollout_request_scope,
@@ -739,6 +740,9 @@ class AgentLoopWorker:
                 try:
                     output: AgentLoopOutput = await agent_loop.run(sampling_params, **runtime_kwargs)
                     raise_if_rpc_cleanup_failed()
+                    # SWE marks this before its hidden evaluator. Other loops
+                    # protect scoring/postprocessing once generation returns.
+                    mark_scoring_started()
                     outcome = "completed"
                 except asyncio.CancelledError:
                     outcome = "cancelled"

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf
 
+from verl.experimental.teacher_loop.errors import TeacherScoringError
 from verl.trainer.distillation.config_utils import (
     opd_cancel_on_cutoff,
     opd_cleanup_timeout_s,
@@ -13,7 +14,7 @@ from verl.trainer.distillation.config_utils import (
 )
 from verl.trainer.ppo.v1 import agent_loop_tq as module
 from verl.trainer.ppo.v1.utils import MetricsAggregator
-from verl.utils.async_rpc import RPCCancellationError
+from verl.utils.async_rpc import RPCCancellationError, mark_scoring_started
 
 Worker = module.AgentLoopWorkerTQ.__ray_metadata__.modified_class
 
@@ -152,6 +153,158 @@ def test_cutoff_ack_waits_for_dispatched_publication(monkeypatch, publication_fa
 
 
 @pytest.mark.parametrize("task_rewards", [False, True])
+@pytest.mark.parametrize("scoring_phase", ["teacher_queue", "teacher_http", "hidden_then_teacher"])
+def test_generation_only_cutoff_drains_scoring_pipeline(monkeypatch, task_rewards, scoring_phase):
+    worker, snapshot = _worker(monkeypatch, task_rewards=task_rewards)
+    worker.config.distillation.wait_for_scoring_on_cutoff = True
+
+    async def run():
+        scoring_started = asyncio.Event()
+        generation_started = asyncio.Event()
+        generation_cancelled = asyncio.Event()
+        scoring_finished = asyncio.Event()
+        release_first_phase = asyncio.Event()
+        teacher_started = asyncio.Event()
+        release_teacher = asyncio.Event()
+
+        async def session(_params, *, session_id, **_kwargs):
+            if session_id == 0:
+                generation_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    generation_cancelled.set()
+                return
+            # The marker protects both queued work and phases that have not
+            # started yet, including teacher scoring after hidden evaluation.
+            mark_scoring_started()
+            scoring_started.set()
+            await release_first_phase.wait()
+            if scoring_phase == "hidden_then_teacher":
+                teacher_started.set()
+                await release_teacher.wait()
+            snapshot["train"]["g_1_0"] = {"status": "success"}
+            scoring_finished.set()
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "g"}, {}, {"validate": False}))
+        worker.prompt_tasks["train"]["g"] = prompt
+        await asyncio.wait_for(scoring_started.wait(), 1)
+        await asyncio.wait_for(generation_started.wait(), 1)
+        cutoff = asyncio.create_task(worker.cancel_sequences(["g"]))
+        await asyncio.wait_for(generation_cancelled.wait(), 1)
+        assert not cutoff.done()
+        assert not scoring_finished.is_set()
+        release_first_phase.set()
+        if scoring_phase == "hidden_then_teacher":
+            await asyncio.wait_for(teacher_started.wait(), 1)
+            assert not cutoff.done()
+            assert not scoring_finished.is_set()
+            release_teacher.set()
+        assert await asyncio.wait_for(cutoff, 1) == 1
+        assert scoring_finished.is_set()
+        assert prompt.cancelled()
+        assert not worker.opd_scoring_sessions
+
+    asyncio.run(run())
+    assert snapshot["train"]["g"]["completion_ratio_cutoff"]
+    assert snapshot["train"]["g_1_0"]["completion_ratio_cutoff"]
+
+
+@pytest.mark.parametrize("task_rewards", [False, True])
+def test_generation_only_cutoff_retains_group_when_all_sessions_are_scoring(monkeypatch, task_rewards):
+    worker, snapshot = _worker(monkeypatch, task_rewards=task_rewards)
+    worker.config.distillation.wait_for_scoring_on_cutoff = True
+
+    async def run():
+        started = [asyncio.Event(), asyncio.Event()]
+        finish = asyncio.Event()
+
+        async def session(_params, *, session_id, **_kwargs):
+            mark_scoring_started()
+            started[session_id].set()
+            await finish.wait()
+            snapshot["train"][f"g_{session_id}_0"] = {"status": "success"}
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "g"}, {}, {"validate": False}))
+        worker.prompt_tasks["train"]["g"] = prompt
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 1)
+        cutoff = asyncio.create_task(worker.cancel_sequences(["g"]))
+        await asyncio.sleep(0)
+        assert not cutoff.done()
+        finish.set()
+        assert await asyncio.wait_for(cutoff, 1) == 1
+        assert not prompt.cancelled()
+        assert not worker.opd_scoring_sessions
+
+    asyncio.run(run())
+    assert snapshot["train"]["g"]["status"] == "finished"
+    assert not snapshot["train"]["g"].get("completion_ratio_cutoff")
+    assert not snapshot["train"]["g_0_0"].get("completion_ratio_cutoff")
+    assert not snapshot["train"]["g_1_0"].get("completion_ratio_cutoff")
+
+
+def test_generation_selected_for_cutoff_cannot_start_scoring_after_swallowing_cancel(monkeypatch):
+    worker, snapshot = _worker(monkeypatch)
+    worker.config.distillation.wait_for_scoring_on_cutoff = True
+
+    async def run():
+        started = [asyncio.Event(), asyncio.Event()]
+        scoring_started = []
+
+        async def session(_params, *, session_id, **_kwargs):
+            started[session_id].set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pass
+            mark_scoring_started()
+            scoring_started.append(session_id)
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "g"}, {}, {"validate": False}))
+        worker.prompt_tasks["train"]["g"] = prompt
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 1)
+        assert await asyncio.wait_for(worker.cancel_sequences(["g"]), 1) == 1
+        assert scoring_started == []
+        assert prompt.cancelled()
+
+    asyncio.run(run())
+    assert snapshot["train"]["g"]["completion_ratio_cutoff"]
+
+
+def test_scoring_drain_preserves_teacher_failure_channel(monkeypatch):
+    worker, snapshot = _worker(monkeypatch)
+    worker.config.distillation.wait_for_scoring_on_cutoff = True
+
+    async def run():
+        started = [asyncio.Event(), asyncio.Event()]
+        finish = asyncio.Event()
+
+        async def session(_params, *, session_id, **_kwargs):
+            mark_scoring_started()
+            started[session_id].set()
+            await finish.wait()
+            if session_id == 0:
+                raise TeacherScoringError("malformed teacher target")
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "g"}, {}, {"validate": False}))
+        worker.prompt_tasks["train"]["g"] = prompt
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 1)
+        cutoff = asyncio.create_task(worker.cancel_sequences(["g"]))
+        await asyncio.sleep(0)
+        finish.set()
+        assert await asyncio.wait_for(cutoff, 1) == 1
+
+    asyncio.run(run())
+    assert snapshot["train"]["g"]["status"] == "reward_error"
+    assert "malformed teacher target" in snapshot["train"]["g"]["teacher_error"]
+    assert not snapshot["train"]["g"].get("completion_ratio_cutoff")
+
+
+@pytest.mark.parametrize("task_rewards", [False, True])
 def test_opd_manager_has_bounded_cleanup_deadline(monkeypatch, task_rewards):
     manager = object.__new__(module.AgentLoopManagerTQ)
     manager.config = _config(distillation_loss={"use_task_rewards": task_rewards})
@@ -169,6 +322,25 @@ def test_opd_manager_has_bounded_cleanup_deadline(monkeypatch, task_rewards):
     with pytest.raises(RuntimeError, match="OPD cancellation.*cleanup deadline"):
         manager.cancel_sequences(["g"])
     assert tick[0] == 1
+
+
+def test_scoring_drain_can_exceed_cancellation_cleanup_deadline(monkeypatch):
+    manager = object.__new__(module.AgentLoopManagerTQ)
+    manager.config = _config(wait_for_scoring_on_cutoff=True)
+    manager.agent_loop_workers = [SimpleNamespace(cancel_sequences=SimpleNamespace(remote=lambda *a, **k: "worker"))]
+    manager.repeat_coordinator = None
+    tick = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: tick[0])
+    monkeypatch.setattr(module, "progress_interval_seconds", lambda: 2.0)
+
+    def wait(refs, *, timeout, **_kwargs):
+        tick[0] += timeout
+        return ([], refs) if tick[0] < 6 else (refs, [])
+
+    monkeypatch.setattr(module.ray, "wait", wait)
+    monkeypatch.setattr(module.ray, "get", lambda refs: [1 for _ in refs])
+    assert manager.cancel_sequences(["g"]) == 1
+    assert tick[0] == 6
 
 
 def test_snapshot_merging_and_iteration_aggregation_count_cancelled_work():

@@ -162,6 +162,9 @@ export SWE_AGENT_OPD_USE_TASK_REWARDS SWE_AGENT_TRAINING_SKIP_HIDDEN_REWARD SWE_
 unset opd_loss_settings
 # Cancel unfinished group RPCs at cutoff and account for cancelled work in timings.
 export SWE_AGENT_OPD_CANCEL_ON_CUTOFF="${SWE_AGENT_OPD_CANCEL_ON_CUTOFF:-1}"
+# Opt in to generation-only cutoff and best-effort SWE release cleanup.
+# Completed generations drain hidden evaluation and queued/running teacher scoring.
+export SWE_AGENT_OPD_CUTOFF_WAIT_FOR_SCORING="${SWE_AGENT_OPD_CUTOFF_WAIT_FOR_SCORING:-0}"
 export SWE_AGENT_OPD_PHASE_TIMING="${SWE_AGENT_OPD_PHASE_TIMING:-1}"
 export SWE_AGENT_OPD_CUTOFF_CLEANUP_TIMEOUT_SECONDS="${SWE_AGENT_OPD_CUTOFF_CLEANUP_TIMEOUT_SECONDS:-120}"
 export SWE_AGENT_TRAINING_TOOL_FAILURE_PENALTY_ENABLED=1

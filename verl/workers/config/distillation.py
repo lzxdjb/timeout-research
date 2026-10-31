@@ -313,6 +313,7 @@ class DistillationConfig(BaseConfig):
     enabled: bool = False
     skip_hidden_reward: bool = False
     cancel_pending_on_cutoff: bool = False
+    wait_for_scoring_on_cutoff: bool = False
     phase_timing: bool = False
     cutoff_cleanup_timeout_s: float = 120.0
     n_gpus_per_node: int = 0
@@ -327,6 +328,8 @@ class DistillationConfig(BaseConfig):
         return any(teacher.backend == "managed" for teacher in self.teacher_models.values())
 
     def __post_init__(self):
+        if self.wait_for_scoring_on_cutoff and not self.cancel_pending_on_cutoff:
+            raise ValueError("wait_for_scoring_on_cutoff requires cancel_pending_on_cutoff=True")
         if self.skip_hidden_reward and (not self.enabled or self.distillation_loss.use_task_rewards):
             raise ValueError("skip_hidden_reward requires enabled distillation with use_task_rewards=False")
         if self.cancel_pending_on_cutoff:

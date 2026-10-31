@@ -68,6 +68,16 @@ def opd_cancel_on_cutoff(config, validate: bool = False) -> bool:
     return not validate
 
 
+def opd_wait_for_scoring_on_cutoff(config, validate: bool = False) -> bool:
+    """Opt-in generation-only cutoff; completed candidates drain their scoring."""
+    distillation = _config_get(config, "distillation", {})
+    if not _config_get(distillation, "wait_for_scoring_on_cutoff", False):
+        return False
+    if not _config_get(distillation, "cancel_pending_on_cutoff", False):
+        raise ValueError("wait_for_scoring_on_cutoff requires cancel_pending_on_cutoff=True")
+    return opd_cancel_on_cutoff(config, validate=validate)
+
+
 def opd_phase_timing_enabled(config, validate: bool = False) -> bool:
     """Phase timing is independent of cutoff and never records validation work."""
     distillation = _config_get(config, "distillation", {})

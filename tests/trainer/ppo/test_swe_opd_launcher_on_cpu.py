@@ -44,6 +44,7 @@ def _stub_launch(tmp_path: Path, **overrides: str) -> subprocess.CompletedProces
         "SWE_AGENT_TRAINING_PARTIAL_HIDDEN_TEST_REWARD",
         "SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD",
         "SWE_AGENT_OPD_CANCEL_ON_CUTOFF",
+        "SWE_AGENT_OPD_CUTOFF_WAIT_FOR_SCORING",
         "SWE_AGENT_OPD_PHASE_TIMING",
         "SWE_AGENT_OPD_CUTOFF_CLEANUP_TIMEOUT_SECONDS",
     ):
@@ -88,6 +89,7 @@ def test_opd_launcher_uses_external_teacher_and_clears_inherited_objectives(tmp_
     assert env["VERL_GRPO_GOLDEN_REPLAY_ENABLED"] == "0"
     assert env["SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD"] == "0.95"
     assert env["SWE_AGENT_OPD_CANCEL_ON_CUTOFF"] == "1"
+    assert env["SWE_AGENT_OPD_CUTOFF_WAIT_FOR_SCORING"] == "0"
     assert env["SWE_AGENT_OPD_PHASE_TIMING"] == "1"
     assert env["SWE_AGENT_OPD_CUTOFF_CLEANUP_TIMEOUT_SECONDS"] == "120"
     assert env["SWE_AGENT_ROLLOUT_TRAINING_UNVERIFIED_TRAJECTORY_RATIO_THRESHOLD"] == "0.25"
@@ -153,6 +155,20 @@ def test_opd_launcher_preserves_explicit_cutoff_and_instrumentation_overrides(tm
     for name, expected in overrides.items():
         assert env[name] == expected
     assert env["SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD"] == "0.98"
+
+
+@pytest.mark.parametrize("task_rewards", ["0", "1"])
+def test_scoring_drain_is_opt_in_for_both_opd_objectives(tmp_path: Path, task_rewards: str) -> None:
+    result = _stub_launch(
+        tmp_path,
+        SWE_AGENT_OPD_USE_TASK_REWARDS=task_rewards,
+        SWE_AGENT_OPD_CUTOFF_WAIT_FOR_SCORING="1",
+    )
+    assert result.returncode == 0, result.stderr
+    env = json.loads(result.stdout)["env"]
+    assert env["SWE_AGENT_OPD_CUTOFF_WAIT_FOR_SCORING"] == "1"
+    assert env["SWE_AGENT_OPD_CANCEL_ON_CUTOFF"] == "1"
+    assert env["SWE_AGENT_TRAINING_SKIP_HIDDEN_REWARD"] == ("0" if task_rewards == "1" else "1")
 
 
 @pytest.mark.parametrize("override,expected", [(None, "1"), ("0", "0")])
