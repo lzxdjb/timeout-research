@@ -347,6 +347,7 @@ class ReplayBuffer:
         train_batch_size (int, optional): Prompt count represented by one Sync DAPO in-flight batch.
         gen_batch_size (int, optional): Dataloader fetch granularity for refill dispatches.
         max_inflight_gen_batches (int): Maximum Sync DAPO prompt batches concurrently pending or running.
+        max_inflight_groups (int, optional): Absolute unfinished Sync DAPO group limit, including reward work.
         sync_refill_failed_groups (bool): Whether sync sampling replaces failed groups with no trajectories.
         cancel_fn (callable, optional): UID-scoped rollout cancellation used by completion-ratio cutoff.
     """
@@ -373,6 +374,7 @@ class ReplayBuffer:
         cutoff_cleanup_timeout_seconds: float = 300.0,
         requeue_fn=None,
         release_fn=None,
+        max_inflight_groups: int | None = None,
     ):
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
@@ -385,6 +387,7 @@ class ReplayBuffer:
         self.train_batch_size = train_batch_size
         self.gen_batch_size = gen_batch_size
         self.max_inflight_gen_batches = max_inflight_gen_batches
+        self.max_inflight_groups = max_inflight_groups
         self.sync_refill_failed_groups = sync_refill_failed_groups
         self.cancel_fn = cancel_fn
         self.cutoff_when_full = cutoff_when_full
@@ -772,6 +775,12 @@ class ReplayBuffer:
         if self.filter_groups_metric is not None:
             if not isinstance(self.max_inflight_gen_batches, int) or self.max_inflight_gen_batches <= 0:
                 raise ValueError("max_inflight_gen_batches must be a positive integer")
+            if self.max_inflight_groups is not None and (
+                isinstance(self.max_inflight_groups, bool)
+                or not isinstance(self.max_inflight_groups, int)
+                or self.max_inflight_groups <= 0
+            ):
+                raise ValueError("max_inflight_groups must be a positive integer or None")
         if self.sync_refill_failed_groups and self.gen_batch_size != 1:
             raise ValueError("sync_refill_failed_groups requires gen_batch_size=1")
 
@@ -1421,7 +1430,11 @@ class ReplayBuffer:
         cutoff_requested = False
         reward_only_wait_seconds = 0.0
         if dapo_enabled:
-            max_inflight_prompts = self.max_inflight_gen_batches * self.train_batch_size
+            max_inflight_prompts = (
+                self.max_inflight_groups
+                if self.max_inflight_groups is not None
+                else self.max_inflight_gen_batches * self.train_batch_size
+            )
 
         while True:
             # Eviction, gating, and selection below must all use this snapshot.
@@ -1494,15 +1507,20 @@ class ReplayBuffer:
                 elif not draining:
                     refill_credit += 2 * dapo_count + failed_count
 
-                if not draining and refill_credit > 0:
+                dispatch_budget = refill_credit
+                if self.max_inflight_groups is not None and not draining:
+                    # A window smaller than the training target needs replacement work even
+                    # when every finished group is valid and earns no rejection refill credit.
+                    dispatch_budget = max(dispatch_budget, batch_size - len(sampleable_keys) - inflight_count)
+                if not draining and dispatch_budget > 0:
                     available_slots = max(0, max_inflight_prompts - inflight_count)
-                    dispatch_count = min(refill_credit, available_slots)
+                    dispatch_count = min(dispatch_budget, available_slots)
                     assert self.gen_batch_size is not None
                     dispatch_count -= dispatch_count % self.gen_batch_size
                     if dispatch_count > 0:
                         assert self.refill_fn is not None
                         self.refill_fn(dispatch_count)
-                        refill_credit -= dispatch_count
+                        refill_credit = max(0, refill_credit - dispatch_count)
                         infrastructure_dispatch_count = min(infrastructure_refill_credit, dispatch_count)
                         if infrastructure_dispatch_count:
                             infrastructure_refill_credit -= infrastructure_dispatch_count

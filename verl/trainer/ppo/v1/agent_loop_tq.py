@@ -128,6 +128,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         self.dapo_cutoff_enabled = bool(
             self.config.get("algorithm", {}).get("filter_groups", {}).get("cutoff_when_full", False)
         )
+        self.dapo_scoring_sessions: dict[tuple[str, str], list[tuple[asyncio.Task, GenerationCutoffState]]] = {}
+        self.dapo_cleanup_timeouts: dict[tuple[str, str], float] = {}
         self.opd_cutoff_enabled = opd_cancel_on_cutoff(self.config)
         self.opd_scoring_sessions: dict[tuple[str, str], list[tuple[asyncio.Task, GenerationCutoffState]]] = {}
         self.dapo_publications = {}
@@ -344,54 +346,94 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             partition_id, key, tq.async_kv_put(key=key, partition_id=partition_id, tag=tag)
         )
 
-    async def _cancel_dapo_repeat(self, partition_id: str, uid: str) -> None:
-        """Settle deferred jobs as well as their publication tasks before acknowledging cutoff."""
-        key = (partition_id, uid)
-        refs = self.repeat_job_refs.get(key, [])
-        for ref in refs:
-            if isinstance(ref, ray.ObjectRef):
-                ray.cancel(ref)
-            elif isinstance(ref, asyncio.Future):
-                ref.cancel()
-        finalizers = self.repeat_finalizers.get(key, [])
-        for task in finalizers:
-            task.cancel()
-        if finalizers:
-            await _settle_session_tasks(finalizers)
+    @staticmethod
+    async def _settle_dapo_cleanup(tasks, timeout_seconds: float, phase: str, *, allow_cancelled: bool = False):
+        """Bound cancelled generation and dispatched writes, separately from normal scoring."""
+        if not tasks:
+            return
+        _, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+        if pending:
+            raise RuntimeError(f"DAPO {phase} cleanup exceeded its deadline; refusing to acknowledge cutoff")
+        errors = await _settle_session_tasks(tasks)
+        if allow_cancelled:
+            errors = [error for error in errors if not isinstance(error, asyncio.CancelledError)]
+        if errors:
+            raise RuntimeError(f"DAPO {phase} cleanup failed") from errors[0]
 
-        async def settle_ref(ref):
-            try:
-                await ref
-            except (ray.exceptions.RayError, asyncio.CancelledError):
-                pass  # Cancelled/failed remote jobs cannot publish a retained reward.
-
-        if refs:
-            await asyncio.gather(*(settle_ref(ref) for ref in refs))
-
-    async def _cancel_dapo_sequences(self, uids: list[str]) -> int:
+    async def _cancel_dapo_sequences(self, uids: list[str], cleanup_timeout_seconds: float = 300.0) -> int:
         tasks = {uid: self.prompt_tasks["train"][uid] for uid in uids
                  if uid in self.prompt_tasks["train"] and not self.prompt_tasks["train"][uid].done()}
         keys = {("train", str(uid)) for uid in tasks}
         self.dapo_cutoff_uids.update(keys)
+        self.dapo_cleanup_timeouts.update(dict.fromkeys(keys, cleanup_timeout_seconds))
         try:
-            for task in tasks.values():
-                task.cancel()
-            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            for result in results:
+            generation_tasks = []
+            draining_sessions = 0
+            for uid, task in tasks.items():
+                sessions = self.dapo_scoring_sessions.get(("train", str(uid)))
+                if sessions is None:
+                    # Not yet registered: no generation or scoring can have started.
+                    task.cancel()
+                    generation_tasks.append(task)
+                    continue
+                for session_task, state in sessions:
+                    if session_task.done():
+                        continue
+                    if state.scoring_started:
+                        draining_sessions += 1
+                    else:
+                        state.cutoff_requested = True
+                        session_task.cancel()
+                        generation_tasks.append(session_task)
+            logger.info("DAPO generation cutoff groups=%d cancelled_generation_sessions=%d "
+                        "draining_scoring_sessions=%d",
+                        len(tasks), len(generation_tasks), draining_sessions)
+            # Observe parent exceptions even if generation cleanup times out first.
+            settlement = asyncio.ensure_future(_settle_session_tasks(list(tasks.values())))
+            await self._settle_dapo_cleanup(
+                generation_tasks, cleanup_timeout_seconds, "generation", allow_cancelled=True
+            )
+            # Parent tasks remain alive to finish started hidden rewards, deferred
+            # judging, and publication. Their normal request timeouts still apply.
+            # Watch dispatched writes while parents drain: a blocked publication
+            # can itself hold a repeat finalizer (and therefore its parent) open.
+            while not settlement.done():
+                publications = [publication for key in keys
+                                for publication in self.dapo_publications.get(key, []) if not publication.done()]
+                if publications:
+                    await self._settle_dapo_cleanup(
+                        publications, cleanup_timeout_seconds, "TransferQueue publication"
+                    )
+                else:
+                    await asyncio.wait([settlement], timeout=min(.1, cleanup_timeout_seconds))
+            for result in await settlement:
                 if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
                     raise RuntimeError("DAPO rollout cancellation cleanup failed") from result
-            for uid in tasks:
-                await tq.async_kv_put(key=uid, partition_id="train", tag={"status": "failure", "dapo_cutoff": True})
+            items = (tq.kv_list("train") or {}).get("train", {})
+            reward_errors = [uid for uid in tasks if items.get(uid, {}).get("status") == "reward_error"]
+            if reward_errors:
+                raise RuntimeError(f"DAPO retained reward processing failed for groups: {reward_errors[:5]}")
+            await self._settle_dapo_cleanup(
+                [asyncio.create_task(tq.async_kv_put(
+                    key=uid, partition_id="train", tag={"status": "failure", "dapo_cutoff": True}
+                )) for uid in tasks],
+                cleanup_timeout_seconds, "cutoff tag publication",
+            )
             return len(tasks)
         finally:
             self.dapo_cutoff_uids.difference_update(keys)
+            for key in keys:
+                self.dapo_cleanup_timeouts.pop(key, None)
 
-    async def cancel_sequences(self, uids: list[str], validate: bool = False, *, dapo_cutoff: bool = False) -> int:
+    async def cancel_sequences(
+        self, uids: list[str], validate: bool = False, *, dapo_cutoff: bool = False,
+        cleanup_timeout_seconds: float = 300.0,
+    ) -> int:
         """Cancel prompt groups and wait until their sessions release resources."""
         if dapo_cutoff:
             if validate:
                 raise ValueError("DAPO cutoff applies only to training")
-            return await self._cancel_dapo_sequences(uids)
+            return await self._cancel_dapo_sequences(uids, cleanup_timeout_seconds)
         partition_id = "val" if validate else "train"
         items = (tq.kv_list(partition_id) or {}).get(partition_id, {}) if self.repeat_coordinator is not None else {}
         tasks_by_uid = {
@@ -503,7 +545,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
         do_sample = prompt.pop("__do_sample__", True)
         state_key = (partition_id, str(uid))
-        drain_scoring = opd_wait_for_scoring_on_cutoff(self.config, validate=trajectory["validate"])
+        dapo_drain_scoring = self.dapo_cutoff_enabled and not trajectory["validate"]
+        opd_drain_scoring = opd_wait_for_scoring_on_cutoff(
+            self.config, validate=trajectory["validate"]
+        )
+        drain_scoring = dapo_drain_scoring or opd_drain_scoring
         scoring_sessions = [] if drain_scoring else None
         scoring_controls = [GenerationCutoffState() for _ in range(n)] if drain_scoring else None
         session_state = self.cutoff_session_states.get(state_key) if cutoff_debug_enabled() else None
@@ -561,9 +607,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
             tasks = []
             if scoring_sessions is not None:
-                if not hasattr(self, "opd_scoring_sessions"):
-                    self.opd_scoring_sessions = {}
-                self.opd_scoring_sessions[state_key] = scoring_sessions
+                if dapo_drain_scoring:
+                    self.dapo_scoring_sessions[state_key] = scoring_sessions
+                if opd_drain_scoring:
+                    if not hasattr(self, "opd_scoring_sessions"):
+                        self.opd_scoring_sessions = {}
+                    self.opd_scoring_sessions[state_key] = scoring_sessions
             for i in range(n):
                 task = asyncio.create_task(run_session(i))
                 tasks.append(task)
@@ -635,9 +684,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 )
                 if cleanup_error is not None:
                     raise RuntimeError("DAPO generation session cleanup failed") from cleanup_error
-                # No partial-rollout admission and no retained-judgment barrier:
-                # the original input will be regenerated under the next policy.
-                # Deferred jobs/publications are settled in finally below.
+                # The original input will be regenerated under the next policy.
+                # Retained judgments/publications are settled in finally below.
                 raise
             try:
                 await self._join_repeat(partition_id, str(uid))
@@ -711,10 +759,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                                      error_type=type(e).__name__)
         finally:
             if (partition_id, str(uid)) in self.dapo_cutoff_uids:
-                await self._cancel_dapo_repeat(partition_id, str(uid))
-                errors = await _settle_session_tasks(self.dapo_publications.get((partition_id, str(uid)), []))
-                if errors:
-                    raise RuntimeError("DAPO TransferQueue publication cleanup failed") from errors[0]
+                # Deferred repeat judging belongs to retained scoring, not generation
+                # cleanup. Never interrupt it or charge it to the cleanup deadline.
+                await self._join_repeat(partition_id, str(uid))
+                await self._settle_dapo_cleanup(
+                    self.dapo_publications.get((partition_id, str(uid)), []),
+                    self.dapo_cleanup_timeouts.get(state_key, 300.0), "TransferQueue publication",
+                )
             await self._settle_opd_publications(partition_id, str(uid))
             if session_state is not None and session_state.get("cancel_reason") is None:
                 self._record_cutoff_group_census(
@@ -730,6 +781,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             self.repeat_generation_sessions.pop((partition_id, str(uid)), None)
             self.cutoff_session_states.pop((partition_id, str(uid)), None)
             getattr(self, "opd_scoring_sessions", {}).pop(state_key, None)
+            getattr(self, "dapo_scoring_sessions", {}).pop(state_key, None)
 
     @staticmethod
     def _record_cutoff_group_census(
@@ -1077,7 +1129,9 @@ class AgentLoopManagerTQ(AgentLoopManager):
             raise ValueError("DAPO training cutoff requires a positive finite cleanup timeout")
         started = time.monotonic()
         interval = progress_interval_seconds()
-        cancellation_kwargs = {"dapo_cutoff": True} if dapo_cutoff else {}
+        cancellation_kwargs = (
+            {"dapo_cutoff": True, "cleanup_timeout_seconds": cleanup_timeout_seconds} if dapo_cutoff else {}
+        )
         pending = [worker.cancel_sequences.remote(uids, validate=validate, **cancellation_kwargs)
                    for worker in self.agent_loop_workers]
         logger.info("Rollout cancellation/drain start partition=%s groups=%d workers=%d",
@@ -1088,9 +1142,11 @@ class AgentLoopManagerTQ(AgentLoopManager):
         cleanup_timeout = (positive_seconds("SWE_AGENT_VALIDATION_CLEANUP_TIMEOUT_SECONDS", 300)
                            if validate and strict_validation_enabled() else None)
         if dapo_cutoff:
-            cleanup_timeout = cleanup_timeout_seconds
+            # Workers bound generation cancellation and publication cleanup.
+            # The manager also waits for retained rewards under their own timeouts.
+            cleanup_timeout = None
         opd_cutoff = opd_cancel_on_cutoff(getattr(self, "config", None), validate=validate)
-        if opd_cutoff:
+        if opd_cutoff and not dapo_cutoff:
             cleanup_timeout = opd_cleanup_timeout_s(self.config)
         if opd_wait_for_scoring_on_cutoff(getattr(self, "config", None), validate=validate) and not dapo_cutoff:
             # Hidden evaluation and teacher queue/HTTP requests retain their

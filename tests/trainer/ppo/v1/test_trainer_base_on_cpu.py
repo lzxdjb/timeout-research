@@ -441,6 +441,7 @@ def test_custom_sampler_skips_builtin_filter_groups_validation():
     assert "train_batch_size" not in sampler.kwargs
     assert "gen_batch_size" not in sampler.kwargs
     assert "max_inflight_gen_batches" not in sampler.kwargs
+    assert "max_inflight_groups" not in sampler.kwargs
     assert "sync_refill_failed_groups" not in sampler.kwargs
 
 
@@ -453,6 +454,7 @@ def test_builtin_filter_groups_uses_default_inflight_limit():
     assert sampler.train_batch_size == 64
     assert sampler.gen_batch_size == 1
     assert sampler.max_inflight_gen_batches == 1
+    assert sampler.max_inflight_groups is None
 
 
 def test_builtin_filter_groups_forwards_configured_inflight_limit():
@@ -461,6 +463,30 @@ def test_builtin_filter_groups_forwards_configured_inflight_limit():
     sampler = trainer._build_replay_buffer()
 
     assert sampler.max_inflight_gen_batches == 3
+
+
+def test_builtin_filter_groups_forwards_absolute_group_limit():
+    trainer = _trainer_with_filter_groups({"enable": True, "metric": "acc", "max_inflight_groups": 32})
+
+    sampler = trainer._build_replay_buffer()
+
+    assert sampler.max_inflight_groups == 32
+
+
+@pytest.mark.parametrize("enabled,limit,expected", [(True, None, 64), (True, 32, 32),
+                                                   (True, 128, 64), (False, 32, 64)])
+def test_initial_generation_respects_opt_in_absolute_group_limit(enabled, limit, expected):
+    trainer = _trainer_with_filter_groups({"enable": enabled, "metric": "acc", "max_inflight_groups": limit})
+    trainer.replay_buffer = trainer._build_replay_buffer()
+    trainer.parameter_sync_step = 1
+    trainer.global_steps = 1
+    with (
+        patch.object(trainer, "_add_batch_to_generate") as submit,
+        patch.object(trainer, "_step_once", return_value=_batch_with_tags([{}])),
+    ):
+        trainer.step({}, {})
+
+    submit.assert_called_once_with(num_prompts=expected)
 
 
 def test_dapo_cutoff_configuration_is_opt_in_and_forwards_queue_callbacks():

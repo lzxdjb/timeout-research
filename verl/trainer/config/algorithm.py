@@ -51,9 +51,13 @@ class FilterGroupsConfig(BaseConfig):
         max_num_gen_batches (int): Non-positive values mean no upper limit.
         max_inflight_gen_batches (int): Maximum Sync DAPO prompt batches concurrently pending or running,
             measured in ``data.train_batch_size`` units.
-        cutoff_when_full (bool): Cancel unselected groups once a full usable V1 sync batch is available.
+        max_inflight_groups (Optional[int]): Absolute unfinished-group limit for Sync DAPO; when set,
+            overrides ``max_inflight_gen_batches`` and includes groups awaiting rewards.
+        cutoff_when_full (bool): Stop unselected generation once a full usable V1 sync batch is available,
+            while draining already-started scoring before cleanup.
         requeue_unselected_prompts (bool): Carry original cancelled/surplus inputs to the next policy step.
-        cutoff_cleanup_timeout_seconds (float): Maximum time to await worker cleanup acknowledgments.
+        cutoff_cleanup_timeout_seconds (float): Deadline for generation cancellation and publication cleanup;
+            ordinary hidden/deferred reward processing is excluded.
     """
 
     enable: bool = False
@@ -63,6 +67,7 @@ class FilterGroupsConfig(BaseConfig):
     cutoff_when_full: bool = False
     requeue_unselected_prompts: bool = False
     cutoff_cleanup_timeout_seconds: float = 300.0
+    max_inflight_groups: Optional[int] = None
 
 
 @dataclass

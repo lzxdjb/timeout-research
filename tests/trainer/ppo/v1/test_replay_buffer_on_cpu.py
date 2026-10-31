@@ -802,6 +802,12 @@ def test_init_rejects_non_positive_sync_dapo_inflight_limit():
         )
 
 
+@pytest.mark.parametrize("limit", [0, -1, 1.5, True])
+def test_init_rejects_invalid_absolute_inflight_group_limit(limit):
+    with pytest.raises(ValueError, match="max_inflight_groups"):
+        _make_rb(filter_groups_metric="acc", refill_fn=lambda _n: None, max_inflight_groups=limit)
+
+
 # --------------------------------------------------------------------------- #
 # _sync_metadata_from_transfer_queue: classification of polled metadata.
 # --------------------------------------------------------------------------- #
@@ -1691,7 +1697,7 @@ def test_dapo_cutoff_cleanup_failure_does_not_materialize_or_requeue(tq_init):
 
 
 @pytest.mark.parametrize("finalizer_started", [False, True])
-def test_dapo_cancels_real_ray_judge_and_waits_for_remote_cleanup(tq_init, finalizer_started):
+def test_dapo_drains_real_ray_judge_without_cancelling_it(tq_init, finalizer_started):
     import asyncio
 
     import ray
@@ -1703,17 +1709,25 @@ def test_dapo_cancels_real_ray_judge_and_waits_for_remote_cleanup(tq_init, final
         def __init__(self):
             self.started = False
             self.cleaned = False
+            self.cancelled = False
+            self.release = asyncio.Event()
 
         async def submit(self):
             self.started = True
             try:
-                await asyncio.Event().wait()
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
             finally:
                 await asyncio.sleep(.05)
                 self.cleaned = True
 
+        async def finish(self):
+            self.release.set()
+
         async def state(self):
-            return self.started, self.cleaned
+            return self.started, self.cleaned, self.cancelled
 
     judge = Judge.remote()
     ref = judge.submit.remote()
@@ -1727,19 +1741,24 @@ def test_dapo_cancels_real_ray_judge_and_waits_for_remote_cleanup(tq_init, final
         worker.repeat_job_refs = {("train", "u"): [ref]}
         worker.repeat_finalizers = {}
 
-        async def cancel():
+        async def drain():
             async def finalize():
                 await ref
 
             finalizer = asyncio.create_task(finalize())
             worker.repeat_finalizers[("train", "u")] = [finalizer]
+            worker.repeat_debug = False
             if finalizer_started:
                 await asyncio.sleep(.01)
-            await asyncio.wait_for(worker._cancel_dapo_repeat("train", "u"), timeout=10)
+            joining = asyncio.create_task(worker._join_repeat("train", "u"))
+            await asyncio.sleep(.01)
+            assert not joining.done()
+            await judge.finish.remote()
+            await asyncio.wait_for(joining, timeout=10)
             assert finalizer.done()
 
-        asyncio.run(cancel())
-        assert ray.get(judge.state.remote()) == (True, True)
+        asyncio.run(drain())
+        assert ray.get(judge.state.remote()) == (True, True, False)
     finally:
         ray.kill(judge)
 
@@ -1885,6 +1904,47 @@ def test_sync_dapo_does_not_refill_when_filtered_surplus_leaves_a_full_batch(tq_
         assert _uids_of(batch.keys) == {spec.uid for spec in mixed}
         assert refiller.calls == []
         assert metrics["validation/filter_groups/evicted_samples"] == 1
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_sync_dapo_absolute_window_reaches_larger_target_without_rejections(tq_init, partition_id):
+    refiller = FakeRefiller(partition_id, global_steps=1, sessions=2, rewards=[0.0, 1.0])
+    rb = _make_rb(
+        refill_fn=refiller, filter_groups_metric="acc", train_batch_size=6,
+        max_inflight_gen_batches=3, max_inflight_groups=2,
+    )
+    try:
+        batch, metrics = rb.sample(global_steps=1, partition_id=partition_id, batch_size=6)
+
+        assert len(_uids_of(batch.keys)) == 6
+        assert refiller.calls == [2, 2, 2]
+        assert metrics.get("validation/filter_groups/evicted_samples", 0) == 0
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_sync_dapo_absolute_window_counts_groups_waiting_for_rewards(tq_init, partition_id):
+    pending_reward = PromptSpec(uid=_uid(), status="reward_pending", sessions=2, rewards=[0.0, 1.0])
+    finished = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 1.0])
+    _produce(partition_id, [pending_reward, finished]).join_and_check()
+    refiller = FakeRefiller(partition_id, global_steps=1, sessions=2, rewards=[0.0, 1.0])
+    rb = _make_rb(
+        refill_fn=refiller, filter_groups_metric="acc", train_batch_size=4, max_inflight_groups=2,
+    )
+    consumer = SampleConsumer(rb, partition_id, batch_size=4, global_steps=1)
+    try:
+        consumer.start()
+        deadline = time.time() + 5
+        while len(refiller.calls) < 2 and consumer.is_alive() and time.time() < deadline:
+            time.sleep(POLL_INTERVAL)
+        assert refiller.calls == [1, 1]
+        assert consumer.is_alive()
+
+        _set_prompt_status(partition_id, pending_reward.uid, "finished", global_steps=0)
+        batch = consumer.result_or_raise()
+        assert len(_uids_of(batch.keys)) == 4
+        assert pending_reward.uid in _uids_of(batch.keys)
     finally:
         _clear_partition(partition_id)
 

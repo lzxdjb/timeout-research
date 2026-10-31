@@ -248,6 +248,8 @@ def worker_harness(monkeypatch, n=1):
     worker.repeat_job_refs = {}
     worker.dapo_cutoff_uids = set()
     worker.dapo_cutoff_enabled = False
+    worker.dapo_scoring_sessions = {}
+    worker.dapo_cleanup_timeouts = {}
     worker.dapo_publications = {}
     worker.repeat_generation_sessions = {}
     worker.repeat_debug = module._repeat_debug_enabled()
@@ -360,19 +362,22 @@ def test_cutoff_cancels_unfinished_generation_but_drains_retained_judgment(monke
 
 
 @pytest.mark.parametrize("n", [1, 2])
-def test_dapo_cutoff_cancels_generation_and_deferred_rewards_without_late_writes(monkeypatch, n):
+def test_dapo_cutoff_cancels_generation_but_drains_deferred_rewards(monkeypatch, n):
     async def run():
         worker, store, publications = worker_harness(monkeypatch, n=n)
         worker.dapo_cutoff_enabled = True
         judging, judge_cancelled, generation_cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        finish_judge = asyncio.Event()
         release_generation = asyncio.Event()
 
         async def submit(job_id, job):
             judging.set()
             try:
-                await asyncio.Event().wait()
-            finally:
+                await finish_judge.wait()
+                return job_id, .1, {"repeat_reward_pending": 0}
+            except asyncio.CancelledError:
                 judge_cancelled.set()
+                raise
 
         worker.repeat_coordinator = SimpleNamespace(submit=RemoteMethod(submit))
 
@@ -398,43 +403,62 @@ def test_dapo_cutoff_cancels_generation_and_deferred_rewards_without_late_writes
         if n == 2:
             assert not cutoff.done()
             release_generation.set()
+        await asyncio.sleep(.01)
+        assert not cutoff.done() and not judge_cancelled.is_set()
+        finish_judge.set()
         assert await asyncio.wait_for(cutoff, timeout=2) == 1
-        assert judge_cancelled.is_set()
+        assert not judge_cancelled.is_set()
         assert n == 1 or generation_cleanup.is_set()
         assert store["train"]["u"]["dapo_cutoff"]
         assert not store["train"]["u"].get("completion_ratio_cutoff")
         await asyncio.sleep(.01)
-        assert not publications and not worker.repeat_finalizers and not worker.repeat_job_refs
+        assert len(publications) == 1 and not worker.repeat_finalizers and not worker.repeat_job_refs
         assert not worker.dapo_cutoff_uids
+        assert not worker.dapo_scoring_sessions and not worker.dapo_cleanup_timeouts
 
     asyncio.run(run())
 
 
-def test_dapo_cutoff_cancels_judge_even_if_finalizer_has_not_started(monkeypatch):
+def test_dapo_cutoff_retains_judge_even_if_finalizer_has_not_started(monkeypatch):
     async def run():
         worker, _, publications = worker_harness(monkeypatch)
         cancelled = asyncio.Event()
+        finished = asyncio.Event()
 
         async def submit():
             try:
-                await asyncio.Event().wait()
-            finally:
+                await finished.wait()
+                return "job", .1, {"repeat_reward_pending": 0}
+            except asyncio.CancelledError:
                 cancelled.set()
+                raise
 
         ref = asyncio.create_task(submit())
         await asyncio.sleep(0)
-        finalizer = asyncio.create_task(worker._finalize_repeat(ref, "job", None, False, {"uid": "u"}))
+        output = fake_output(repeat.RepeatConfig())
+        output.extra_fields.pop("_swe_repeat_job")
+        finalizer = asyncio.create_task(worker._finalize_repeat(
+            ref, "job", output, False, {"uid": "u", "session_id": 0, "global_steps": 0}
+        ))
+        # Finalized outputs must skip the generation handoff and publish directly.
+        worker.repeat_generation_sessions[("train", "u")] = (1, {0})
         worker.repeat_job_refs[("train", "u")] = [ref]
         worker.repeat_finalizers[("train", "u")] = [finalizer]
-        await worker._cancel_dapo_repeat("train", "u")
-        assert cancelled.is_set() and finalizer.cancelled() and not publications
+        join = asyncio.create_task(worker._join_repeat("train", "u"))
+        await asyncio.sleep(0)
+        assert not join.done() and not cancelled.is_set()
+        finished.set()
+        await asyncio.wait_for(join, timeout=2)
+        assert not cancelled.is_set() and not finalizer.cancelled() and len(publications) == 1
 
     asyncio.run(run())
 
 
 @pytest.mark.parametrize("deferred", [False, True])
-def test_dapo_cutoff_waits_for_publication_already_sent_to_transfer_queue(monkeypatch, deferred):
+@pytest.mark.parametrize("publication_timeout", [False, True])
+def test_dapo_cutoff_waits_for_publication_already_sent_to_transfer_queue(monkeypatch, deferred, publication_timeout):
     from verl.trainer.ppo.v1 import agent_loop_tq as module
+    from verl.utils.async_rpc import mark_scoring_started
 
     async def run():
         worker, store, publications = worker_harness(monkeypatch)
@@ -454,6 +478,7 @@ def test_dapo_cutoff_waits_for_publication_already_sent_to_transfer_queue(monkey
             worker.repeat_coordinator = SimpleNamespace(submit=RemoteMethod(submit))
 
         async def session(*args, **kwargs):
+            mark_scoring_started()
             output = fake_output(repeat.RepeatConfig(deferred_enabled=True))
             if not deferred:
                 output.extra_fields.pop("_swe_repeat_job")
@@ -463,13 +488,196 @@ def test_dapo_cutoff_waits_for_publication_already_sent_to_transfer_queue(monkey
         prompt = asyncio.create_task(worker._run_prompt({"uid": "u"}, {}, {"validate": False}))
         worker.prompt_tasks["train"]["u"] = prompt
         await asyncio.wait_for(entered.wait(), timeout=2)
-        cutoff = asyncio.create_task(worker.cancel_sequences(["u"], dapo_cutoff=True))
+        cutoff = asyncio.create_task(worker.cancel_sequences(
+            ["u"], dapo_cutoff=True, cleanup_timeout_seconds=.01 if publication_timeout else 300
+        ))
+        if publication_timeout:
+            try:
+                with pytest.raises(RuntimeError, match="DAPO .*cleanup"):
+                    await asyncio.wait_for(cutoff, timeout=2)
+                assert not publications
+            finally:
+                release.set()
+                await asyncio.gather(prompt, return_exceptions=True)
+                await asyncio.gather(*worker.dapo_publications.get(("train", "u"), []), return_exceptions=True)
+            return
         await asyncio.sleep(.01)
         assert not cutoff.done() and not publications
         release.set()
         assert await asyncio.wait_for(cutoff, timeout=2) == 1
         assert len(publications) == 1 and store["train"]["u"]["dapo_cutoff"]
         assert not worker.dapo_publications
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("n", [1, 2])
+@pytest.mark.parametrize("opd_enabled", [False, True])
+def test_dapo_cutoff_keeps_started_hidden_rewards_and_bounds_only_generation_cleanup(monkeypatch, n, opd_enabled):
+    from verl.utils.async_rpc import mark_scoring_started
+
+    async def run():
+        worker, store, publications = worker_harness(monkeypatch, n=n)
+        worker.dapo_cutoff_enabled = True
+        if opd_enabled:
+            worker.config.trainer = {"use_v1": True}
+            worker.config.distillation = {"enabled": True, "cancel_pending_on_cutoff": True,
+                                          "wait_for_scoring_on_cutoff": True}
+            worker.opd_cutoff_enabled = True
+        scoring_started, finish_scoring = asyncio.Event(), asyncio.Event()
+        generation_cancelled, scoring_cancelled = asyncio.Event(), asyncio.Event()
+
+        async def session(params, *, session_id, **kwargs):
+            if session_id == 0:
+                mark_scoring_started()
+                scoring_started.set()
+                try:
+                    await finish_scoring.wait()
+                except asyncio.CancelledError:
+                    scoring_cancelled.set()
+                    raise
+                output = fake_output(repeat.RepeatConfig())
+                output.extra_fields.pop("_swe_repeat_job")
+                await worker._agent_loop_postprocess(output, False, uid="u", session_id=0, global_steps=0)
+            else:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    generation_cancelled.set()
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "u"}, {}, {"validate": False}))
+        worker.prompt_tasks["train"]["u"] = prompt
+        await asyncio.wait_for(scoring_started.wait(), timeout=2)
+        if opd_enabled:
+            assert worker.opd_scoring_sessions[("train", "u")] is worker.dapo_scoring_sessions[("train", "u")]
+        cutoff = asyncio.create_task(worker.cancel_sequences(["u"], dapo_cutoff=True, cleanup_timeout_seconds=.01))
+        await asyncio.sleep(.04)  # Normal hidden scoring may exceed the generation cleanup deadline.
+        assert not cutoff.done() and not scoring_cancelled.is_set()
+        assert n == 1 or generation_cancelled.is_set()
+        finish_scoring.set()
+        assert await asyncio.wait_for(cutoff, timeout=2) == 1
+        assert len(publications) == 1 and store["train"]["u"]["dapo_cutoff"]
+        assert not worker.dapo_scoring_sessions and not worker.dapo_publications
+
+    asyncio.run(run())
+
+
+def test_dapo_cutoff_generation_cleanup_still_has_a_deadline(monkeypatch):
+    async def run():
+        worker, _, _ = worker_harness(monkeypatch)
+        worker.dapo_cutoff_enabled = True
+        started, release_cleanup = asyncio.Event(), asyncio.Event()
+
+        async def session(*args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await release_cleanup.wait()
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "u"}, {}, {"validate": False}))
+        worker.prompt_tasks["train"]["u"] = prompt
+        await asyncio.wait_for(started.wait(), timeout=2)
+        try:
+            with pytest.raises(RuntimeError, match="DAPO generation cleanup exceeded"):
+                await worker.cancel_sequences(["u"], dapo_cutoff=True, cleanup_timeout_seconds=.01)
+            assert not prompt.done()
+        finally:
+            release_cleanup.set()
+            await asyncio.gather(prompt, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_dapo_cutoff_tag_publication_still_has_a_deadline(monkeypatch):
+    from verl.trainer.ppo.v1 import agent_loop_tq as module
+
+    async def run():
+        worker, _, _ = worker_harness(monkeypatch)
+        worker.dapo_cutoff_enabled = True
+        started, publishing, release_publication = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original_put = module.tq.async_kv_put
+
+        async def put(**kwargs):
+            if kwargs["tag"].get("dapo_cutoff"):
+                publishing.set()
+                await release_publication.wait()
+            return await original_put(**kwargs)
+
+        monkeypatch.setattr(module.tq, "async_kv_put", put)
+
+        async def session(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "u"}, {}, {"validate": False}))
+        worker.prompt_tasks["train"]["u"] = prompt
+        await asyncio.wait_for(started.wait(), timeout=2)
+        try:
+            with pytest.raises(RuntimeError, match="DAPO cutoff tag publication cleanup exceeded"):
+                await worker.cancel_sequences(["u"], dapo_cutoff=True, cleanup_timeout_seconds=.01)
+            assert publishing.is_set()
+        finally:
+            release_publication.set()
+            await asyncio.sleep(0)
+            await asyncio.gather(prompt, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_dapo_cutoff_keeps_retained_reward_errors_fatal(monkeypatch):
+    async def run():
+        worker, store, _ = worker_harness(monkeypatch)
+        worker.dapo_cutoff_enabled = True
+        judging, release = asyncio.Event(), asyncio.Event()
+
+        async def submit(job_id, job):
+            judging.set()
+            await release.wait()
+            raise RuntimeError("retained judge failed")
+
+        worker.repeat_coordinator = SimpleNamespace(submit=RemoteMethod(submit))
+
+        async def session(*args, **kwargs):
+            await worker._agent_loop_postprocess(fake_output(repeat.RepeatConfig(deferred_enabled=True)), False,
+                                                uid="u", session_id=0, global_steps=0)
+
+        worker._run_agent_loop = session
+        prompt = asyncio.create_task(worker._run_prompt({"uid": "u"}, {}, {"validate": False}))
+        worker.prompt_tasks["train"]["u"] = prompt
+        await asyncio.wait_for(judging.wait(), timeout=2)
+        cutoff = asyncio.create_task(worker.cancel_sequences(["u"], dapo_cutoff=True))
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(RuntimeError, match="DAPO rollout cancellation cleanup failed"):
+            await asyncio.wait_for(cutoff, timeout=2)
+        assert store["train"]["u"]["status"] == "reward_error"
+        assert not store["train"]["u"].get("dapo_cutoff")
+
+    asyncio.run(run())
+
+
+def test_dapo_cutoff_does_not_overwrite_a_reward_error_when_parent_returns_normally(monkeypatch):
+    async def run():
+        worker, store, _ = worker_harness(monkeypatch)
+        worker.dapo_scoring_sessions[("train", "u")] = []
+        release = asyncio.Event()
+
+        async def parent():
+            await release.wait()
+            store.setdefault("train", {})["u"] = {"status": "reward_error"}
+
+        prompt = asyncio.create_task(parent())
+        worker.prompt_tasks["train"]["u"] = prompt
+        cutoff = asyncio.create_task(worker.cancel_sequences(["u"], dapo_cutoff=True))
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(RuntimeError, match="DAPO retained reward processing failed"):
+            await asyncio.wait_for(cutoff, timeout=2)
+        assert store["train"]["u"]["status"] == "reward_error"
 
     asyncio.run(run())
 
@@ -800,7 +1008,7 @@ def test_manager_cancellation_heartbeat_does_not_block_on_snapshot(monkeypatch, 
     assert "cancellation/drain end" in caplog.text
 
 
-def test_dapo_manager_times_out_without_acknowledgement(monkeypatch):
+def test_dapo_manager_waits_for_retained_scoring_beyond_cleanup_deadline(monkeypatch):
     from verl.trainer.ppo.v1 import agent_loop_tq as module
 
     manager = object.__new__(module.AgentLoopManagerTQ)
@@ -816,11 +1024,11 @@ def test_dapo_manager_times_out_without_acknowledgement(monkeypatch):
 
     def wait(refs, **kwargs):
         tick[0] += 1
-        return [], refs
+        return (refs, []) if tick[0] == 4 else ([], refs)
 
     monkeypatch.setattr(module.ray, "wait", wait)
-    monkeypatch.setattr(module.ray, "get", lambda refs: [])
+    monkeypatch.setattr(module.ray, "get", lambda refs: [1] if refs else [])
     monkeypatch.setattr(module.time, "monotonic", lambda: tick[0])
-    with pytest.raises(RuntimeError, match="DAPO cancellation.*cleanup deadline"):
-        manager.cancel_sequences(["u"], dapo_cutoff=True, cleanup_timeout_seconds=2.)
-    assert forwarded == [{"validate": False, "dapo_cutoff": True}]
+    assert manager.cancel_sequences(["u"], dapo_cutoff=True, cleanup_timeout_seconds=2.) == 1
+    assert tick[0] == 4
+    assert forwarded == [{"validate": False, "dapo_cutoff": True, "cleanup_timeout_seconds": 2.}]

@@ -478,6 +478,7 @@ class PPOTrainer(ABC):
                     )
                     else (self.config.data.get("gen_batch_size", None) or train_batch_size),
                     max_inflight_gen_batches=max_inflight_gen_batches,
+                    max_inflight_groups=filter_groups.get("max_inflight_groups", None),
                     cutoff_when_full=cutoff_when_full,
                     cutoff_cleanup_timeout_seconds=filter_groups.get("cutoff_cleanup_timeout_seconds", 300.0),
                     requeue_fn=self._dapo_prompt_queue.requeue if self._dapo_prompt_queue is not None else None,
@@ -824,6 +825,12 @@ class PPOTrainer(ABC):
             partition_id="train",
             batch_size=train_batch_size,
         )
+        if (
+            type(self.replay_buffer) is ReplayBuffer
+            and self.replay_buffer.filter_groups_metric is not None
+            and self.replay_buffer.max_inflight_groups is not None
+        ):
+            fresh_prompts = min(fresh_prompts, self.replay_buffer.max_inflight_groups)
         self._add_batch_to_generate(num_prompts=fresh_prompts)
 
         metrics_aggregator = MetricsAggregator()
