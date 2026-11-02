@@ -11,13 +11,20 @@ SFT_LR="${SFT_LR:-5e-7}"
 SFT_EPOCHS="${SFT_EPOCHS:-1}"
 SFT_TEST_FREQ="${SFT_TEST_FREQ:-10}"
 SFT_SAVE_FREQ="${SFT_SAVE_FREQ:-10}"
-SFT_TEACHER_TEST_FREQ="${SFT_TEACHER_TEST_FREQ:--1}"
+SFT_TEACHER_TEST_FREQ="${SFT_TEACHER_TEST_FREQ:-$SFT_TEST_FREQ}"
+SFT_VAL_BEFORE_TRAIN="${SFT_VAL_BEFORE_TRAIN:-True}"
+SFT_TEACHER_VAL_BEFORE_TRAIN="${SFT_TEACHER_VAL_BEFORE_TRAIN:-True}"
+SFT_DATA_MANIFEST="${SFT_DATA_MANIFEST:-}"
 
 : "${VAL_FILES:?Set VAL_FILES to a Hydra list of RL validation parquet paths}"
 : "${SWE_AGENT_EXECUTION_URLS:?Set SWE_AGENT_EXECUTION_URLS to the execution-service URL list}"
 [[ -f "$SFT_TRAIN_FILE" ]] || { echo "SFT train file not found: $SFT_TRAIN_FILE" >&2; exit 2; }
 if [[ -n "$SFT_TEACHER_VAL_FILE" && ! -f "$SFT_TEACHER_VAL_FILE" ]]; then
   echo "Teacher-forced validation file not found: $SFT_TEACHER_VAL_FILE" >&2
+  exit 2
+fi
+if [[ -n "$SFT_DATA_MANIFEST" && ! -f "$SFT_DATA_MANIFEST" ]]; then
+  echo "SFT data manifest not found: $SFT_DATA_MANIFEST" >&2
   exit 2
 fi
 
@@ -41,8 +48,16 @@ export ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU="${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_
 
 if [[ -n "$SFT_TEACHER_VAL_FILE" ]]; then
   teacher_val_files="[\"$SFT_TEACHER_VAL_FILE\"]"
+  read -r teacher_val_sha256 _ < <(sha256sum -- "$SFT_TEACHER_VAL_FILE")
 else
   teacher_val_files=null
+  teacher_val_sha256=disabled
+fi
+read -r train_sha256 _ < <(sha256sum -- "$SFT_TRAIN_FILE")
+manifest_args=()
+if [[ -n "$SFT_DATA_MANIFEST" ]]; then
+  read -r manifest_sha256 _ < <(sha256sum -- "$SFT_DATA_MANIFEST")
+  manifest_args+=("+sft.data_manifest_path=$SFT_DATA_MANIFEST" "+sft.data_manifest_sha256=$manifest_sha256")
 fi
 
 echo "SFT train data:       $SFT_TRAIN_FILE"
@@ -51,6 +66,8 @@ echo "Teacher-forced data:  ${SFT_TEACHER_VAL_FILE:-disabled}"
 echo "SFT batch/lr/epochs:  $SFT_BATCH_SIZE / $SFT_LR / $SFT_EPOCHS"
 echo "SFT max length:       $SFT_MAX_LENGTH"
 echo "Validation frequency: RL=$SFT_TEST_FREQ teacher-forced=$SFT_TEACHER_TEST_FREQ"
+echo "Validation before SFT: RL=$SFT_VAL_BEFORE_TRAIN teacher-forced=$SFT_TEACHER_VAL_BEFORE_TRAIN"
+echo "SFT train SHA256:     $train_sha256"
 
 exec bash "$TARGET_VERL/scripts/run_swe_agent_qwen3_5_35b_a3b.sh" \
   trainer.use_v1=True \
@@ -58,6 +75,7 @@ exec bash "$TARGET_VERL/scripts/run_swe_agent_qwen3_5_35b_a3b.sh" \
   trainer.total_epochs="$SFT_EPOCHS" \
   trainer.test_freq="$SFT_TEST_FREQ" \
   trainer.save_freq="$SFT_SAVE_FREQ" \
+  trainer.val_before_train="$SFT_VAL_BEFORE_TRAIN" \
   data.train_batch_size="$SFT_BATCH_SIZE" \
   +data.messages_key=messages \
   +data.tools_key=tools \
@@ -80,6 +98,9 @@ exec bash "$TARGET_VERL/scripts/run_swe_agent_qwen3_5_35b_a3b.sh" \
   reward.reward_model.enable=False \
   +sft.teacher_forced_val_files="$teacher_val_files" \
   +sft.teacher_forced_test_freq="$SFT_TEACHER_TEST_FREQ" \
-  +sft.teacher_forced_val_before_train=False \
+  +sft.teacher_forced_val_before_train="$SFT_TEACHER_VAL_BEFORE_TRAIN" \
   +sft.teacher_forced_val_batch_size="$SFT_BATCH_SIZE" \
+  +sft.train_file_sha256="$train_sha256" \
+  +sft.teacher_forced_val_file_sha256="$teacher_val_sha256" \
+  "${manifest_args[@]}" \
   "$@"

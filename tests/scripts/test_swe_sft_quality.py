@@ -328,6 +328,138 @@ def test_pool_fallback_dedup_and_exclusions(tmp_path, monkeypatch):
     db.close()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_judge_relocation_reuses_decisions_and_preserves_original_endpoint(tmp_path, monkeypatch, legacy):
+    args = args_for(
+        tmp_path, "--allow-unaudited-pilot", "--judge-vote-count", "1", "--judge-min-good-votes", "1"
+    )
+    run = args.rollout_root / "run"
+    run.mkdir()
+    (run / "1.jsonl").write_text(json.dumps(fixture_row()) + "\n")
+    db, stats, fingerprint = quality.prepare_pool(args)
+    calls = []
+    served_root = "same-checkpoint"
+
+    async def preflight(self):
+        self.served_root = served_root
+
+    async def judge(self, *a, **kw):
+        calls.append(self.config.url)
+        return {"accepted": True, "verdict": "good", "reason": "test decision", "error": 0}
+
+    monkeypatch.setattr(quality.SFTJudgeClient, "preflight", preflight)
+    monkeypatch.setattr(quality.SFTJudgeClient, "judge_consensus", judge)
+    try:
+        args.judge_url = "http://old-teacher:18090"
+        core, _, _, stats = asyncio.run(quality.filter_pool(args, db, stats, fingerprint))
+        assert len(core) == 1 and calls == [args.judge_url]
+        original_report = json.loads((args.output_dir / "quality_report.json").read_text())
+
+        if legacy:
+            from scripts.swe_sft_quality_resume import LEGACY_SOURCE_SHA256
+
+            # Recreate the pre-update format: URL-bound keys, and provenance
+            # stored in the per-case artifact rather than the cache result.
+            artifact = next((args.output_dir / "quality_artifacts").glob("*.json.gz"))
+            saved = json.loads(gzip.decompress(artifact.read_bytes()))
+            legacy_key = repeat.digest({
+                "policy": LEGACY_SOURCE_SHA256, "reward_source": repeat.POLICY_SOURCE_SHA256,
+                "config": original_report["config"], "served_root": served_root,
+            })
+            cache_key = repeat.digest({
+                "config": legacy_key, "task": saved["public_task"],
+                "events": saved["events"], "segments": saved["actor_segments"],
+            })
+            saved["policy_source_sha256"] = LEGACY_SOURCE_SHA256
+            saved["result"].pop("judge_config")
+            saved["result"].pop("judge_provenance")
+            saved["result"]["cache_key"] = cache_key
+            cache = args.output_dir / "judge_cache"
+            for path in cache.glob("*.json.gz"):
+                path.unlink()
+            (cache / f"{cache_key}.json.gz").write_bytes(gzip.compress(json.dumps(saved["result"]).encode()))
+            artifact.write_bytes(gzip.compress(json.dumps(saved).encode()))
+
+        args.judge_url = "http://relocated-teacher:18090"
+        core, _, _, stats = asyncio.run(quality.filter_pool(args, db, stats, fingerprint))
+        assert len(core) == 1 and calls == ["http://old-teacher:18090"]
+        assert stats["cache_hits"] == 1
+        relocated_report = json.loads((args.output_dir / "quality_report.json").read_text())
+        assert relocated_report["config_key"] == original_report["config_key"]
+        assert relocated_report["provenance"]["endpoint"] == args.judge_url
+        artifact = next((args.output_dir / "quality_artifacts").glob("*.json.gz"))
+        audit = json.loads(gzip.decompress(artifact.read_bytes()))
+        assert audit["config"]["url"] == "http://old-teacher:18090"
+        assert audit["provenance"]["endpoint"] == "http://old-teacher:18090"
+
+        # Endpoint mobility must not make a different served checkpoint cache-compatible.
+        served_root = "different-checkpoint"
+        asyncio.run(quality.filter_pool(args, db, stats, fingerprint))
+        assert calls == ["http://old-teacher:18090", "http://relocated-teacher:18090"]
+    finally:
+        db.close()
+
+
+def test_endpoint_update_keeps_legacy_prepared_pool_but_rejects_other_code(tmp_path, monkeypatch):
+    from scripts.swe_sft_quality_resume import LEGACY_SOURCE_SHA256, SOURCE_HASH_MIGRATIONS
+
+    assert quality.SOURCE_SHA256 in SOURCE_HASH_MIGRATIONS
+    args = args_for(tmp_path)
+    run = args.rollout_root / "run"
+    run.mkdir()
+    (run / "1.jsonl").write_text(json.dumps(fixture_row()) + "\n")
+    with monkeypatch.context() as legacy:
+        legacy.setattr(quality, "SOURCE_SHA256", LEGACY_SOURCE_SHA256)
+        db, _, original = quality.prepare_pool(args)
+        db.close()
+    args.judge_url = "http://relocated-teacher:18090"
+    db, _, resumed = quality.prepare_pool(args)
+    db.close()
+    assert resumed == original
+    monkeypatch.setattr(quality, "SOURCE_SHA256", "unknown-unreviewed-policy-change")
+    with pytest.raises(ValueError, match="filters or code changed"):
+        quality.prepare_pool(args)
+
+
+def test_legacy_pilot_identity_requires_matching_checkpoint_settings_and_policy(tmp_path, monkeypatch):
+    from scripts import swe_sft_filter_audit as audit
+    from scripts.swe_sft_quality_resume import LEGACY_SOURCE_SHA256
+
+    args = args_for(tmp_path)
+    config = quality.judge_config(args)
+    client = quality.SFTJudgeClient(config)
+    client.served_root = "same-checkpoint"
+    metadata = {"config": quality.dataclasses.asdict(config), "provenance": client.provenance()}
+    old_key = repeat.digest({
+        "policy": LEGACY_SOURCE_SHA256, "reward_source": repeat.POLICY_SOURCE_SHA256,
+        "config": metadata["config"], "served_root": client.served_root,
+    })
+    relocated = quality.dataclasses.replace(config, url="http://relocated-teacher:18090")
+    keys = quality.compatible_judge_keys(metadata, relocated, client.served_root)
+    assert old_key in keys
+    monkeypatch.setattr(audit, "validate_audit", lambda directory: {
+        "source_fingerprint": "frozen", "config_key": old_key,
+    })
+    current = quality.judge_config_key(relocated, client.served_root)
+    quality.verify_pilot_audit(tmp_path, "frozen", current, keys)
+    with pytest.raises(ValueError, match="configuration differ"):
+        quality.verify_pilot_audit(tmp_path, "changed-sources", current, keys)
+    assert not quality.compatible_judge_keys(metadata, relocated, "different-checkpoint")
+    assert not quality.compatible_judge_keys(
+        metadata, quality.dataclasses.replace(relocated, model="other"), client.served_root,
+    )
+    metadata["provenance"]["policy_source_sha256"] = "different-reward-policy"
+    assert not quality.compatible_judge_keys(metadata, relocated, client.served_root)
+
+
+def test_judge_identity_keeps_sampling_settings(tmp_path):
+    args = args_for(tmp_path)
+    config = quality.judge_config(args)
+    key = quality.judge_config_key(config, "checkpoint")
+    changed = quality.dataclasses.replace(config, temperature=0.8 if config.temperature != 0.8 else 0.7)
+    assert quality.judge_config_key(changed, "checkpoint") != key
+
+
 @pytest.mark.parametrize(
     "extra",
     [

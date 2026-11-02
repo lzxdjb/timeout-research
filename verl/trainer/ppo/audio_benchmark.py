@@ -24,6 +24,9 @@ _BENCHMARK_SPECS = {
     "rul_muchomusic": ("--rul-muchomusic", "muchomusic"),
     "voicebench_bbh": ("--voicebenchbbh", "voicebench_bbh"),
 }
+# Keep the historical implicit suite stable when adding opt-in benchmarks.
+_DEFAULT_BENCHMARKS = tuple(_BENCHMARK_SPECS)
+_BENCHMARK_SPECS["aishell1"] = ("--aishell-1", "aishell1")
 
 
 def run_audio_benchmarks(
@@ -68,7 +71,7 @@ def run_audio_benchmarks(
 
     api_key = str(config.get("api_key", "dummy"))
     served_model = str(config.get("served_model_name") or _discover_model(api_base, api_key))
-    benchmarks = list(config.get("benchmarks") or _BENCHMARK_SPECS)
+    benchmarks = list(config.get("benchmarks") or _DEFAULT_BENCHMARKS)
     unknown = sorted(set(benchmarks) - set(_BENCHMARK_SPECS))
     if unknown:
         raise ValueError(f"Unsupported audio benchmarks: {', '.join(unknown)}")

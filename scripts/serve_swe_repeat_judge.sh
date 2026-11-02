@@ -9,7 +9,18 @@ judge_host="${SWE_REPEAT_JUDGE_HOST:-0.0.0.0}"
 judge_port="${SWE_REPEAT_JUDGE_PORT:-18090}"
 [[ -f "$judge_model_path/config.json" ]] || { echo "Checkpoint config not found: $judge_model_path" >&2; exit 2; }
 IFS=',' read -ra judge_gpus <<< "$CUDA_VISIBLE_DEVICES"
-[[ "$judge_tp" =~ ^[1-9][0-9]*$ && "${#judge_gpus[@]}" -eq "$judge_tp" ]] || { echo "GPU list length must equal TP" >&2; exit 2; }
+judge_gpu_count="${#judge_gpus[@]}"
+[[ "$judge_tp" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid judge TP: $judge_tp (expected a positive integer)" >&2; exit 2; }
+# Check the number of digits before arithmetic so oversized TP values cannot overflow.
+if (( ${#judge_tp} > ${#judge_gpu_count} )) || (( judge_gpu_count % judge_tp != 0 )); then
+  echo "GPU list length ($judge_gpu_count) must be a multiple of TP ($judge_tp)" >&2
+  exit 2
+fi
+# Use all listed GPUs locally; equal GPU count and TP preserves the single replica.
+judge_inferred_dp="$((judge_gpu_count / judge_tp))"
+judge_dp="${SWE_REPEAT_JUDGE_DP:-$judge_inferred_dp}"
+[[ "$judge_dp" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid judge DP: $judge_dp (expected a positive integer)" >&2; exit 2; }
+[[ "$judge_dp" == "$judge_inferred_dp" ]] || { echo "GPU list length ($judge_gpu_count) must equal TP ($judge_tp) * DP ($judge_dp)" >&2; exit 2; }
 [[ "$judge_port" =~ ^[1-9][0-9]{0,4}$ && "$judge_port" -le 65535 ]] || { echo "Invalid judge port: $judge_port" >&2; exit 2; }
 
 # 0.0.0.0 is a bind address only. Resolve a separate client endpoint.
@@ -24,6 +35,10 @@ judge_command=(vllm serve "$judge_model_path"
   --gpu-memory-utilization "${SWE_REPEAT_JUDGE_MEMORY_FRACTION:-0.90}"
   --language-model-only --generation-config vllm
   --default-chat-template-kwargs '{"enable_thinking":false}')
+# Do not add a new vLLM flag to existing single-replica launches.
+if (( judge_dp > 1 )); then
+  judge_command+=(--data-parallel-size "$judge_dp")
+fi
 if [[ "${1:-}" == "--dry-run" ]]; then
   printf 'Judge bind address: http://%s:%s\n' "$judge_host" "$judge_port" >&2
   printf 'Judge client endpoint: %s\n' "$judge_advertise_url" >&2

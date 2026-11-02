@@ -107,12 +107,39 @@ link-local or multicast client IPs are rejected. Use a plain URL such as
 Defaults:
 
 - Checkpoint `/cpfs01/thscc/sharestorage/iwc/HithinkGPT/models/Qwen3.5-122`.
-- BF16, no quantization, GPUs `0,1,2,3`, TP=4; the remaining four GPUs are unused.
+- BF16, no quantization, GPUs `0,1,2,3`, TP=4, DP=1; the remaining four GPUs are unused.
 - Served model `swe-repeat-judge`, port 18090, 131072 context, max 4 active sequences,
   GPU memory utilization 0.90, text-only, thinking disabled.
 - Override with `SWE_REPEAT_JUDGE_CHECKPOINT`, `SWE_REPEAT_JUDGE_GPUS`,
-  `SWE_REPEAT_JUDGE_TP`, `SWE_REPEAT_JUDGE_HOST`, `SWE_REPEAT_JUDGE_PORT`, `SWE_REPEAT_JUDGE_MAX_SEQS`,
-  `SWE_REPEAT_JUDGE_MEMORY_FRACTION` as needed. GPU count must equal TP.
+  `SWE_REPEAT_JUDGE_TP`, `SWE_REPEAT_JUDGE_DP`, `SWE_REPEAT_JUDGE_HOST`, `SWE_REPEAT_JUDGE_PORT`,
+  `SWE_REPEAT_JUDGE_MAX_SEQS`, `SWE_REPEAT_JUDGE_MEMORY_FRACTION` as needed.
+
+When `SWE_REPEAT_JUDGE_DP` is unset or empty, DP is inferred as the number of
+listed GPUs divided by TP. GPU count must be a multiple of TP. An explicit DP
+must be a positive integer and satisfy `GPU count = TP * DP`. Existing launches
+with GPU count equal to TP keep DP=1 and their original vLLM command. With DP>1,
+the launcher adds `--data-parallel-size` for local replicas behind the same
+client endpoint; no external load balancer is needed. `SWE_REPEAT_JUDGE_MAX_SEQS`
+applies to each replica. Multi-replica launches require vLLM with native data
+parallel serving support (available in the inspected vLLM 0.24.0).
+
+For Qwen3-Omni on eight GPUs, use TP=4 and DP=2. The audio encoder has 20
+attention heads, so TP=8 fails during initialization even in text-only mode:
+
+```bash
+export SWE_REPEAT_JUDGE_CHECKPOINT=/cpfs01/thscc/sharestorage/iwc/HithinkOmni/user_workspace/leizhengxing/leizhengxing/swe/stock-rl-reflect/data/Qwen3-Omni-30B-A3B-Instruct
+export SWE_REPEAT_JUDGE_GPUS=0,1,2,3,4,5,6,7
+export SWE_REPEAT_JUDGE_TP=4
+export SWE_REPEAT_JUDGE_DP=2  # Optional: inferred from GPU count / TP.
+export SWE_AGENT_REPEAT_JUDGE_MAX_CONTEXT=65536
+bash scripts/serve_swe_repeat_judge.sh --dry-run
+bash scripts/serve_swe_repeat_judge.sh
+```
+
+Set the same context limit in the client environment. If this standalone server
+reports a missing `verl` package while loading the optional `verl_qwen35_omni`
+plugin, `export VLLM_PLUGINS=""` disables optional plugins; Qwen3-Omni uses the
+built-in vLLM implementation.
 
 Checkpoint configuration was inspected offline: Qwen3_5Moe architecture,
 BF16, 262144 advertised context, no quantization configuration. Actual GPU

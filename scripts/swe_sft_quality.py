@@ -18,9 +18,10 @@ import re
 import sqlite3
 from pathlib import Path
 
-from recipe.swe_agent import repetition_reward as repeat
 from recipe.swe_agent import repeat_legacy_render_v6 as sft_render
+from recipe.swe_agent import repetition_reward as repeat
 from scripts import swe_repeat_regression as replay
+from scripts.swe_sft_quality_resume import policy_source_identity
 
 VERSION = "swe-sft-quality-v1"
 CHECKS = (
@@ -371,7 +372,7 @@ def prepare_pool(args):
             "sources": sources,
             "filters": candidate_kwargs(args),
             "core_max_tool_dispatches": args.max_tool_dispatches,
-            "source": SOURCE_SHA256,
+            "source": policy_source_identity(SOURCE_SHA256),
             "builder": hashlib.sha256(Path(sft.__file__).read_bytes()).hexdigest(),
         }
     )
@@ -621,6 +622,68 @@ def judge_config(args):
     return config
 
 
+def judge_config_key(config, served_root):
+    """Identify the judging policy independently of a relocated service address."""
+    settings = dataclasses.asdict(config)
+    settings.pop("url")
+    return repeat.digest(
+        {
+            "policy": policy_source_identity(SOURCE_SHA256),
+            "reward_source": repeat.POLICY_SOURCE_SHA256,
+            "config": settings,
+            "served_root": served_root,
+        }
+    )
+
+
+def compatible_judge_keys(metadata, config, served_root):
+    """Validate old model/settings before recognizing a URL-bound legacy key."""
+    previous = metadata.get("config")
+    provenance = metadata.get("provenance") or {}
+    if not isinstance(previous, dict):
+        return set()
+    current = dataclasses.asdict(config)
+    if {k: v for k, v in previous.items() if k != "url"} != {k: v for k, v in current.items() if k != "url"}:
+        return set()
+    if (
+        provenance.get("served_root") != served_root
+        or provenance.get("policy_source_sha256") != repeat.POLICY_SOURCE_SHA256
+    ):
+        return set()
+    policy = policy_source_identity(SOURCE_SHA256)
+    if "policy_source_sha256" in metadata and policy_source_identity(metadata["policy_source_sha256"]) != policy:
+        return set()
+    common = {"policy": policy, "reward_source": repeat.POLICY_SOURCE_SHA256, "served_root": served_root}
+    return {
+        repeat.digest({**common, "config": previous}),
+        repeat.digest({**common, "config": {k: v for k, v in previous.items() if k != "url"}}),
+    }
+
+
+def relocated_artifact_result(path, config, served_root, transcript_hash, task, events, segments):
+    """Recover a completed legacy decision only from matching recorded evidence."""
+    if not path.is_file():
+        return None
+    saved = json.loads(gzip.decompress(path.read_bytes()))
+    if not isinstance(saved, dict):
+        return None
+    if (
+        saved.get("transcript_hash") != transcript_hash
+        or saved.get("public_task") != task
+        or saved.get("events") != events
+        or saved.get("actor_segments") != segments
+    ):
+        return None
+    result = saved.get("result") or {}
+    keys = compatible_judge_keys(saved, config, served_root)
+    expected = {
+        repeat.digest({"config": key, "task": task, "events": events, "segments": segments}) for key in keys
+    }
+    if result.get("stage") != "model" or result.get("error") or result.get("cache_key") not in expected:
+        return None
+    return {**result, "judge_config": saved["config"], "judge_provenance": saved["provenance"]}
+
+
 async def filter_pool(args, db, stats, fingerprint):
     from scripts import make_swe_sft_data as sft
 
@@ -630,14 +693,7 @@ async def filter_pool(args, db, stats, fingerprint):
         raise ValueError("Full SFT filtering requires --audited-pilot-dir with >=50 audited pilot cases")
     async with asyncio.timeout(min(config.timeout, 30)):
         await client.preflight()  # No synthetic fallback if the model is unavailable.
-    config_key = repeat.digest(
-        {
-            "policy": SOURCE_SHA256,
-            "reward_source": repeat.POLICY_SOURCE_SHA256,
-            "config": dataclasses.asdict(config),
-            "served_root": client.served_root,
-        }
-    )
+    config_key = judge_config_key(config, client.served_root)
     cache_dir = args.judge_cache_dir or args.output_dir / "judge_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     from scripts.swe_sft_filter_audit import sample_tasks
@@ -647,7 +703,12 @@ async def filter_pool(args, db, stats, fingerprint):
     for task in tasks:
         queue.put_nowait(task)
     if not args.pilot_cases and not args.allow_unaudited_pilot:
-        verify_pilot_audit(args.audited_pilot_dir, fingerprint, config_key)
+        pilot_path = args.audited_pilot_dir / "quality_report.json"
+        pilot = json.loads(pilot_path.read_text()) if pilot_path.is_file() else {}
+        verify_pilot_audit(
+            args.audited_pilot_dir, fingerprint, config_key,
+            compatible_judge_keys(pilot, config, client.served_root),
+        )
     # Pool counters are durable; execution counters are specific to this run.
     stats = collections.Counter({k: v for k, v in stats.items() if not k.startswith("quality_")})
     core, relaxed = {}, {}
@@ -696,11 +757,20 @@ async def filter_pool(args, db, stats, fingerprint):
                                     raise ValueError("Judgment cache key mismatch")
                                 stats["cache_hits"] += 1
                             else:
-                                result = {
-                                    **await client.judge_consensus(c.input_text, events, actor_segments=segments),
-                                    "stage": "model",
-                                    "cache_key": cache_key,
-                                }
+                                result = relocated_artifact_result(
+                                    args.output_dir / "quality_artifacts" / f"{transcript_hash}.json.gz",
+                                    config, client.served_root, transcript_hash, c.input_text, events, segments,
+                                )
+                                if result is None:
+                                    result = {
+                                        **await client.judge_consensus(c.input_text, events, actor_segments=segments),
+                                        "stage": "model",
+                                        "judge_config": dataclasses.asdict(config),
+                                        "judge_provenance": client.provenance(),
+                                    }
+                                else:
+                                    stats["cache_hits"] += 1
+                                result["cache_key"] = cache_key
                                 # Transient errors are never durable cached rejections.
                                 if not result.get("error"):
                                     temporary = cache_path.with_suffix(f".{os.getpid()}.tmp")
@@ -724,8 +794,8 @@ async def filter_pool(args, db, stats, fingerprint):
                         "actor_segments": segments,
                         "messages": client.messages(c.input_text, events, actor_segments=segments),
                         "result": result,
-                        "config": dataclasses.asdict(config),
-                        "provenance": client.provenance(),
+                        "config": result.get("judge_config", dataclasses.asdict(config)),
+                        "provenance": result.get("judge_provenance", client.provenance()),
                         "source": provenance,
                     }
                     audit_dir = args.output_dir / "quality_artifacts"
@@ -963,12 +1033,12 @@ def write_exclusions(args, tiers):
         (args.output_dir / "rl_exclusion_report.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
-def verify_pilot_audit(directory, fingerprint, config_key):
+def verify_pilot_audit(directory, fingerprint, config_key, compatible_keys=()):
     """A full run must use the exact audited policy, sources and model configuration."""
     if directory is None:
         raise ValueError("Full SFT filtering requires --audited-pilot-dir with >=50 audited pilot cases")
     from scripts.swe_sft_filter_audit import validate_audit
 
     report = validate_audit(directory)
-    if report["source_fingerprint"] != fingerprint or report["config_key"] != config_key:
+    if report["source_fingerprint"] != fingerprint or report["config_key"] not in {config_key, *compatible_keys}:
         raise ValueError("Pilot audit sources/policy/model configuration differ from full run")

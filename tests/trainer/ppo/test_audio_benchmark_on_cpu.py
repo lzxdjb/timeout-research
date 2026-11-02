@@ -116,8 +116,9 @@ def test_run_audio_benchmarks_reads_fresh_unique_run(monkeypatch: pytest.MonkeyP
     assert metrics["val-audio/completed"] == 1.0
 
 
-def test_all_supported_benchmarks_use_their_gage_flags_and_dataset_directories(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("include_aishell1", [False, True])
+def test_supported_benchmarks_use_their_gage_flags_and_dataset_directories(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, include_aishell1: bool
 ) -> None:
     gage_root = tmp_path / "gage"
     runner = gage_root / "scripts" / "run" / "run_suite.sh"
@@ -136,12 +137,16 @@ def test_all_supported_benchmarks_use_their_gage_flags_and_dataset_directories(
         "--rul-muchomusic": "muchomusic",
         "--voicebenchbbh": "voicebench_bbh",
     }
+    if include_aishell1:
+        expected["--aishell-1"] = "aishell1"
 
     monkeypatch.setattr(audio_benchmark, "uuid4", lambda: SimpleNamespace(hex="0123456789abcdef"))
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
         for flag, directory in expected.items():
             assert command[command.index(flag) + 1] == str(data_root / directory)
+        if not include_aishell1:
+            assert "--aishell-1" not in command
         run_id = command[command.index("--run-id") + 1]
         summary = output_root / run_id / "suite_summary.json"
         summary.parent.mkdir(parents=True)
@@ -157,6 +162,7 @@ def test_all_supported_benchmarks_use_their_gage_flags_and_dataset_directories(
             "output_dir": str(output_root),
             "served_model_name": "model",
             "max_samples": 20,
+            "benchmarks": list(audio_benchmark._BENCHMARK_SPECS) if include_aishell1 else None,
         },
         server_addresses=["127.0.0.1:8000"],
         model_path="/models/test",

@@ -141,6 +141,15 @@ from verl.workers.utils.losses import value_loss
 from verl.workers.utils.padding import response_from_nested, response_to_nested
 
 
+def _audio_validation_only(config: DictConfig) -> bool:
+    """Select audio-only validation without changing legacy validation defaults."""
+    audio_config = config.trainer.get("audio_benchmark", None)
+    only = bool(audio_config and audio_config.get("only", False))
+    if only and not bool(audio_config.get("enabled", False)):
+        raise ValueError("trainer.audio_benchmark.only=True requires trainer.audio_benchmark.enabled=True")
+    return only
+
+
 def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
     params["top_p"] = 1.0
     params["top_k"] = -1
@@ -715,7 +724,9 @@ class PPOTrainer(ABC):
         )
 
         # perform validation before training
-        if self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", True) or (
+            _audio_validation_only(self.config) and self.config.trainer.get("val_only", False)
+        ):
             self.on_validate_begin()
             val_metrics = self._validate()
             self.on_validate_end()
@@ -1027,6 +1038,19 @@ class PPOTrainer(ABC):
 
     def _init_dataloader(self):
         """Initialize train and validate dataloader."""
+        audio_only = _audio_validation_only(self.config)
+        if audio_only and self.config.trainer.get("val_only", False):
+            # Keep actor initialization and the initial weight sync, but do not
+            # require SWE parquet data for a standalone audio evaluation.
+            self.train_dataset = self.val_dataset = None
+            self.train_dataloader = self.val_dataloader = None
+            self.train_dataloader_it = None
+            self.steps_per_epoch = 1
+            # Model engines still initialize an optimizer/scheduler. A positive
+            # horizon is needed even though fit() exits before its first step.
+            self._set_training_steps(1)
+            logger.info("Audio-only evaluation: skipped train and SWE validation datasets")
+            return
         self.train_dataset = create_rl_dataset(
             self.config.data.train_files,
             self.config.data,
@@ -1035,15 +1059,17 @@ class PPOTrainer(ABC):
             is_train=True,
             max_samples=self.config.data.get("train_max_samples", -1),
         )
-        self.val_dataset = create_rl_dataset(
-            self.config.data.val_files,
-            self.config.data,
-            self.tokenizer,
-            self.processor,
-            is_train=False,
-            max_samples=self.config.data.get("val_max_samples", -1),
-        )
-        if strict_validation_enabled():
+        self.val_dataset = None
+        if not audio_only:
+            self.val_dataset = create_rl_dataset(
+                self.config.data.val_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                is_train=False,
+                max_samples=self.config.data.get("val_max_samples", -1),
+            )
+        if not audio_only and strict_validation_enabled():
             if self.trainer_mode != "sync":
                 raise ValueError("Strict SWE validation currently requires the synchronous V1 trainer")
             self._validation_roster, self._validation_roster_provenance = load_roster(self.config.data.val_files)
@@ -1086,18 +1112,24 @@ class PPOTrainer(ABC):
             sampler=create_rl_sampler(self.config.data, self.train_dataset),
         )
         self.train_dataloader_it = None
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=self.config.data.val_batch_size or len(self.val_dataset),
-            num_workers=self.config.data["dataloader_num_workers"],
-            shuffle=self.config.data.get("validation_shuffle", True),
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
-        logger.info(
-            f"train and validate dataloader initialized, train dataset size: "
-            f"{len(self.train_dataset)}, val dataset size: {len(self.val_dataset)}"
-        )
+        self.val_dataloader = None
+        if not audio_only:
+            self.val_dataloader = StatefulDataLoader(
+                dataset=self.val_dataset,
+                batch_size=self.config.data.val_batch_size or len(self.val_dataset),
+                num_workers=self.config.data["dataloader_num_workers"],
+                shuffle=self.config.data.get("validation_shuffle", True),
+                drop_last=False,
+                collate_fn=collate_fn,
+            )
+            logger.info(
+                f"train and validate dataloader initialized, train dataset size: "
+                f"{len(self.train_dataset)}, val dataset size: {len(self.val_dataset)}"
+            )
+        else:
+            logger.info(
+                "Train dataloader initialized, train dataset size: %d; audio-only validation", len(self.train_dataset)
+            )
 
         self.steps_per_epoch = len(self.train_dataset) // self.config.data.train_batch_size
 
@@ -1105,6 +1137,10 @@ class PPOTrainer(ABC):
         total_training_steps = self.steps_per_epoch * self.config.trainer.total_epochs
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
+        self._set_training_steps(total_training_steps)
+
+    def _set_training_steps(self, total_training_steps: int):
+        """Set the scheduler horizon, including initialization for evaluation."""
         self.total_training_steps = total_training_steps
         logger.info(f"Total training steps: {self.total_training_steps}")
 
@@ -1223,7 +1259,9 @@ class PPOTrainer(ABC):
 
         # 4. load dataloader checkpoint
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
+        if self.train_dataloader is None:
+            logger.info("Audio-only evaluation: skipped training dataloader checkpoint")
+        elif os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
@@ -1360,6 +1398,8 @@ class PPOTrainer(ABC):
             f.write(str(self.global_steps))
 
     def _validate(self) -> dict[str, float]:
+        if _audio_validation_only(self.config):
+            return self._run_optional_audio_validation()
         strict = strict_validation_enabled()
         validation_started = time.monotonic()
         validation_attempts = []
