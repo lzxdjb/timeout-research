@@ -2157,9 +2157,16 @@ class PPOTrainer(ABC):
         try:
             if self.train_dataloader_it is None:
                 self.train_dataloader_it = iter(self.train_dataloader)
+            if self.config.data.get("opd_source_mix", None):
+                # StatefulDataLoader restores sampler state lazily in iter().
+                # Apply the current optimizer step afterwards, so a resumed
+                # phase boundary cannot revert to the checkpoint's old phase.
+                self.train_dataloader.sampler.set_step(self.global_steps)
             batch_dict = next(self.train_dataloader_it)
         except StopIteration:
             self.train_dataloader_it = iter(self.train_dataloader)
+            if self.config.data.get("opd_source_mix", None):
+                self.train_dataloader.sampler.set_step(self.global_steps)
             batch_dict = next(self.train_dataloader_it)
 
         batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)

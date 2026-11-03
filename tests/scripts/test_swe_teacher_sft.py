@@ -157,7 +157,7 @@ def test_main_resumes_existing_pipeline_at_new_teacher_and_judge_address(tmp_pat
     contract = tmp_path / "pipeline_config.json"
     contract.write_text(json.dumps(original))
     saved = contract.read_bytes()
-    current = {**original, "base_url": "http://teacher-moved:18090"}
+    current = {**original, "base_url": "http://teacher-moved:18090", "concurrency": 32}
     monkeypatch.setattr(pipeline, "configuration", lambda: current)
     monkeypatch.setattr(pipeline.sys, "argv", ["teacher-sft", "all", "--output-root", str(tmp_path)])
     calls = []
@@ -172,6 +172,7 @@ def test_main_resumes_existing_pipeline_at_new_teacher_and_judge_address(tmp_pat
     pipeline.main()
     assert len(calls) == 2
     assert calls[0][1]["LLM_API_URL"] == "http://teacher-moved:18090/v1"
+    assert calls[0][0][calls[0][0].index("--concurrency") + 1] == "32"
     assert calls[1][1]["SWE_SFT_JUDGE_URL"] == "http://teacher-moved:18090"
     assert contract.read_bytes() == saved
 
@@ -190,7 +191,7 @@ def test_endpoint_migration_keeps_other_pipeline_settings_frozen(tmp_path, monke
     monkeypatch.setattr(pipeline.sys, "argv", ["teacher-sft", "collect", "--output-root", str(tmp_path)])
     calls = []
     monkeypatch.setattr(pipeline, "stage", lambda *args: calls.append(args))
-    with pytest.raises(ValueError, match="Pipeline settings changed"):
+    with pytest.raises(ValueError, match=f"Pipeline settings changed.*{key}"):
         pipeline.main()
     assert not calls
     assert contract.read_bytes() == saved

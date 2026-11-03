@@ -71,6 +71,7 @@ def test_audio_launcher_keeps_distillation_startup_options_consistent(
             SWE_AGENT_OPD_CANCEL_ON_CUTOFF="1",
             SWE_AGENT_OPD_CUTOFF_WAIT_FOR_SCORING="1",
             SWE_AGENT_OPD_PHASE_TIMING="1",
+            AUDIO_BENCHMARK_LOAD_BALANCE="False",
         )
     result = subprocess.run(
         ["bash", str(REPO_ROOT / "running_script_6" / "audio_test.sh")],
@@ -88,3 +89,7 @@ def test_audio_launcher_keeps_distillation_startup_options_consistent(
     assert opd_cancel_on_cutoff(startup_config) is (not audio_only)
     assert opd_phase_timing_enabled(startup_config) is (not audio_only)
     assert opd_wait_for_scoring_on_cutoff(startup_config) is (not audio_only and inherited_flags)
+    audio_config = OmegaConf.from_dotlist(
+        [arg.lstrip("+") for arg in args if arg.lstrip("+").startswith("trainer.audio_benchmark.")]
+    )
+    assert audio_config.trainer.audio_benchmark.load_balance is (not inherited_flags)

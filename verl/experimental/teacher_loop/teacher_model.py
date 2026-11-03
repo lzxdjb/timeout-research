@@ -239,5 +239,9 @@ class MultiTeacherModelManager:
             from verl.experimental.teacher_loop.external_teacher import ExternalTeacherClient
 
             for key, handle in self.external_scoring_handles.items():
-                teacher_clients[key] = ExternalTeacherClient(config=self.config, scoring_handle=handle)
+                teacher_clients[key] = ExternalTeacherClient(
+                    config=self.config,
+                    scoring_handle=handle,
+                    external_config=self.distillation_config.teacher_models[key].external,
+                )
         return teacher_clients

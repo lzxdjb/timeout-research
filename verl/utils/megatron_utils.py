@@ -304,6 +304,7 @@ def make_megatron_module(
     override_ddp_config: dict[str, Any] = None,
     peft_cls: Any = None,
     peft_config: Any = None,
+    post_model_creation_callbacks: list | None = None,
 ):
     from verl.models.mcore.config_converter import get_hf_rope_theta
 
@@ -330,7 +331,10 @@ def make_megatron_module(
             )
             value_model_hook = make_value_model(hidden_size, provider.sequence_parallel)
 
-        post_model_creation_callbacks = []
+        # Opt-in modules must exist before Float16/DDP buffers and optimizer
+        # parameter groups are constructed. Never attach trainable parameters
+        # to an already wrapped model.
+        post_model_creation_callbacks = list(post_model_creation_callbacks or [])
         if wrap_config.is_value_model:
             post_model_creation_callbacks.append(value_model_hook)
         if override_model_config.get("moe_config", {}).get("freeze_moe_router", False):

@@ -13,9 +13,9 @@
 # limitations under the License.
 """Teacher-forced scoring through an already deployed vLLM HTTP server.
 
-Only sampled-token distillation is supported. The student transcript is sent as
-token IDs without chat-template rendering, tokenization, or special-token insertion.
-The caller must use compatible text tokenizers and must not send audio trajectories.
+The default text protocol sends exact student token IDs and requires compatible
+text tokenizers. The opt-in audio protocol scores a complete candidate sequence
+in the native audio teacher vocabulary and returns a scalar sequence score.
 """
 
 import asyncio
@@ -91,6 +91,14 @@ class ExternalTeacherScorer:
         self._unsupported_ids = set(config.unsupported_token_ids)
         self._phase_timing = phase_timing
         self._phase_metrics = PhaseMetrics()
+        self._audio_codec = None
+
+    def _get_audio_codec(self):
+        if self._audio_codec is None:
+            from verl.experimental.teacher_loop.audio_candidate import AudioCandidateCodec
+
+            self._audio_codec = AudioCandidateCodec(self.config)
+        return self._audio_codec
 
     @contextmanager
     def _timed_phase(self, phase: str):
@@ -168,7 +176,24 @@ class ExternalTeacherScorer:
                 "Prompt-logprob scoring reserves one generated token. Increase the actual teacher serving limit "
                 "before training; changing only the client configuration cannot increase server capacity."
             )
+        if self.config.protocol == "audio_candidate_score":
+            await asyncio.to_thread(self._get_audio_codec)
         return {"model_name": self.config.model_name, "max_model_len": served_limit}
+
+    async def score_audio_candidate(self, trajectory: dict, audio_data=None, mm_processor_kwargs=None) -> dict:
+        if self.config.protocol != "audio_candidate_score":
+            raise ValueError("Audio sequence scoring requires the explicit audio_candidate_score protocol.")
+        with self._timed_phase("teacher_score"):
+            codec = self._get_audio_codec()
+            payload, expected = await asyncio.to_thread(codec.prepare, trajectory, audio_data, mm_processor_kwargs)
+            with self._timed_phase("teacher_queue"):
+                await self._semaphore.acquire()
+            try:
+                with self._timed_phase("teacher_http"):
+                    result = await self._request("POST", "/chat/completions", payload)
+            finally:
+                self._semaphore.release()
+            return codec.parse(result, expected)
 
     async def score(self, prompt_ids: list[int], sampling_params: dict[str, Any]) -> dict[str, list]:
         with self._timed_phase("teacher_score"):
@@ -211,9 +236,10 @@ class ExternalTeacherScorer:
 class ExternalTeacherClient(LLMServerClient):
     """Serializable rollout-worker proxy to the shared HTTP scoring actor."""
 
-    def __init__(self, config, scoring_handle):
+    def __init__(self, config, scoring_handle, external_config=None):
         super().__init__(config=config)
         self._scoring_handle = scoring_handle
+        self._protocol = getattr(external_config, "protocol", "text_token_ids")
 
     async def generate(
         self,
@@ -228,6 +254,14 @@ class ExternalTeacherClient(LLMServerClient):
         **kwargs,
     ) -> TokenOutput:
         try:
+            if self._protocol == "audio_candidate_score":
+                if image_data or video_data:
+                    raise ValueError("Audio sequence teacher does not accept image/video trajectories.")
+                scoring_ref = self._scoring_handle.score_audio_candidate.remote(
+                    kwargs.get("trajectory"), audio_data, mm_processor_kwargs
+                )
+                extra_fields = await await_cancellable_ray_ref(scoring_ref)
+                return TokenOutput(token_ids=[], extra_fields=extra_fields)
             if any(data is not None and len(data) > 0 for data in (image_data, video_data, audio_data)):
                 raise NotImplementedError("External teacher OPD currently supports text-only trajectories.")
             scoring_ref = self._scoring_handle.score.remote(prompt_ids, sampling_params)

@@ -34,12 +34,13 @@ def setting(name: str, default: object) -> str:
 
 
 def resume_configuration(config: dict) -> dict:
-    """Freeze experiment settings while allowing the same server to relocate.
+    """Freeze experiment settings while allowing runtime placement and capacity changes.
 
     Keep the original pipeline_config.json for provenance. The current address
-    is passed to both generation and quality judging on each invocation.
+    is passed to both generation and quality judging on each invocation, and
+    concurrency controls scheduling rather than task identity or sampling.
     """
-    return {key: value for key, value in config.items() if key != "base_url"}
+    return {key: value for key, value in config.items() if key not in {"base_url", "concurrency"}}
 
 
 def configuration() -> dict:
@@ -463,8 +464,14 @@ def main() -> None:
     root = args.output_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     contract = root / "pipeline_config.json"
-    if contract.exists() and resume_configuration(json.loads(contract.read_text())) != resume_configuration(config):
-        raise ValueError("Pipeline settings changed; choose a new TEACHER_OUTPUT_ROOT")
+    if contract.exists():
+        previous = resume_configuration(json.loads(contract.read_text()))
+        current = resume_configuration(config)
+        changed = sorted(key for key in previous.keys() | current.keys() if previous.get(key) != current.get(key))
+        if changed:
+            raise ValueError(
+                "Pipeline settings changed (" + ", ".join(changed) + "); choose a new TEACHER_OUTPUT_ROOT"
+            )
     if not contract.exists():
         with contract.open("x") as stream:
             json.dump(config, stream, indent=2)

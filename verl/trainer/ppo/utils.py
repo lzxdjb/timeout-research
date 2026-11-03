@@ -147,6 +147,14 @@ def create_rl_sampler(data_config, dataset):
     Returns:
         sampler (Sampler): The sampler.
     """
+    source_mix = data_config.get("opd_source_mix", None)
+    if source_mix:
+        if data_config.get("dataloader_num_workers", 0) != 0:
+            raise ValueError("Audio OPD source quotas require dataloader_num_workers=0")
+        from verl.utils.dataset.audio_opd_sampler import AudioOPDQuotaSampler
+
+        return AudioOPDQuotaSampler(dataset, source_mix, data_config.train_batch_size, data_config.get("seed", 0))
+
     import torch
     from torch.utils.data import SequentialSampler
 

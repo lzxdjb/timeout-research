@@ -112,6 +112,43 @@ class AsyncTeacherLLMServerManager:
             )
         return routing_key
 
+    @property
+    def has_audio_teacher(self) -> bool:
+        return any(
+            teacher.backend == "external" and teacher.external.protocol == "audio_candidate_score"
+            for teacher in self.teacher_model_configs.values()
+        )
+
+    def uses_audio_sequence_score(self, routing_key: Optional[str]) -> bool:
+        teacher = self.teacher_model_configs[self._resolve_teacher_key(routing_key)]
+        return teacher.backend == "external" and teacher.external.protocol == "audio_candidate_score"
+
+    async def compute_teacher_sequence_score_single(
+        self,
+        sequence_ids: list[int],
+        trajectory: dict,
+        multi_modal_data=None,
+        mm_processor_kwargs=None,
+        routing_key=None,
+    ) -> dict:
+        if not self.uses_audio_sequence_score(routing_key):
+            raise ValueError("Sequence candidate scoring was requested for a token-ID teacher.")
+        key = self._resolve_teacher_key(routing_key)
+        data = multi_modal_data or {}
+        output = await self.teacher_client[key].generate(
+            request_id=uuid4().hex,
+            prompt_ids=sequence_ids,
+            sampling_params=_get_teacher_sampling_params(
+                self.teacher_model_configs[key], self.distillation_loss_config
+            ),
+            image_data=data.get("images"),
+            video_data=data.get("videos"),
+            audio_data=data.get("audios"),
+            mm_processor_kwargs=mm_processor_kwargs,
+            trajectory=trajectory,
+        )
+        return output.extra_fields
+
     async def compute_teacher_logprobs_single(
         self,
         sequence_ids: list[int],

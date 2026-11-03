@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,9 +117,9 @@ def test_run_audio_benchmarks_reads_fresh_unique_run(monkeypatch: pytest.MonkeyP
     assert metrics["val-audio/completed"] == 1.0
 
 
-@pytest.mark.parametrize("include_aishell1", [False, True])
+@pytest.mark.parametrize("include_additional_audio", [False, True])
 def test_supported_benchmarks_use_their_gage_flags_and_dataset_directories(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, include_aishell1: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, include_additional_audio: bool
 ) -> None:
     gage_root = tmp_path / "gage"
     runner = gage_root / "scripts" / "run" / "run_suite.sh"
@@ -137,16 +138,21 @@ def test_supported_benchmarks_use_their_gage_flags_and_dataset_directories(
         "--rul-muchomusic": "muchomusic",
         "--voicebenchbbh": "voicebench_bbh",
     }
-    if include_aishell1:
-        expected["--aishell-1"] = "aishell1"
+    additional_audio = {
+        "--aishell-1": "aishell1",
+        "--librispeech": "librispeech",
+        "--wenetspeech": "wenetspeech",
+    }
+    if include_additional_audio:
+        expected.update(additional_audio)
 
     monkeypatch.setattr(audio_benchmark, "uuid4", lambda: SimpleNamespace(hex="0123456789abcdef"))
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
         for flag, directory in expected.items():
             assert command[command.index(flag) + 1] == str(data_root / directory)
-        if not include_aishell1:
-            assert "--aishell-1" not in command
+        if not include_additional_audio:
+            assert not set(additional_audio).intersection(command)
         run_id = command[command.index("--run-id") + 1]
         summary = output_root / run_id / "suite_summary.json"
         summary.parent.mkdir(parents=True)
@@ -162,11 +168,68 @@ def test_supported_benchmarks_use_their_gage_flags_and_dataset_directories(
             "output_dir": str(output_root),
             "served_model_name": "model",
             "max_samples": 20,
-            "benchmarks": list(audio_benchmark._BENCHMARK_SPECS) if include_aishell1 else None,
+            "benchmarks": list(audio_benchmark._BENCHMARK_SPECS) if include_additional_audio else None,
         },
         server_addresses=["127.0.0.1:8000"],
         model_path="/models/test",
         experiment_name="experiment",
+        global_step=0,
+    )
+
+    assert metrics["val-audio/completed"] == 1.0
+
+
+def test_full_audio_suite_runs_all_samples_without_vision_benchmarks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gage_root = tmp_path / "gage"
+    runner = gage_root / "scripts" / "run" / "run_suite.sh"
+    runner.parent.mkdir(parents=True)
+    runner.touch()
+    data_root = tmp_path / "data"
+    output_root = tmp_path / "results"
+    benchmarks = ["aishell1", "librispeech", "wenetspeech", "clothoaqa", "rul_muchomusic", "voicebench_bbh"]
+    expected_dataset_args = [
+        "--aishell-1",
+        str(data_root / "aishell1"),
+        "--librispeech",
+        str(data_root / "librispeech"),
+        "--wenetspeech",
+        str(data_root / "wenetspeech"),
+        "--clothoaqa",
+        str(data_root / "clothoaqa"),
+        "--rul-muchomusic",
+        str(data_root / "muchomusic"),
+        "--voicebenchbbh",
+        str(data_root / "voicebench_bbh"),
+    ]
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        # GAGE interprets an integer after each dataset path as a sample limit.
+        # Requiring the exact argument tail also excludes extra dataset flags.
+        assert command[command.index("--no-resume") + 1 :] == expected_dataset_args
+        assert "--max-samples" not in command
+        assert "--sample-seed" not in command
+        run_id = command[command.index("--run-id") + 1]
+        summary = output_root / run_id / "suite_summary.json"
+        summary.parent.mkdir(parents=True)
+        _write_summary(summary, run_id=run_id)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(audio_benchmark.subprocess, "run", fake_run)
+    metrics = audio_benchmark.run_audio_benchmarks(
+        {
+            "enabled": True,
+            "gage_root": str(gage_root),
+            "data_root": str(data_root),
+            "output_dir": str(output_root),
+            "served_model_name": "model",
+            "benchmarks": benchmarks,
+            "max_samples": None,
+        },
+        server_addresses=["127.0.0.1:8000"],
+        model_path="/models/test",
+        experiment_name="full-audio",
         global_step=0,
     )
 
@@ -227,3 +290,259 @@ def test_success_without_expected_summary_reports_recent_runs(
             experiment_name="experiment",
             global_step=0,
         )
+
+
+@pytest.mark.parametrize(
+    ("addresses", "overrides", "expected_bases", "balanced"),
+    [
+        (
+            ["127.0.0.1:8000", "http://127.0.0.1:8001/v1", "http://127.0.0.1:8000/v1/"],
+            {},
+            ["http://127.0.0.1:8000/v1", "http://127.0.0.1:8001/v1"],
+            True,
+        ),
+        (["127.0.0.1:8000"], {}, ["http://127.0.0.1:8000/v1"], False),
+        (
+            ["127.0.0.1:8000", "http://127.0.0.1:8000/v1/"],
+            {},
+            ["http://127.0.0.1:8000/v1"],
+            False,
+        ),
+        (
+            ["127.0.0.1:8000", "127.0.0.1:8001"],
+            {"load_balance": False},
+            ["http://127.0.0.1:8000/v1", "http://127.0.0.1:8001/v1"],
+            False,
+        ),
+        (
+            ["127.0.0.1:8000", "127.0.0.1:8001"],
+            {"api_base": "http://dedicated:9000/v1"},
+            ["http://dedicated:9000/v1"],
+            False,
+        ),
+    ],
+)
+def test_audio_replica_routing_preserves_endpoint_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, addresses, overrides, expected_bases, balanced
+) -> None:
+    runner = tmp_path / "gage/scripts/run/run_suite.sh"
+    runner.parent.mkdir(parents=True)
+    runner.touch()
+    output_root = tmp_path / "results"
+    router_events = []
+
+    class FakeRouter:
+        api_base = "http://127.0.0.1:9001/v1"
+
+        def __init__(self, upstream_api_bases):
+            assert balanced
+            assert upstream_api_bases == expected_bases
+
+        def __enter__(self):
+            router_events.append("started")
+            return self
+
+        def __exit__(self, *exc):
+            router_events.append("closed")
+
+    def discover_model(api_base, api_key):
+        # Discover the model before starting the router, using a real replica.
+        assert api_base == expected_bases[0]
+        assert api_key == "dummy"
+        assert not router_events
+        return "trained-audio-model"
+
+    def fake_run(command, **kwargs):
+        assert router_events == (["started"] if balanced else [])
+        assert command[command.index("--external-api-base") + 1] == (
+            FakeRouter.api_base if balanced else expected_bases[0]
+        )
+        assert command[command.index("--external-model-name") + 1] == "trained-audio-model"
+        assert command[command.index("--concurrency") + 1] == "64"
+        run_id = command[command.index("--run-id") + 1]
+        summary = output_root / run_id / "suite_summary.json"
+        summary.parent.mkdir(parents=True)
+        _write_summary(summary, run_id=run_id)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(audio_benchmark, "AudioBenchmarkRouter", FakeRouter)
+    monkeypatch.setattr(audio_benchmark, "_discover_model", discover_model)
+    monkeypatch.setattr(audio_benchmark.subprocess, "run", fake_run)
+    metrics = audio_benchmark.run_audio_benchmarks(
+        {
+            "enabled": True,
+            "gage_root": str(tmp_path / "gage"),
+            "data_root": str(tmp_path / "data"),
+            "output_dir": str(output_root),
+            "benchmarks": ["aishell2"],
+            "concurrency": 64,
+            **overrides,
+        },
+        server_addresses=addresses,
+        model_path="/models/trained-audio-model",
+        experiment_name="audio",
+        global_step=0,
+    )
+
+    assert metrics["val-audio/completed"] == 1.0
+    assert router_events == (["started", "closed"] if balanced else [])
+
+
+@pytest.mark.parametrize("runner_raises", [False, True])
+def test_audio_replica_router_closes_when_suite_fails(monkeypatch, tmp_path, runner_raises) -> None:
+    runner = tmp_path / "gage/scripts/run/run_suite.sh"
+    runner.parent.mkdir(parents=True)
+    runner.touch()
+    router_events = []
+
+    class FakeRouter:
+        api_base = "http://127.0.0.1:9001/v1"
+
+        def __init__(self, upstream_api_bases):
+            pass
+
+        def __enter__(self):
+            router_events.append("started")
+            return self
+
+        def __exit__(self, *exc):
+            router_events.append("closed")
+
+    def fake_run(command, **kwargs):
+        if runner_raises:
+            raise OSError("Cannot launch suite")
+        return subprocess.CompletedProcess(command, 1)
+
+    monkeypatch.setattr(audio_benchmark, "AudioBenchmarkRouter", FakeRouter)
+    monkeypatch.setattr(audio_benchmark.subprocess, "run", fake_run)
+    with pytest.raises(OSError if runner_raises else RuntimeError):
+        audio_benchmark.run_audio_benchmarks(
+            {
+                "enabled": True,
+                "gage_root": str(tmp_path / "gage"),
+                "data_root": str(tmp_path / "data"),
+                "output_dir": str(tmp_path / "results"),
+                "served_model_name": "model",
+                "benchmarks": ["aishell2"],
+            },
+            server_addresses=["127.0.0.1:8000", "127.0.0.1:8001"],
+            model_path="/models/test",
+            experiment_name="audio",
+            global_step=0,
+        )
+
+    assert router_events == ["started", "closed"]
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "exception"])
+@pytest.mark.parametrize("explicit_control", [False, True])
+def test_audio_control_storage_is_scoped_and_keeps_artifacts_in_output_dir(
+    monkeypatch, tmp_path, outcome, explicit_control
+) -> None:
+    runner = tmp_path / "gage/scripts/run/run_suite.sh"
+    runner.parent.mkdir(parents=True)
+    runner.touch()
+    output_root = tmp_path / "results"
+    user_control_root = tmp_path / "user-control"
+    if explicit_control:
+        monkeypatch.setenv("GAGE_SUITE_CONTROL_DIR", str(user_control_root))
+        user_control_root.mkdir()
+        (user_control_root / "existing.txt").write_text("preserve this file")
+    else:
+        monkeypatch.delenv("GAGE_SUITE_CONTROL_DIR", raising=False)
+    observed_roots = []
+
+    def fake_run(command, **kwargs):
+        child_env = kwargs["env"]
+        control_root = Path(child_env["GAGE_SUITE_CONTROL_DIR"])
+        observed_roots.append(control_root)
+        assert control_root.is_dir()
+        if explicit_control:
+            assert control_root == user_control_root
+        else:
+            assert control_root.parent == Path("/tmp")
+            assert control_root.name.startswith("verl-audio-control-")
+            assert "GAGE_SUITE_CONTROL_DIR" not in os.environ
+        assert command[command.index("--output-dir") + 1] == str(output_root)
+        run_id = command[command.index("--run-id") + 1]
+        if outcome == "exception":
+            raise OSError("Cannot launch suite")
+        summary = output_root / run_id / "suite_summary.json"
+        summary.parent.mkdir(parents=True)
+        _write_summary(summary, run_id=run_id)
+        return subprocess.CompletedProcess(command, 1 if outcome == "failure" else 0)
+
+    monkeypatch.setattr(audio_benchmark.subprocess, "run", fake_run)
+    config = {
+        "enabled": True,
+        "gage_root": str(tmp_path / "gage"),
+        "data_root": str(tmp_path / "data"),
+        "output_dir": str(output_root),
+        "served_model_name": "model",
+        "benchmarks": ["aishell2"],
+    }
+    kwargs = {
+        "server_addresses": ["127.0.0.1:8000"],
+        "model_path": "/models/test",
+        "experiment_name": "audio",
+        "global_step": 0,
+    }
+    if outcome == "success":
+        assert audio_benchmark.run_audio_benchmarks(config, **kwargs)["val-audio/completed"] == 1.0
+    else:
+        with pytest.raises(OSError if outcome == "exception" else RuntimeError):
+            audio_benchmark.run_audio_benchmarks(config, **kwargs)
+    assert len(observed_roots) == 1
+    if explicit_control:
+        assert (user_control_root / "existing.txt").read_text() == "preserve this file"
+        assert os.environ["GAGE_SUITE_CONTROL_DIR"] == str(user_control_root)
+    else:
+        assert not observed_roots[0].exists()
+        assert "GAGE_SUITE_CONTROL_DIR" not in os.environ
+    if outcome != "exception":
+        assert len(list(output_root.glob("*/suite_summary.json"))) == 1
+
+
+def test_audio_control_storage_closes_if_router_cannot_start(monkeypatch, tmp_path) -> None:
+    runner = tmp_path / "gage/scripts/run/run_suite.sh"
+    runner.parent.mkdir(parents=True)
+    runner.touch()
+    monkeypatch.delenv("GAGE_SUITE_CONTROL_DIR", raising=False)
+    observed_roots = []
+    original_storage = audio_benchmark.TemporaryDirectory
+
+    def capture_storage(**kwargs):
+        storage = original_storage(**kwargs)
+        observed_roots.append(Path(storage.name))
+        return storage
+
+    class FailingRouter:
+        def __init__(self, upstream_api_bases):
+            pass
+
+        def __enter__(self):
+            assert observed_roots[0].is_dir()
+            raise RuntimeError("Router failed to start")
+
+        def __exit__(self, *exc):
+            pass
+
+    monkeypatch.setattr(audio_benchmark, "TemporaryDirectory", capture_storage)
+    monkeypatch.setattr(audio_benchmark, "AudioBenchmarkRouter", FailingRouter)
+    with pytest.raises(RuntimeError, match="Router failed to start"):
+        audio_benchmark.run_audio_benchmarks(
+            {
+                "enabled": True,
+                "gage_root": str(tmp_path / "gage"),
+                "data_root": str(tmp_path / "data"),
+                "output_dir": str(tmp_path / "results"),
+                "served_model_name": "model",
+                "benchmarks": ["aishell2"],
+            },
+            server_addresses=["127.0.0.1:8000", "127.0.0.1:8001"],
+            model_path="/models/test",
+            experiment_name="audio",
+            global_step=0,
+        )
+    assert len(observed_roots) == 1
+    assert not observed_roots[0].exists()

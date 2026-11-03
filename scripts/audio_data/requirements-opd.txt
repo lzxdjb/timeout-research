@@ -1,0 +1,4 @@
+# Additional CPU audio dependencies for the existing verl training environment.
+soundfile>=0.12
+# Keep support for existing training images using NumPy 1.26.
+scipy>=1.13,<1.16

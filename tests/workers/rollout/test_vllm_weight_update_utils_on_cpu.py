@@ -366,3 +366,78 @@ def test_actor_audio_across_multiple_ipc_buckets_is_preserved(tmp_path, monkeypa
     worker.update_weights_from_ipc(global_steps=6)
     assert events[-1] == "post_process"
     torch.testing.assert_close(model.audio_tower.bias, torch.full((2,), 52.0))
+
+
+@pytest.mark.parametrize("missing_projector_bias", [False, True])
+def test_trainable_projector_across_ipc_buckets_restores_only_encoder(tmp_path, monkeypatch, missing_projector_bias):
+    events = []
+    worker, model = _audio_update_worker(tmp_path, monkeypatch, events)
+
+    class Tower(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Linear(4, 4)
+            self.proj1 = torch.nn.Linear(4, 4)
+            self.proj2 = torch.nn.Linear(4, 2)
+
+        @torch.no_grad()
+        def load_weights(self, weights):
+            params = dict(self.named_parameters())
+            loaded = set()
+            for name, tensor in weights:
+                params[name].copy_(tensor)
+                loaded.add(name)
+            return loaded
+
+    model.audio_tower = Tower()
+    worker.model_runner.vllm_config.model_config.hf_config.verl_audio_projector_trainable = True
+    save_file(
+        {
+            "model.audio_tower." + name: torch.full_like(param, -99.0)
+            for name, param in model.audio_tower.named_parameters()
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    actor_tensors = {
+        "model.audio_tower." + name: torch.full_like(param, 100.0 + index)
+        for index, (name, param) in enumerate(model.audio_tower.named_parameters())
+        if name.startswith(("proj1.", "proj2."))
+    }
+    if missing_projector_bias:
+        del actor_tensors["model.audio_tower.proj2.bias"]
+
+    class Receiver:
+        def __init__(self, **kwargs):
+            pass
+
+        def receive_weights(self, on_bucket_received):
+            items = list(actor_tensors.items())
+            on_bucket_received(items[:2], False)
+            events.append("first_ack")
+            on_bucket_received(items[2:], True)
+            events.append("final_ack")
+
+    receiver_module = sys.modules["verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"]
+    monkeypatch.setattr(receiver_module, "BucketedWeightReceiver", Receiver)
+
+    def post_process(inner_model, config, device):
+        assert events[-1] == "final_ack"
+        for name, param in inner_model.audio_tower.named_parameters():
+            expected = actor_tensors.get("model.audio_tower." + name, torch.full_like(param, -99.0))
+            torch.testing.assert_close(param, expected)
+        events.append("post_process")
+
+    post_module = sys.modules["vllm.model_executor.model_loader.utils"]
+    monkeypatch.setattr(post_module, "process_weights_after_loading", post_process)
+    for step in [0, 2]:
+        with torch.no_grad():
+            for param in model.audio_tower.parameters():
+                param.fill_(float("nan"))
+        if missing_projector_bias:
+            with pytest.raises(RuntimeError, match=r"trainable audio projector.*proj2.bias"):
+                worker.update_weights_from_ipc(global_steps=step)
+            assert events[-1] == "final_ack"
+            assert "post_process" not in events
+        else:
+            worker.update_weights_from_ipc(global_steps=step)
+            assert events[-1] == "post_process"

@@ -1,15 +1,20 @@
-"""Optional GAGE audio benchmarks over the live rollout endpoint."""
+"""Optional GAGE audio benchmarks over live rollout endpoints."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Mapping
 from urllib.request import ProxyHandler, Request, build_opener
 from uuid import uuid4
+
+from verl.trainer.ppo.audio_benchmark_router import AudioBenchmarkRouter
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +32,8 @@ _BENCHMARK_SPECS = {
 # Keep the historical implicit suite stable when adding opt-in benchmarks.
 _DEFAULT_BENCHMARKS = tuple(_BENCHMARK_SPECS)
 _BENCHMARK_SPECS["aishell1"] = ("--aishell-1", "aishell1")
+_BENCHMARK_SPECS["librispeech"] = ("--librispeech", "librispeech")
+_BENCHMARK_SPECS["wenetspeech"] = ("--wenetspeech", "wenetspeech")
 
 
 def run_audio_benchmarks(
@@ -39,10 +46,10 @@ def run_audio_benchmarks(
 ) -> dict[str, float]:
     """Run configured GAGE suites without modifying the normal validation path.
 
-    The suite targets ``config["api_base"]`` when provided, otherwise it reuses
-    the live rollout endpoint (``server_addresses[0]``).  The live rollout serves
-    audio when ``rollout.enable_audio=True``; ``api_base`` remains available to
-    target a dedicated audio-capable model service instead.
+    An explicit ``config["api_base"]`` takes precedence. Otherwise, requests are
+    balanced across live rollout endpoints, which serve audio when
+    ``rollout.enable_audio=True``. Set ``load_balance=False`` to retain the
+    historical behavior of targeting only the first rollout endpoint.
     """
 
     if not config or not bool(config.get("enabled", False)):
@@ -61,13 +68,14 @@ def run_audio_benchmarks(
     # it rejects audio with "At most 0 audio(s)".
     raw_address = str(config.get("api_base") or "").strip()
     if raw_address:
-        api_base = _normalize_api_base(raw_address)
+        api_bases = [_normalize_api_base(raw_address)]
     else:
-        if not server_addresses:
+        api_bases = list(dict.fromkeys(_normalize_api_base(address) for address in server_addresses if address.strip()))
+        if not api_bases:
             raise RuntimeError(
                 "Audio benchmark requires `audio_benchmark.api_base` or at least one live rollout endpoint"
             )
-        api_base = _normalize_api_base(server_addresses[0])
+    api_base = api_bases[0]
 
     api_key = str(config.get("api_key", "dummy"))
     served_model = str(config.get("served_model_name") or _discover_model(api_base, api_key))
@@ -116,18 +124,40 @@ def run_audio_benchmarks(
         command.extend(["--sample-seed", str(int(sample_seed))])
 
     summary_path = suite_dir / "suite_summary.json"
-    logger.info(
-        "audio_benchmark_pressure step=%s run_id=%s benchmarks=%s max_samples=%s "
-        "concurrency=%s api_base=%s expected_summary=%s",
-        global_step,
-        run_id,
-        benchmarks,
-        max_samples,
-        config.get("concurrency", 4),
-        api_base,
-        summary_path,
+    # The GAGE child accepts one OpenAI endpoint. Keep it on the same host as
+    # this loopback router, which forwards to every rollout replica. An explicit
+    # endpoint and single-replica runs keep their direct connection unchanged.
+    routing = (
+        AudioBenchmarkRouter(api_bases)
+        if len(api_bases) > 1 and bool(config.get("load_balance", True))
+        else nullcontext()
     )
-    completed = subprocess.run(command, cwd=gage_root, check=False)
+    # The suite and its children run on this host. Keep transient control files
+    # off shared storage without moving any benchmark artifacts or weakening
+    # the atomic per-sample journal writes. Respect an explicitly chosen root.
+    control_root = os.environ.get("GAGE_SUITE_CONTROL_DIR", "").strip()
+    control_storage = (
+        nullcontext(control_root) if control_root else TemporaryDirectory(prefix="verl-audio-control-", dir="/tmp")
+    )
+    with control_storage as control_dir, routing as router:
+        if router is not None:
+            api_base = router.api_base
+            command[command.index("--external-api-base") + 1] = api_base
+            logger.info("Audio benchmark replica routing: replicas=%s endpoints=%s", len(api_bases), api_bases)
+        logger.info(
+            "audio_benchmark_pressure step=%s run_id=%s benchmarks=%s max_samples=%s "
+            "concurrency=%s api_base=%s expected_summary=%s",
+            global_step,
+            run_id,
+            benchmarks,
+            max_samples,
+            config.get("concurrency", 4),
+            api_base,
+            summary_path,
+        )
+        child_env = {**os.environ, "GAGE_SUITE_CONTROL_DIR": str(control_dir)}
+        logger.info("Audio benchmark coordination root: %s", control_dir)
+        completed = subprocess.run(command, cwd=gage_root, check=False, env=child_env)
     logger.info(
         "GAGE audio validation process exited: run_id=%s returncode=%s expected_summary=%s",
         run_id,

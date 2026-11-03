@@ -127,6 +127,16 @@ def _distillation_response_mask(data: TensorDict) -> torch.Tensor:
     return response_mask
 
 
+def _teacher_sequence_mask(data: TensorDict, response_mask: torch.Tensor) -> torch.Tensor:
+    """Return explicit sequence-score routing; never infer it from zero targets."""
+    route = data.get("teacher_sequence_mask")
+    if route is None or route.ndim != 1 or route.shape[0] != response_mask.shape[0]:
+        raise ValueError("teacher_sequence_mask must have shape [batch_size] for audio sequence distillation")
+    if route.dtype != torch.bool:
+        raise ValueError("teacher_sequence_mask must be boolean")
+    return route.to(device=response_mask.device)
+
+
 def _opd_tool_failure_weights(config: ActorConfig, loss_config: DistillationLossConfig, data: TensorDict):
     """Reuse V1's verified local costs only when task PPO is absent.
 
@@ -143,7 +153,13 @@ def _opd_tool_failure_weights(config: ActorConfig, loss_config: DistillationLoss
     if active_global_count is None or "tool_failure_weights" not in data:
         raise ValueError("Enabled tool-failure penalty requires V1 minibatch cost fields")
     weights = data["tool_failure_weights"]
-    return weights.to_padded_tensor(0.0) if weights.is_nested else weights
+    weights = weights.to_padded_tensor(0.0) if weights.is_nested else weights
+    if loss_config.audio_sequence_surrogate:
+        # Costs describe SWE tool calls. Stale or padding metadata must never
+        # penalize a single-turn audio response or gate its teacher reward.
+        route = _teacher_sequence_mask(data, _distillation_response_mask(data))
+        weights = weights.masked_fill(route.unsqueeze(-1), 0.0)
+    return weights
 
 
 def compute_distillation_loss_range(
@@ -269,11 +285,18 @@ def distillation_ppo_loss(
             rollout_is_weights = data.get("rollout_is_weights")
             if rollout_is_weights is not None and rollout_is_weights.is_nested:
                 rollout_is_weights = rollout_is_weights.to_padded_tensor(0.0)
+            cost_mask = _distillation_response_mask(data)
+            if distillation_loss_config.audio_sequence_surrogate:
+                cost_mask = cost_mask & ~_teacher_sequence_mask(data, cost_mask).unsqueeze(-1)
+                log_prob = torch.where(cost_mask, log_prob, 0.0)
+                old_log_prob = torch.where(cost_mask, old_log_prob, 0.0)
+                if rollout_is_weights is not None:
+                    rollout_is_weights = torch.where(cost_mask, rollout_is_weights, 0.0)
             policy_loss = local_ppo_loss(
                 log_prob,
                 old_log_prob,
                 tool_failure_weights,
-                _distillation_response_mask(data),
+                cost_mask,
                 config,
                 active_global_count=tu.get_non_tensor_data(data, "tool_failure_active_global_count", default=None),
                 dp_size=data["dp_size"],
@@ -294,6 +317,159 @@ def distillation_ppo_loss(
     return policy_loss, policy_metrics
 
 
+def _audio_sequence_distillation_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Combine SWE token k1 with an explicitly different audio sequence objective.
+
+    For completed audio response y, T is the teacher's native-token assistant
+    log-likelihood including its verified termination token. P_old and P_theta
+    sum the student's assistant-token log-probabilities, including the emitted
+    termination token. The stopped reward is R = scale * (T - P_old). We apply
+    sequence PPO to R, with ratio exp(P_theta - P_old), and no reward baseline.
+    This estimates a teacher-score plus student-entropy surrogate; different
+    tokenizers mean it is not a token-aligned KL or exact text-distribution KL.
+
+    Both routes use the accepted global sequence denominator. Consequently the
+    combined loss equals each route's mean weighted by its realized prompt
+    share when rollout n is the same for both routes. Audio is never divided by
+    token length; SWE retains seq-mean-token-mean and its existing local costs.
+    The optional SWE tool cost remains a separate auxiliary objective with its
+    existing SWE active-trajectory denominator; it is not part of this mixture.
+    """
+    loss_config = distillation_config.distillation_loss
+    if config.loss_agg_mode != "seq-mean-token-mean":
+        raise ValueError("audio_sequence_surrogate requires loss_agg_mode=seq-mean-token-mean")
+    response_mask = _distillation_response_mask(data)
+    route = _teacher_sequence_mask(data, response_mask)
+    audio_mask = response_mask & route.unsqueeze(-1)
+    text_mask = response_mask & ~route.unsqueeze(-1)
+    audio_rows = audio_mask.any(dim=-1)
+    student = no_padding_2_padding(model_output["log_probs"], data).float()
+    old = data["old_log_probs"]
+    old = (old.to_padded_tensor(0.0) if old.is_nested else old).detach().float()
+    if student.shape != response_mask.shape or old.shape != response_mask.shape:
+        raise ValueError("Student current/old log probabilities must match the assistant response mask")
+    if not torch.isfinite(student[response_mask]).all() or not torch.isfinite(old[response_mask]).all():
+        raise ValueError("Audio sequence distillation requires finite accepted student log probabilities")
+    student = torch.where(response_mask, student, 0.0)
+    old = torch.where(response_mask, old, 0.0)
+
+    # These are optimizer-minibatch normalizers prepared before microbatching,
+    # including DP reduction. Do not replace them with a microbatch row count.
+    denominator = tu.get_non_tensor_data(data, "global_batch_size", default=None)
+    dp_size = tu.get_non_tensor_data(data, "dp_size", default=None)
+    if denominator is None or dp_size is None or denominator <= 0:
+        raise ValueError("Audio sequence distillation requires positive global minibatch normalization")
+    global_info = dict(
+        dp_size=dp_size,
+        batch_num_tokens=data["batch_num_tokens"],
+        global_batch_size=denominator,
+        loss_scale_factor=config.loss_scale_factor,
+    )
+    loss_config.global_batch_info.update(global_info)
+
+    # Index only accepted SWE tokens: the audio route's padded token targets
+    # are transport placeholders, and must not be interpreted as evidence.
+    text_losses = torch.zeros_like(student)
+    if text_mask.any():
+        if "teacher_logprobs" not in data:
+            raise ValueError("SWE rows require their token-aligned teacher_logprobs")
+        teacher = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1).float()
+        if teacher.shape != student.shape or not torch.isfinite(teacher[text_mask]).all():
+            raise ValueError("SWE teacher log probabilities must be finite and aligned with accepted tokens")
+        text_losses[text_mask] = student[text_mask] - teacher[text_mask]
+    metrics = compute_distillation_loss_range(text_losses, text_mask)
+    metrics["distillation/abs_loss"] = Metric(
+        AggregationType.MEAN, text_losses[text_mask].abs().mean().detach() if text_mask.any() else 0.0
+    )
+    if loss_config.loss_max_clamp is not None:
+        text_losses = text_losses.clamp(-loss_config.loss_max_clamp, loss_config.loss_max_clamp)
+    text_advantages = -text_losses.detach()
+    tool_weights = _opd_tool_failure_weights(config, loss_config, data)
+    if tool_weights is not None:
+        from verl.utils.swe_tool_failure import gate_positive_credit
+
+        text_advantages = gate_positive_credit(text_advantages, tool_weights)
+    importance = data.get("rollout_is_weights")
+    if importance is not None and importance.is_nested:
+        importance = importance.to_padded_tensor(0.0)
+    if importance is not None:
+        if importance.shape != response_mask.shape or not torch.isfinite(importance[response_mask]).all():
+            raise ValueError("Rollout importance weights must be finite and aligned for accepted tokens")
+        if not torch.all(importance[audio_mask] == 1):
+            raise ValueError("The audio sequence surrogate pilot requires no rollout importance correction for audio")
+        importance = torch.where(response_mask, importance, 0.0)
+    if text_mask.any():
+        text_loss, text_metrics = get_policy_loss_fn(loss_config.policy_loss_mode)(
+            old_log_prob=old,
+            log_prob=student,
+            advantages=text_advantages,
+            response_mask=text_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            config=loss_config,
+            rollout_is_weights=importance,
+        )
+        metrics.update({f"distillation/{key.removeprefix('actor/')}": value for key, value in text_metrics.items()})
+    else:
+        text_loss = student.masked_select(text_mask).sum()
+        metrics.update({f"distillation/{key}": 0.0 for key in ("pg_clipfrac", "ppo_kl", "pg_clipfrac_lower")})
+
+    # torch.where excludes masked padding/observations rather than multiplying
+    # them by zero (0 * NaN would contaminate even an excluded trajectory).
+    current_sequence = torch.where(audio_mask, student, 0.0).sum(dim=-1)[audio_rows]
+    old_sequence = torch.where(audio_mask, old, 0.0).sum(dim=-1)[audio_rows]
+    teacher_sequence = data.get("teacher_sequence_logprob")
+    if teacher_sequence is None or teacher_sequence.ndim != 1 or teacher_sequence.shape != route.shape:
+        raise ValueError("teacher_sequence_logprob must have shape [batch_size]")
+    teacher_sequence = teacher_sequence.to(device=student.device).float()[audio_rows].detach()
+    if not torch.isfinite(teacher_sequence).all():
+        raise ValueError("Accepted audio teacher sequence scores must be finite")
+    reward = (teacher_sequence - old_sequence).detach() * loss_config.audio_sequence_reward_scale
+    log_ratio = current_sequence - old_sequence
+    # The same numerical guard as vanilla token PPO; PPO's configured clip is
+    # applied separately below to the ratio of whole response probabilities.
+    ratio = log_ratio.clamp(-20.0, 20.0).exp()
+    clipped_ratio = ratio.clamp(1 - loss_config.audio_sequence_clip_ratio, 1 + loss_config.audio_sequence_clip_ratio)
+    unclipped_losses = -reward * ratio
+    clipped_losses = -reward * clipped_ratio
+    clipped_active = clipped_losses > unclipped_losses
+    sequence_losses = torch.maximum(unclipped_losses, clipped_losses)
+    audio_loss = sequence_losses.sum() * dp_size / denominator
+    # Empty selections retain the model's graph, including on audio-only and
+    # fully excluded microbatches/ranks.
+    total_loss = text_loss + audio_loss
+    audio_count = tu.get_non_tensor_data(data, "audio_sequence_global_count", default=denominator)
+    for key, values in {
+        "reward": reward,
+        "teacher_sequence_logprob": teacher_sequence,
+        "old_student_sequence_logprob": old_sequence,
+        "sequence_ratio": ratio,
+        "clip_fraction": clipped_active.float(),
+    }.items():
+        metrics[f"distillation/audio/{key}"] = Metric(
+            AggregationType.SUM, values.detach().sum() * dp_size / max(1, audio_count)
+        )
+    metrics["distillation/audio/accepted_sequences"] = Metric(
+        AggregationType.SUM, int(audio_rows.sum().item()) * dp_size
+    )
+    metrics["distillation/swe/accepted_sequences"] = Metric(
+        AggregationType.SUM, int(text_mask.any(dim=-1).sum().item()) * dp_size
+    )
+    metrics["distillation/audio/finite_teacher_sequences"] = Metric(
+        AggregationType.SUM, int(torch.isfinite(teacher_sequence).sum().item()) * dp_size
+    )
+    metrics["distillation/audio/clipped_sequences"] = Metric(
+        AggregationType.SUM, int(clipped_active.sum().item()) * dp_size
+    )
+    metrics["distillation/audio/loss"] = Metric(AggregationType.SUM, audio_loss.detach())
+    metrics["distillation/swe/loss"] = Metric(AggregationType.SUM, text_loss.detach())
+    return total_loss, metrics
+
+
 def distillation_loss(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -309,6 +485,11 @@ def distillation_loss(
     """
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    if loss_config.audio_sequence_surrogate:
+        return _audio_sequence_distillation_loss(config, distillation_config, model_output, data)
+    sequence_route = data.get("teacher_sequence_mask")
+    if sequence_route is not None and sequence_route.any():
+        raise ValueError("Audio sequence teacher scores require audio_sequence_surrogate=True")
     tool_failure_weights = _opd_tool_failure_weights(config, loss_config, data)
     distillation_loss_fn = get_distillation_loss_fn(loss_config.loss_mode)
     distillation_losses, distillation_metrics = distillation_loss_fn(

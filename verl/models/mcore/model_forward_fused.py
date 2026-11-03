@@ -37,6 +37,7 @@ from verl.utils.megatron.moe_loss_mask import packed_moe_router_mask
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.model import CausalLMOutputForPPO
 
+from .frozen_audio import frozen_audio_forward
 from .util import postprocess_packed_seqs_for_dict_output, postprocess_thd_engine
 
 _FUSED_FORWARD_MODE_ATTR = "_verl_fused_forward_mode"
@@ -229,15 +230,16 @@ def fused_forward_model_gen(vision_model: bool = False):
             input_args["input_ids"] = input_ids
             input_args["attention_mask"] = attention_mask
 
-        if _use_output_processor_hook(model):
-            input_args.pop("temperature", None)
-            output_orig: CausalLMOutputForPPO = model(
-                **input_args,
-                output_processor=fused_output_processor,
-                output_processor_context=FusedOutputProcessorContext(temperature=temperature),
-            )
-        else:
-            output_orig: CausalLMOutputForPPO = model(**input_args)
+        with frozen_audio_forward(model, input_args["input_ids"], multi_modal_inputs):
+            if _use_output_processor_hook(model):
+                input_args.pop("temperature", None)
+                output_orig: CausalLMOutputForPPO = model(
+                    **input_args,
+                    output_processor=fused_output_processor,
+                    output_processor_context=FusedOutputProcessorContext(temperature=temperature),
+                )
+            else:
+                output_orig: CausalLMOutputForPPO = model(**input_args)
 
         if post_process:
             # output_orig is in type of CausalLMOutputForPPO
@@ -342,14 +344,15 @@ def fused_forward_model_engine(vision_model: bool = False):
             labels=labels_rmpad,
             **model_kwargs,
         )
-        if _use_output_processor_hook(model):
-            output_orig: CausalLMOutputForPPO = model(
-                **forward_kwargs,
-                output_processor=fused_output_processor,
-                output_processor_context=FusedOutputProcessorContext(temperature=temperature),
-            )
-        else:
-            output_orig: CausalLMOutputForPPO = model(temperature=temperature, **forward_kwargs)
+        with frozen_audio_forward(model, forward_kwargs["input_ids"], multi_modal_inputs):
+            if _use_output_processor_hook(model):
+                output_orig: CausalLMOutputForPPO = model(
+                    **forward_kwargs,
+                    output_processor=fused_output_processor,
+                    output_processor_context=FusedOutputProcessorContext(temperature=temperature),
+                )
+            else:
+                output_orig: CausalLMOutputForPPO = model(temperature=temperature, **forward_kwargs)
 
         if not post_process:
             return output_orig

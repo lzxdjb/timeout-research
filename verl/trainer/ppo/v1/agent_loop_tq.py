@@ -905,7 +905,24 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
 
-        if should_skip_hidden_reward(self.config, validate=validate):
+        from verl.trainer.distillation.config_utils import audio_teacher_for_sample
+
+        audio_sequence_training = not validate and audio_teacher_for_sample(self.config, kwargs) is not None
+        if audio_sequence_training:
+            if len(outputs) != 1:
+                raise RuntimeError("Audio sequence OPD requires a single-turn trajectory.")
+            await self._compute_teacher_logprobs(
+                outputs[0],
+                prompt_ids=outputs[0].prompt_ids,
+                response_ids=outputs[0].response_ids,
+                validate=False,
+                sample_kwargs=kwargs,
+            )
+            if outputs[0].extra_fields.get("teacher_sequence_mask") is not True:
+                raise RuntimeError("Audio neutral task reward requires a verified audio teacher sequence score.")
+            outputs[0].reward_score = 0.0
+            outputs[0].extra_fields["audio_opd_task_reward_skipped"] = True
+        elif should_skip_hidden_reward(self.config, validate=validate):
             # The SWE loop must have skipped the evaluator itself. Never fall
             # back to a reward worker if an outdated agent omitted the marker.
             if any(not hidden_reward_was_skipped(o.extra_fields) or o.reward_score != 0.0 for o in outputs):
@@ -918,13 +935,14 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
         final_output = outputs[-1]
         # TODO: Support output:list[AgentLoopOutput]
-        await self._compute_teacher_logprobs(
-            final_output,
-            prompt_ids=final_output.prompt_ids,
-            response_ids=final_output.response_ids,
-            validate=validate,
-            sample_kwargs=kwargs,
-        )
+        if not audio_sequence_training:
+            await self._compute_teacher_logprobs(
+                final_output,
+                prompt_ids=final_output.prompt_ids,
+                response_ids=final_output.response_ids,
+                validate=validate,
+                sample_kwargs=kwargs,
+            )
 
         if final_output.reward_score is not None:
             for output in outputs[:-1]:

@@ -15,7 +15,7 @@
 
 import torch
 
-from verl.trainer.distillation.losses import _distillation_response_mask
+from verl.trainer.distillation.losses import _distillation_response_mask, _teacher_sequence_mask
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import response_to_nested
 
@@ -31,14 +31,34 @@ def prepare_distillation_minibatch(data, dp_group=None):
     """
     effective_mask = _distillation_response_mask(data)
     active_count = int(effective_mask.any(dim=-1).sum().item())
+    route_counts = None
+    if "teacher_sequence_mask" in data:
+        route = _teacher_sequence_mask(data, effective_mask)
+        audio_count = int((effective_mask.any(dim=-1) & route).sum().item())
+        route_counts = (audio_count, active_count - audio_count)
+        if "tool_failure_normalizer" in data:
+            # A shared SWE launcher can enable local tool costs. Audio has no
+            # SWE calls and must not dilute that cost's trajectory denominator.
+            data["tool_failure_normalizer"] = data["tool_failure_normalizer"].masked_fill(route, 0.0)
     if data["response_mask"].is_nested:
         data["loss_mask"] = response_to_nested(effective_mask, data["response_mask"])
     else:
         data["loss_mask"] = effective_mask
     if torch.distributed.is_initialized():
         counts = [None] * torch.distributed.get_world_size(dp_group)
-        torch.distributed.all_gather_object(counts, active_count, dp_group)
-        active_count = sum(counts)
+        if route_counts is None:
+            torch.distributed.all_gather_object(counts, active_count, dp_group)
+            active_count = sum(counts)
+        else:
+            torch.distributed.all_gather_object(counts, route_counts, dp_group)
+            route_counts = tuple(sum(values[i] for values in counts) for i in range(2))
+            active_count = sum(route_counts)
     # Fully rejected batches are skipped by the existing engine safeguards; the
     # finite denominator also protects zero-loss microbatches on other backends.
     tu.assign_non_tensor(data, global_batch_size=max(1, active_count))
+    if route_counts is not None:
+        tu.assign_non_tensor(
+            data,
+            audio_sequence_global_count=route_counts[0],
+            swe_sequence_global_count=route_counts[1],
+        )

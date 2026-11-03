@@ -20,8 +20,9 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems
-from vllm.multimodal.processing import PromptReplacement, PromptUpdate
-from vllm.multimodal.processing import PromptUpdateDetails
+from vllm.multimodal.processing import PromptReplacement, PromptUpdate, PromptUpdateDetails
+
+from verl.utils.tokenizer.audio_processor import load_audio_feature_extractor
 
 from .interleaved import AUDIO, VIDEO, interleave_text, pair_prompt, requested, update_tokenized, without_mode
 
@@ -38,7 +39,7 @@ class HybridProcessor(Qwen3VLProcessor):
             for key in ("local_files_only", "revision", "cache_dir", "token")
             if key in kwargs
         }
-        processor.feature_extractor = WhisperFeatureExtractor.from_pretrained(
+        processor.feature_extractor = load_audio_feature_extractor(
             pretrained_model_name_or_path, **download_kwargs
         )
         processor.audio_token = "<|audio_pad|>"

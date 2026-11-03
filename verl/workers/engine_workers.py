@@ -639,6 +639,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             distillation_config: Optional[DistillationConfig] = (
                 omega_conf_to_dataclass(self.distillation_config) if self.distillation_enabled else None
             )
+            if distillation_config is not None and distillation_config.distillation_loss.audio_sequence_surrogate:
+                if self.config.actor.ppo_epochs != 1:
+                    raise ValueError("The audio sequence surrogate pilot requires actor.ppo_epochs=1")
+                if actor_config.loss_agg_mode != "seq-mean-token-mean":
+                    raise ValueError("The audio sequence surrogate requires loss_agg_mode=seq-mean-token-mean")
 
             # Build the inner actor profiler config via the hydra path (same as SFT), so
             # its tool_config entries are real dataclass instances the torch profiler can

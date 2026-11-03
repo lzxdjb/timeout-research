@@ -88,6 +88,14 @@ class DistillationLossConfig(BaseConfig):
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
 
+    # Opt-in cross-tokenizer audio objective. This is a sequence teacher-score
+    # and student-entropy policy-gradient surrogate, not token-aligned KL.
+    # The existing token-level loss remains in use for non-audio rows.
+    audio_sequence_surrogate: bool = False
+    audio_sequence_reward_scale: float = 1.0
+    audio_sequence_clip_ratio: float = 0.2
+    audio_sequence_baseline: str = "none"
+
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch
@@ -103,6 +111,19 @@ class DistillationLossConfig(BaseConfig):
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+
+        if self.audio_sequence_surrogate:
+            if self.loss_mode != "k1" or not self.use_policy_gradient or self.use_task_rewards:
+                raise ValueError(
+                    "audio_sequence_surrogate requires pure policy-gradient distillation "
+                    "(loss_mode=k1, use_policy_gradient=True, use_task_rewards=False)."
+                )
+            if not math.isfinite(self.audio_sequence_reward_scale) or self.audio_sequence_reward_scale <= 0:
+                raise ValueError("audio_sequence_reward_scale must be positive and finite.")
+            if not math.isfinite(self.audio_sequence_clip_ratio) or not 0 < self.audio_sequence_clip_ratio < 1:
+                raise ValueError("audio_sequence_clip_ratio must be finite and between zero and one.")
+            if self.audio_sequence_baseline != "none":
+                raise ValueError("Only the explicit audio_sequence_baseline=none is supported in the pilot.")
 
         if self.policy_loss_mode != "vanilla":
             raise NotImplementedError(
@@ -143,6 +164,11 @@ class ExternalTeacherConfig(BaseConfig):
     retry_backoff_s: float = 1.0
     api_key_env: Optional[str] = None
     unsupported_token_ids: list[int] = field(default_factory=list)
+    # Audio scoring is explicitly opt-in; text teachers retain the exact token-ID protocol.
+    protocol: str = "text_token_ids"
+    tokenizer_path: Optional[str] = None
+    audio_prompt_length: int = 8192
+    audio_response_length: int = 2048
 
     def validate(self):
         from urllib.parse import urlsplit
@@ -158,6 +184,15 @@ class ExternalTeacherConfig(BaseConfig):
             raise ValueError("External teacher concurrency and request timeout must be positive.")
         if self.max_retries < 0 or self.retry_backoff_s < 0:
             raise ValueError("External teacher retry count and backoff must be nonnegative.")
+        if self.protocol not in {"text_token_ids", "audio_candidate_score"}:
+            raise ValueError(f"Unknown external teacher protocol {self.protocol!r}.")
+        if self.protocol == "audio_candidate_score":
+            if not self.tokenizer_path or not os.path.isdir(self.tokenizer_path):
+                raise ValueError("Audio candidate scoring requires a local external.tokenizer_path directory.")
+            if self.audio_prompt_length < 1 or self.audio_response_length < 1:
+                raise ValueError("Audio prompt and response lengths must be positive.")
+            if self.audio_prompt_length + self.audio_response_length + 1 > self.max_model_len:
+                raise ValueError("Audio prompt + response + one scoring token exceeds the audio teacher context.")
 
 
 @dataclass
@@ -222,6 +257,9 @@ class DistillationTeacherModelConfig(BaseConfig):
             max_model_len = min(max_model_len or self.external.max_model_len, self.external.max_model_len)
         student_prompt_length = self.inference.prompt_length
         student_response_length = self.inference.response_length
+        if self.backend == "external" and self.external.protocol == "audio_candidate_score":
+            student_prompt_length = self.external.audio_prompt_length
+            student_response_length = self.external.audio_response_length
         required_context_len = student_prompt_length + student_response_length + 1
         if max_model_len is not None and required_context_len > max_model_len:
             raise ValueError(
@@ -229,7 +267,7 @@ class DistillationTeacherModelConfig(BaseConfig):
                 f"response, and one generated token, but got {student_prompt_length=}, "
                 f"{student_response_length=}, {required_context_len=}, {max_model_len=}."
             )
-        self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
+        self.inference.prompt_length = student_prompt_length + student_response_length
         self.inference.response_length = 1
         if self.backend == "managed":
             self._validate_topk_logprobs(use_topk=use_topk, topk=topk)

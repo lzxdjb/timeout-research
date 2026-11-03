@@ -106,6 +106,8 @@ class HFModelConfig(BaseConfig):
     # whether to use shared memory
     use_shm: bool = False
     trust_remote_code: bool = False
+    # Explicit training-side audio features; ordinary processor loading stays unchanged.
+    enable_audio_processor: bool = False
 
     # custom chat template for the model
     custom_chat_template: Optional[str] = None
@@ -159,7 +161,11 @@ class HFModelConfig(BaseConfig):
         if self.load_tokenizer:
             self.local_tokenizer_path = copy_to_local(self.tokenizer_path, use_shm=self.use_shm)
             self.tokenizer = hf_tokenizer(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
-            self.processor = hf_processor(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
+            self.processor = hf_processor(
+                self.local_tokenizer_path,
+                trust_remote_code=self.trust_remote_code,
+                enable_audio_processor=self.enable_audio_processor,
+            )
 
         # For base models (e.g. Qwen3.5-2b-Base), the processor may not have a chat_template
         # while the tokenizer does. Sync it so that processor.apply_chat_template() works.

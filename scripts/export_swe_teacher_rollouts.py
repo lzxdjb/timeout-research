@@ -204,6 +204,13 @@ def rollout_row(trajectory: dict, tokenizer: Any, record_path: Path, contract: d
         # Older trajectories without those fields still use the initial contract.
         teacher_model=trajectory.get("teacher_model") or contract.get("model"),
         teacher_api_url=trajectory.get("teacher_api_url") or contract.get("api_url"),
+        # Code may change between collection sessions. Only attempt-local
+        # provenance can describe the code that produced this trajectory;
+        # the original run contract is not a fallback for these fields.
+        runtime_session_id=trajectory.get("runtime_session_id"),
+        runtime_provenance=(
+            as_dict(trajectory["runtime_provenance"]) if trajectory.get("runtime_provenance") is not None else None
+        ),
         teacher_export_version=VERSION,
     )
     if fields.get("sft_tool_contract_outcomes"):
@@ -217,6 +224,8 @@ def sft_row(row: dict) -> dict:
     This is a hidden-test-success snapshot, before rules and judge filtering.
     The template-expanded system text already contains the tool definitions,
     so adding a separate ``tools`` column would duplicate them during SFT.
+    ``runtime_provenance`` is a JSON string for stable Parquet schemas across
+    collection sessions; missing legacy provenance stays null.
     """
     from scripts.make_swe_sft_data import _parse_input
     from scripts.swe_sft_quality import parse_sft_transcript
@@ -239,6 +248,13 @@ def sft_row(row: dict) -> dict:
         "source_sha256": row["teacher_source_sha256"],
         "teacher_model": row["teacher_model"],
         "teacher_api_url": row["teacher_api_url"],
+        "runtime_session_id": row.get("runtime_session_id"),
+        # A JSON string keeps mixed sessions and old records Arrow-compatible,
+        # including sessions whose nested provenance contains empty mappings.
+        "runtime_provenance": (
+            json.dumps(row["runtime_provenance"], ensure_ascii=False, sort_keys=True)
+            if row.get("runtime_provenance") is not None else None
+        ),
         "response_tokens": row["trajectory_response_tokens"],
         "tool_dispatches": row["trajectory_tool_dispatches"],
     }

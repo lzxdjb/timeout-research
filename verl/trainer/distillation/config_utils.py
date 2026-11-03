@@ -47,6 +47,29 @@ def _config_get(config, key, default=None):
     return config.get(key, default) if hasattr(config, "get") else getattr(config, key, default)
 
 
+def audio_teacher_for_sample(config, sample):
+    """Resolve only the opt-in audio protocol, without constructing teacher/loss objects."""
+    distillation = _config_get(config, "distillation", {})
+    if not _config_get(distillation, "enabled", False):
+        return None
+    teachers = dict(_config_get(distillation, "teacher_models", {}))
+    if len(teachers) > 1:
+        teachers.pop("teacher_model", None)
+    routing = sample.get(_config_get(distillation, "teacher_key", "data_source"))
+    if hasattr(routing, "item"):
+        routing = routing.item()
+    for name, teacher in teachers.items():
+        if len(teachers) > 1 and _config_get(teacher, "key", name) != routing:
+            continue
+        external = _config_get(teacher, "external", {})
+        if (
+            _config_get(teacher, "backend", "managed") == "external"
+            and _config_get(external, "protocol", "text_token_ids") == "audio_candidate_score"
+        ):
+            return external
+    return None
+
+
 def opd_cleanup_timeout_s(config) -> float:
     """Bound cancellation acknowledgement, independently of teacher request timeout."""
     value = float(_config_get(_config_get(config, "distillation", {}), "cutoff_cleanup_timeout_s", 120.0))

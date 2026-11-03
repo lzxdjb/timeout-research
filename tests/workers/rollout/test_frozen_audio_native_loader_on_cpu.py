@@ -12,7 +12,8 @@ from safetensors.torch import save_file
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_native_audio_loader_restores_each_tp_partition_after_weight_loss(tmp_path, rank):
+@pytest.mark.parametrize("projector_trainable", [False, True])
+def test_native_audio_loader_restores_each_tp_partition_after_weight_loss(tmp_path, rank, projector_trainable):
     # Import inside the test so lightweight suites do not require vLLM.
     omni = pytest.importorskip("vllm.model_executor.models.qwen3_omni_moe_thinker")
     linear = pytest.importorskip("vllm.model_executor.layers.linear")
@@ -58,13 +59,23 @@ def test_native_audio_loader_restores_each_tp_partition_after_weight_loss(tmp_pa
             model.audio_tower = omni.Qwen3OmniMoeAudioEncoder(config)
         model_config = SimpleNamespace(
             model=str(tmp_path),
-            hf_config=SimpleNamespace(architectures=["GageQwen3_5OmniMoeForConditionalGeneration"]),
+            hf_config=SimpleNamespace(
+                architectures=["GageQwen3_5OmniMoeForConditionalGeneration"],
+                verl_audio_projector_trainable=projector_trainable,
+            ),
         )
         for step in [0, 2]:
             with torch.no_grad():
                 for p in model.audio_tower.parameters():
                     p.fill_(float("nan"))
-            restoration.restore_frozen_audio_tower(model, model_config, [], rank=rank, global_steps=step)
+            actor_tensors = {
+                name: tensor + 100 + step
+                for name, tensor in tensors.items()
+                if projector_trainable and name.startswith(("proj1.", "proj2."))
+            }
+            if actor_tensors:
+                model.audio_tower.load_weights(actor_tensors.items())
+            restoration.restore_frozen_audio_tower(model, model_config, actor_tensors, rank=rank, global_steps=step)
             for name, p in model.audio_tower.named_parameters():
                 if ".self_attn.qkv." in name:
                     expected = torch.cat(
@@ -80,6 +91,8 @@ def test_native_audio_loader_restores_each_tp_partition_after_weight_loss(tmp_pa
                     expected = tensors[name].chunk(2, dim=0)[rank]
                 elif name.endswith((".self_attn.out_proj.weight", ".fc2.weight")):
                     expected = tensors[name].chunk(2, dim=1)[rank]
+                elif name in actor_tensors:
+                    expected = actor_tensors[name]
                 else:
                     expected = tensors[name]
                 torch.testing.assert_close(p, expected.to(p.dtype), rtol=0, atol=0, msg=name)

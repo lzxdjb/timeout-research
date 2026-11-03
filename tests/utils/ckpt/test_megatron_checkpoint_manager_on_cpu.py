@@ -58,7 +58,10 @@ def _init_distributed():
             pipeline_model_parallel_size=1,
         )
 
-    yield
+    # These fixtures deliberately exercise CPU/Gloo checkpointing. A CUDA
+    # build of PyTorch must not make RNG save/load initialize a GPU driver.
+    with patch("verl.utils.checkpoint.megatron_checkpoint_manager.get_device_name", return_value="cpu"):
+        yield
 
     mpu.destroy_model_parallel()
     if dist.is_initialized():
@@ -699,3 +702,60 @@ class TestOmniAudioPreservation:
         save_file({"model.audio_tower.x": torch.ones(1)}, str(self.source / "model.safetensors"))
         self._manager_for_source(omni=False)._preserve_omni_audio_weights(str(self.destination))
         assert not (self.destination / "audio_tower.safetensors").exists()
+
+    @pytest.mark.parametrize("indexed", [False, True])
+    def test_trained_projector_survives_audio_preservation(self, indexed):
+        projector = {
+            f"model.audio_tower.{layer}.{parameter}": torch.zeros(2, 2) if parameter == "weight" else torch.zeros(2)
+            for layer in ("proj1", "proj2")
+            for parameter in ("weight", "bias")
+        }
+        encoder = {"model.audio_tower.ln_post.weight": torch.ones(2)}
+        save_file({**encoder, **projector}, str(self.source / "model.safetensors"))
+        updated = {key: tensor + 3 for key, tensor in projector.items()}
+        updated["model.language_model.embed.weight"] = torch.full((2,), 7.0)
+        destination_shard = "trained.safetensors" if indexed else "model.safetensors"
+        save_file(updated, str(self.destination / destination_shard))
+        if indexed:
+            (self.destination / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {key: destination_shard for key in updated}})
+            )
+        manager = self._manager_for_source()
+        manager.train_audio_projector = True
+        manager._preserve_omni_audio_weights(str(self.destination))
+        saved = load_file(str(self.destination / "audio_tower.safetensors"))
+        assert set(saved) == set(encoder) | set(projector)
+        for key, tensor in {**encoder, **{k: updated[k] for k in projector}}.items():
+            assert torch.equal(saved[key], tensor), key
+        index = json.loads((self.destination / "model.safetensors.index.json").read_text())["weight_map"]
+        assert all(index[key] == "audio_tower.safetensors" for key in projector)
+        assert index["model.language_model.embed.weight"] == destination_shard
+        # Repeat preservation must keep the updated tensors, not regress to source.
+        manager._preserve_omni_audio_weights(str(self.destination))
+        repeated = load_file(str(self.destination / "audio_tower.safetensors"))
+        assert all(torch.equal(repeated[k], v) for k, v in saved.items())
+
+    @pytest.mark.parametrize("problem", ["missing", "shape", "nonfinite", "encoder_changed"])
+    def test_projector_export_rejects_incomplete_or_corrupted_weights(self, problem):
+        source = {
+            f"model.audio_tower.{layer}.{parameter}": torch.zeros(2, 2) if parameter == "weight" else torch.zeros(2)
+            for layer in ("proj1", "proj2")
+            for parameter in ("weight", "bias")
+        }
+        source["model.audio_tower.ln_post.weight"] = torch.ones(2)
+        save_file(source, str(self.source / "model.safetensors"))
+        exported = {key: value + 1 for key, value in source.items() if ".proj" in key}
+        key = "model.audio_tower.proj1.weight"
+        if problem == "missing":
+            del exported[key]
+        elif problem == "shape":
+            exported[key] = torch.zeros(3, 3)
+        elif problem == "nonfinite":
+            exported[key] = torch.full((2, 2), float("nan"))
+        else:
+            exported["model.audio_tower.ln_post.weight"] = torch.zeros(2)
+        save_file(exported, str(self.destination / "model.safetensors"))
+        manager = self._manager_for_source()
+        manager.train_audio_projector = True
+        with pytest.raises(RuntimeError, match="projector|Conflicting destination audio"):
+            manager._preserve_omni_audio_weights(str(self.destination))

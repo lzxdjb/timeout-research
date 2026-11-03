@@ -363,8 +363,9 @@ class vLLMColocateWorkerExtension:
         )
 
         # All IPC buckets have been acknowledged before a checkpoint read can
-        # fail. The actor never exports this frozen tower; level-2 sleep drops
-        # it, so restore it after every update, including the initial sync.
+        # fail. Level-2 sleep drops frozen audio parameters, so restore them
+        # after every update, including the initial sync. In projector-training
+        # mode, preserve the projector received from the actor in these buckets.
         restore_frozen_audio_tower(
             self.model_runner.model,
             self.model_runner.vllm_config.model_config,

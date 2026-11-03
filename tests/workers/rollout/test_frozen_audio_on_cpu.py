@@ -189,6 +189,102 @@ def test_partial_actor_audio_is_not_mixed_with_checkpoint(tmp_path):
         _AUDIO.restore_frozen_audio_tower(_model(), _config(tmp_path), names)
 
 
+def _projector_model(rank=0):
+    model = _model(rank)
+    del model.audio_tower.proj
+    model.audio_tower.proj1 = torch.nn.Linear(4, 4)
+    model.audio_tower.proj2 = torch.nn.Linear(4, 2)
+    return model
+
+
+def _projector_weights():
+    weights = {name: value for name, value in _weights().items() if not name.startswith("model.audio_tower.proj.")}
+    for projection, shape in [("proj1", (4, 4)), ("proj2", (2, 4))]:
+        weights[f"model.audio_tower.{projection}.weight"] = torch.full(shape, -999.0)
+        weights[f"model.audio_tower.{projection}.bias"] = torch.full(shape[:1], -999.0)
+    return weights
+
+
+def _projector_config(source):
+    config = _config(source)
+    config.hf_config.verl_audio_projector_trainable = True
+    return config
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("indexed", [False, True])
+def test_trainable_projector_preserved_across_repeated_frozen_encoder_restoration(tmp_path, rank, indexed):
+    weights = _projector_weights()
+    _write_checkpoint(tmp_path, weights, indexed)
+    model = _projector_model(rank)
+    for step in [0, 1, 2]:
+        with torch.no_grad():
+            for param in model.audio_tower.parameters():
+                param.fill_(float("nan"))
+            model.language_model.weight.fill_(step + 50)
+        actor_weights = {
+            name: torch.full_like(param, step + 100.0 + index)
+            for index, (name, param) in enumerate(model.audio_tower.named_parameters())
+            if name.startswith(("proj1.", "proj2."))
+        }
+        model.audio_tower.load_weights(actor_weights.items())
+        result = _AUDIO.restore_frozen_audio_tower(
+            model, _projector_config(tmp_path), actor_weights, rank=rank, global_steps=step
+        )
+        assert result["tensor_count"] == 6
+        assert result["parameter_count"] == 2
+        assert result["actor_projector_tensor_count"] == 4
+        for leaf in ["weight", "bias"]:
+            expected = torch.cat(
+                [
+                    weights[f"model.audio_tower.layers.0.self_attn.{projection}_proj.{leaf}"][rank * 2 : (rank + 1) * 2]
+                    for projection in "qkv"
+                ]
+            )
+            torch.testing.assert_close(getattr(model.audio_tower.layers[0].self_attn.qkv, leaf), expected)
+        for name, tensor in actor_weights.items():
+            torch.testing.assert_close(dict(model.audio_tower.named_parameters())[name], tensor)
+        torch.testing.assert_close(model.language_model.weight, torch.full((4, 4), float(step + 50)))
+        assert all(torch.isfinite(param).all() for param in model.audio_tower.parameters())
+
+
+@pytest.mark.parametrize("missing", [None, "proj1.weight", "proj1.bias", "proj2.weight", "proj2.bias", "all"])
+def test_trainable_projector_requires_every_actor_tensor_before_checkpoint_reads(tmp_path, missing):
+    model = _projector_model()
+    before = {name: param.clone() for name, param in model.audio_tower.named_parameters()}
+    names = {"proj1.weight", "proj1.bias", "proj2.weight", "proj2.bias"}
+    if missing == "all":
+        names.clear()
+    elif missing is None:
+        names.add("layers.0.self_attn.q_proj.weight")
+    else:
+        names.remove(missing)
+    with pytest.raises(RuntimeError, match="synchronized trainable audio projector"):
+        _AUDIO.restore_frozen_audio_tower(model, _projector_config(tmp_path / "no-checkpoint"), names)
+    for name, param in model.audio_tower.named_parameters():
+        torch.testing.assert_close(param, before[name])
+
+
+def test_partial_projector_requires_explicit_opt_in(tmp_path):
+    names = {"proj1.weight", "proj1.bias", "proj2.weight", "proj2.bias"}
+    with pytest.raises(RuntimeError, match="Incomplete synchronized audio tower"):
+        _AUDIO.restore_frozen_audio_tower(_projector_model(), _config(tmp_path), names)
+
+
+def test_trainable_projector_does_not_read_stale_checkpoint_projector(tmp_path):
+    weights = _projector_weights()
+    # These stale tensors are intentionally unusable. Only encoder tensors
+    # should be read when the four projector tensors came from the actor.
+    weights["model.audio_tower.proj1.weight"] = torch.full((1,), float("nan"))
+    del weights["model.audio_tower.proj2.bias"]
+    _write_checkpoint(tmp_path, weights, True)
+    model = _projector_model()
+    before = {name: param.clone() for name, param in model.audio_tower.named_parameters() if name.startswith("proj")}
+    _AUDIO.restore_frozen_audio_tower(model, _projector_config(tmp_path), before)
+    for name, tensor in before.items():
+        torch.testing.assert_close(dict(model.audio_tower.named_parameters())[name], tensor)
+
+
 def test_loader_must_report_all_target_parameters(tmp_path):
     _write_checkpoint(tmp_path, _weights(), False)
     model = _model()

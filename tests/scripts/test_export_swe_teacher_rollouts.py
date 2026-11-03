@@ -220,3 +220,67 @@ def test_finished_snapshot_while_collecting_is_explicit_and_ignores_incomplete_a
     assert frame.iloc[0]["quality_status"] == "hidden_success_before_quality_filter"
     with pytest.raises(ValueError, match="immutable"):
         adapter.export(args)
+
+
+def test_export_preserves_mixed_runtime_sessions_without_misattributing_legacy_code(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+    from transformers import AutoTokenizer
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *args, **kwargs: Tokenizer())
+    source = tmp_path / "synthesis"
+    source.mkdir()
+    contract = {
+        "model": "397B",
+        "api_url": "http://original:18090/v1",
+        "loop_hashes": {"agent_loop": "initial-contract-hash"},
+    }
+    (source / "run_contract.json").write_text(json.dumps(contract))
+    expected = {}
+    for index in range(4):
+        value = trajectory()
+        value["task_id"] = f"owner__repo-{index}"
+        if index in {1, 2}:
+            session_id = f"session-{index}"
+            provenance = {
+                "session_id": session_id,
+                "concurrency": index * 8,
+                "runtime_revisions": {"verl": f"revision-{index}"},
+                "loop_hashes": {"agent_loop": f"attempt-hash-{index}"},
+                "resolved_actor_config": {"diagnostics": True},
+                "harness_environment": {},
+            }
+            value.update(
+                runtime_session_id=session_id,
+                runtime_provenance=provenance,
+                teacher_api_url=f"http://teacher-{index}:18090/v1",
+            )
+        expected[value["task_id"]] = value
+        attempt_dir = source / "attempts" / value["task_id"] / "0001"
+        attempt_dir.mkdir(parents=True)
+        (attempt_dir / "record.json").write_text(json.dumps({"kind": "solve", "trajectory": value}))
+    # The latest runtime session must not be used to fill older attempt fields.
+    (source / "runtime_sessions.jsonl").write_text(json.dumps({"session_id": "latest-unrelated-session"}) + "\n")
+    args = argparse.Namespace(
+        synthesis_dir=source,
+        output_dir=tmp_path / "export",
+        tokenizer_path=tmp_path / "tokenizer",
+        write_sft_parquet=True,
+    )
+    report = adapter.export(args)
+    assert report["counts"]["exported_trajectories"] == 4
+    rows = [json.loads(line) for line in (args.output_dir / "rollouts" / "1.jsonl").read_text().splitlines()]
+    sft_rows = pq.read_table(args.output_dir / "successful.parquet").to_pylist()
+    by_task = {row["task_id"]: row for row in sft_rows}
+    for row in rows:
+        attempt = expected[row["task_id"]]
+        sft = by_task[row["task_id"]]
+        assert row["runtime_session_id"] == sft["runtime_session_id"] == attempt.get("runtime_session_id")
+        assert row["runtime_provenance"] == attempt.get("runtime_provenance")
+        if attempt.get("runtime_provenance") is None:
+            assert sft["runtime_provenance"] is None
+        else:
+            assert isinstance(sft["runtime_provenance"], str)
+            assert json.loads(sft["runtime_provenance"]) == attempt["runtime_provenance"]
+        assert row["teacher_api_url"] == sft["teacher_api_url"] == attempt.get("teacher_api_url", contract["api_url"])
+        assert "initial-contract-hash" not in json.dumps(row)
+        assert "latest-unrelated-session" not in json.dumps(row)

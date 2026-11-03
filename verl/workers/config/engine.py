@@ -212,6 +212,10 @@ class McoreEngineConfig(EngineConfig):
     override_mcore_model_config: dict[str, Any] = field(default_factory=dict)
     use_mbridge: bool = True
     vanilla_mbridge: bool = False
+    # Immutable checkpoint-backed audio conditioning, before bridge CP/TP packing.
+    frozen_audio: bool = False
+    # Train only proj1/proj2; the checkpoint-backed encoder remains frozen.
+    train_audio_projector: bool = False
     use_megatron_fsdp: bool = False
     strategy: str = "megatron"
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
@@ -221,6 +225,12 @@ class McoreEngineConfig(EngineConfig):
         """config validation logics go here"""
         assert self.strategy == "megatron"
         assert self.dtype in ["bfloat16", "float16"], f"dtype {self.dtype} not supported"
+        if self.frozen_audio and self.train_audio_projector:
+            raise ValueError("frozen_audio and train_audio_projector are mutually exclusive")
+        if self.frozen_audio and self.dynamic_context_parallel:
+            raise ValueError("frozen_audio does not support dynamic_context_parallel")
+        if self.train_audio_projector and self.dynamic_context_parallel:
+            raise ValueError("train_audio_projector does not support dynamic_context_parallel")
         if self.vanilla_mbridge:
             warnings.warn(
                 "The legacy mbridge backend selected by `vanilla_mbridge=True` is deprecated and will be removed "

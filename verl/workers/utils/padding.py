@@ -55,6 +55,13 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
 
     input_ids_nested = torch.nested.nested_tensor_from_jagged(input_ids_rmpad.squeeze(-1), offsets=cu_seqlens)
 
+    # Native-token audio teacher evidence is one scalar per trajectory. It
+    # remains a regular [batch] tensor when token fields become NestedTensors.
+    for key in ("teacher_sequence_logprob", "teacher_sequence_mask", "teacher_sequence_token_count"):
+        value = data.get(key)
+        if value is not None and (value.is_nested or value.ndim != 1 or value.shape[0] != input_ids.shape[0]):
+            raise ValueError(f"{key} must remain a [batch_size] sequence field during padding conversion")
+
     position_ids_list = []
     for i in range(attention_mask.shape[0]):
         curr_mask = attention_mask[i].bool()

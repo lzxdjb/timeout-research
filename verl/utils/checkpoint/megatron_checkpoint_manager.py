@@ -175,6 +175,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         bridge=None,
         provider=None,
         peft_cls=None,
+        train_audio_projector: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -201,6 +202,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         self.vanilla_bridge = self.provider is None
         self.peft_cls = peft_cls
         self.use_megatron_fsdp = use_megatron_fsdp
+        self.train_audio_projector = train_audio_projector
         self.rank = torch.distributed.get_rank()
 
         # ``use_dist_checkpointing`` selects Megatron shards for the ``model``
@@ -1022,7 +1024,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         )
 
     def _preserve_omni_audio_weights(self, hf_ckpt_path: str):
-        """Restore only frozen audio tensors after the Megatron HF export."""
+        """Complete HF audio weights, retaining any explicitly trained projector."""
         if not self._is_omni_audio_checkpoint():
             return
 
@@ -1098,6 +1100,25 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     }
             destination_index = {"weight_map": destination_weight_map}
 
+        if getattr(self, "train_audio_projector", False):
+            # mbridge exports the registered projector under its original HF
+            # names. Merge those current weights with the immutable encoder;
+            # copying the complete source tower would silently undo training.
+            projector_keys = {
+                f"model.audio_tower.{layer}.{parameter}"
+                for layer in ("proj1", "proj2")
+                for parameter in ("weight", "bias")
+            }
+            if not projector_keys <= audio_tensors.keys() or not projector_keys <= destination_weight_map.keys():
+                raise RuntimeError("Trained audio projector export requires all four source and destination tensors")
+            for key in sorted(projector_keys):
+                shard_path = os.path.join(hf_ckpt_path, destination_weight_map[key])
+                with safe_open(shard_path, framework="pt", device="cpu") as dst:
+                    value = dst.get_tensor(key)
+                if value.shape != audio_tensors[key].shape or not torch.isfinite(value).all():
+                    raise RuntimeError(f"Invalid trained audio projector tensor: {key}")
+                audio_tensors[key] = value
+
         for key, existing_shard in destination_weight_map.items():
             if not key.startswith("model.audio_tower.") or key not in audio_tensors:
                 continue
@@ -1114,7 +1135,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         destination_index["weight_map"] = destination_weight_map
         with open(destination_index_path, "w", encoding="utf-8") as f:
             json.dump(destination_index, f, indent=2, sort_keys=True)
-        logger.info("Preserved %d frozen Omni audio tensors in %s", len(audio_tensors), destination_audio_path)
+        logger.info(
+            "Preserved %d Omni audio tensors in %s (train_audio_projector=%s)",
+            len(audio_tensors), destination_audio_path, getattr(self, "train_audio_projector", False),
+        )
 
     def _save_hf_config_and_tokenizer(self, local_path: str):
         """Rank-0 saves HF config, tokenizer, and generation config."""

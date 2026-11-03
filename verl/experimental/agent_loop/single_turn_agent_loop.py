@@ -39,6 +39,18 @@ class SingleTurnAgentLoop(AgentLoopBase):
         # priority may arrive as np.int64 from non_tensor_batch; normalize to Python int.
         priority = int(priority)
         messages = list(kwargs["raw_prompt"])
+        from verl.trainer.distillation.config_utils import audio_teacher_for_sample
+
+        audio_teacher = audio_teacher_for_sample(getattr(self, "config", None), kwargs)
+        response_length = self.response_length
+        if audio_teacher is not None:
+            # This loop instance belongs to one trajectory; do not mutate shared data config.
+            self.apply_chat_template_kwargs = {**self.apply_chat_template_kwargs, "enable_thinking": False}
+            response_length = min(response_length, int(audio_teacher.audio_response_length))
+            sampling_params = dict(sampling_params)
+            sampling_params["max_tokens"] = min(
+                int(sampling_params.get("max_tokens", response_length)), response_length
+            )
 
         # 1. extract multimodal inputs from messages
         multi_modal_data = await self.process_multi_modal_info(messages)
@@ -76,6 +88,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+        if audio_teacher is not None:
+            output.extra_fields["audio_student_truncated"] = (
+                len(output.token_ids) > response_length or output.stop_reason == "aborted"
+            )
 
         if use_continuous_token:
             merge_result, response_mask, response_logprobs = await self.ct_merge_assistant_token(
@@ -94,11 +110,11 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
-            response_ids=response_ids[: self.response_length],
-            response_mask=response_mask[: self.response_length],
-            response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
+            response_ids=response_ids[:response_length],
+            response_mask=response_mask[:response_length],
+            response_logprobs=response_logprobs[:response_length] if response_logprobs else None,
             routed_experts=(
-                output.routed_experts[: len(prompt_ids) + self.response_length]
+                output.routed_experts[: len(prompt_ids) + response_length]
                 if output.routed_experts is not None
                 else None
             ),

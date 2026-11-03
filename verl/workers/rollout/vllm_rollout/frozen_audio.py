@@ -1,4 +1,4 @@
-"""Restore the frozen Qwen3.5-Omni audio tower after actor weight updates."""
+"""Restore frozen Qwen3.5-Omni audio parameters after actor weight updates."""
 
 from __future__ import annotations
 
@@ -21,6 +21,9 @@ logger.setLevel(logging.INFO)
 _ARCHITECTURE = "GageQwen3_5OmniMoeForConditionalGeneration"
 _CHECKPOINT_PREFIX = "model.audio_tower."
 _AUDIO_PREFIXES = (_CHECKPOINT_PREFIX, "audio_tower.")
+_PROJECTOR_WEIGHTS = frozenset(
+    f"{projection}.{leaf}" for projection in ("proj1", "proj2") for leaf in ("weight", "bias")
+)
 
 
 def cuda_memory_snapshot(device: Any = None) -> dict[str, Any]:
@@ -140,11 +143,12 @@ def restore_frozen_audio_tower(
 ) -> dict[str, Any] | None:
     """Complete a hybrid rollout update with checkpoint-backed audio weights.
 
-    Megatron's Qwen3.5 actor exports vision/text parameters only. Dummy loading
-    and level-2 sleep therefore require restoring the frozen tower on *every*
-    update, before post-processing and generation resume. A complete audio
-    update from another backend takes precedence; partial updates fail rather
-    than mixing trained and frozen audio parameters.
+    Dummy loading and level-2 sleep require restoring frozen audio parameters
+    on *every* update, before post-processing and generation resume. Normally
+    the actor omits the entire tower, or supplies it in full. The opt-in HF
+    override ``verl_audio_projector_trainable=True`` instead requires exactly
+    proj1/proj2 from the actor and restores only the frozen encoder. Missing
+    trained projector weights always fail, even on the initial update.
 
     Args:
         model: The main vLLM model owned by this worker.
@@ -184,7 +188,18 @@ def restore_frozen_audio_tower(
             covered.update(targets[name])
         else:
             raise RuntimeError(f"Unexpected synchronized audio tensor: {name}")
-    if received:
+    trainable_projector = getattr(hf_config, "verl_audio_projector_trainable", False)
+    if trainable_projector:
+        if not _PROJECTOR_WEIGHTS <= expected:
+            raise RuntimeError("Trainable audio projector requires proj1/proj2 weights and biases in the audio tower")
+        if received != _PROJECTOR_WEIGHTS:
+            raise RuntimeError(
+                "Incomplete or unexpected synchronized trainable audio projector; "
+                f"missing={sorted(_PROJECTOR_WEIGHTS - received)}, "
+                f"unexpected={sorted(received - _PROJECTOR_WEIGHTS)}"
+            )
+        restore_expected = expected - _PROJECTOR_WEIGHTS
+    elif received:
         missing = expected - covered
         if missing:
             raise RuntimeError(f"Incomplete synchronized audio tower; missing tensors: {sorted(missing)}")
@@ -197,6 +212,9 @@ def restore_frozen_audio_tower(
             extra={"received_tensors": len(received), "tower_parameter_bytes": parameter_bytes},
         )
         return {"source": "actor", "tensor_count": len(received)}
+    else:
+        restore_expected = expected
+    restore_targets = {name for name, sources in targets.items() if sources <= restore_expected}
 
     # STEP 2: Validate headers before copying any checkpoint tensor into the model.
     started = time.monotonic()
@@ -205,12 +223,15 @@ def restore_frozen_audio_tower(
         raise RuntimeError("Frozen audio restoration requires model_config.model to identify its source checkpoint")
     source = Path(source_value).expanduser()
     files = _checkpoint_files(source)
-    missing, unexpected = expected - files.keys(), files.keys() - expected
+    missing, unexpected = restore_expected - files.keys(), files.keys() - expected
     if missing or unexpected:
         raise RuntimeError(
             f"Audio checkpoint coverage mismatch at {source}; "
             f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
         )
+    # Actor-supplied projector values must never be read or replaced by stale
+    # checkpoint values, including after level-2 sleep and later updates.
+    files = {name: file for name, file in files.items() if name in restore_expected}
     by_file: dict[Path, list[str]] = defaultdict(list)
     for name, file in files.items():
         by_file[file].append(name)
@@ -262,10 +283,10 @@ def restore_frozen_audio_tower(
                 },
             )
             raise
-        if loaded != set(targets):
+        if loaded != restore_targets:
             raise RuntimeError(
-                f"Audio loader coverage mismatch: missing={sorted(set(targets) - loaded)}, "
-                f"unexpected={sorted(loaded - set(targets))}"
+                f"Audio loader coverage mismatch: missing={sorted(restore_targets - loaded)}, "
+                f"unexpected={sorted(loaded - restore_targets)}"
             )
 
     elapsed = time.monotonic() - started
@@ -291,4 +312,10 @@ def restore_frozen_audio_tower(
         len(loaded),
         elapsed,
     )
-    return {"source": str(source), "tensor_count": len(files), "parameter_count": len(loaded), "seconds": elapsed}
+    result = {"source": str(source), "tensor_count": len(files), "parameter_count": len(loaded), "seconds": elapsed}
+    if trainable_projector:
+        result["actor_projector_tensor_count"] = len(received)
+        logger.info(
+            "Omni audio projector supplied by actor: rank=%s step=%s tensors=%d", rank, global_steps, len(received)
+        )
+    return result

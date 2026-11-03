@@ -1,0 +1,3 @@
+# Optional local ASR. Obtain a complete CTranslate2/faster-whisper snapshot separately.
+# transcribe_local requires local model.bin/config.json/tokenizer.json; it never downloads weights.
+faster-whisper>=1.1.0,<2

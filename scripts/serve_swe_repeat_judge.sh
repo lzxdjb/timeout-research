@@ -7,6 +7,12 @@ judge_tp="${SWE_REPEAT_JUDGE_TP:-4}"
 judge_context="${SWE_AGENT_REPEAT_JUDGE_MAX_CONTEXT:-131072}"
 judge_host="${SWE_REPEAT_JUDGE_HOST:-0.0.0.0}"
 judge_port="${SWE_REPEAT_JUDGE_PORT:-18090}"
+# Set to 0 to load the vision encoder and accept image/video inputs.
+judge_language_model_only="${SWE_REPEAT_JUDGE_LANGUAGE_MODEL_ONLY:-1}"
+[[ "$judge_language_model_only" == 0 || "$judge_language_model_only" == 1 ]] || {
+  echo "Invalid SWE_REPEAT_JUDGE_LANGUAGE_MODEL_ONLY: $judge_language_model_only (expected 0 or 1)" >&2
+  exit 2
+}
 [[ -f "$judge_model_path/config.json" ]] || { echo "Checkpoint config not found: $judge_model_path" >&2; exit 2; }
 IFS=',' read -ra judge_gpus <<< "$CUDA_VISIBLE_DEVICES"
 judge_gpu_count="${#judge_gpus[@]}"
@@ -33,8 +39,11 @@ judge_command=(vllm serve "$judge_model_path"
   --tensor-parallel-size "$judge_tp" --dtype bfloat16
   --max-model-len "$judge_context" --max-num-seqs "${SWE_REPEAT_JUDGE_MAX_SEQS:-4}"
   --gpu-memory-utilization "${SWE_REPEAT_JUDGE_MEMORY_FRACTION:-0.90}"
-  --language-model-only --generation-config vllm
+  --generation-config vllm
   --default-chat-template-kwargs '{"enable_thinking":false}')
+if [[ "$judge_language_model_only" == 1 ]]; then
+  judge_command+=(--language-model-only)
+fi
 # Do not add a new vLLM flag to existing single-replica launches.
 if (( judge_dp > 1 )); then
   judge_command+=(--data-parallel-size "$judge_dp")

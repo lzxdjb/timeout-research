@@ -23,6 +23,7 @@ from verl.utils.megatron.moe_loss_mask import packed_moe_router_mask
 from verl.utils.megatron_utils import unwrap_model
 from verl.workers.config import MtpConfig
 
+from .frozen_audio import frozen_audio_forward
 from .util import (
     build_vlm_attn_mask_bshd,
     build_vlm_attn_mask_thd,
@@ -107,7 +108,8 @@ def model_forward_gen(vision_model: bool = False):
                 input_args["input_ids"] = input_ids
                 input_args["attention_mask"] = attention_mask
 
-            output_orig = model(**input_args)
+            with frozen_audio_forward(model, input_args["input_ids"], multi_modal_inputs):
+                output_orig = model(**input_args)
 
             if post_process and logits_processor is not None:
                 args = {
@@ -149,12 +151,13 @@ def model_forward_gen(vision_model: bool = False):
                 sequence_parallel=sp,
                 pre_process=pre_process_for_bshd,
             )
-            output_orig = model(
-                input_ids=new_input_ids,
-                position_ids=None if vision_model else new_position_ids,
-                attention_mask=new_attention_mask,
-                **model_kwargs,
-            )
+            with frozen_audio_forward(model, new_input_ids, multi_modal_inputs):
+                output_orig = model(
+                    input_ids=new_input_ids,
+                    position_ids=None if vision_model else new_position_ids,
+                    attention_mask=new_attention_mask,
+                    **model_kwargs,
+                )
             if post_process and logits_processor is not None:
                 args = {
                     k: preprocess_bshd(
@@ -364,13 +367,14 @@ def gptmodel_forward_model_engine(
         if router_padding_mask is not None:
             model_kwargs["padding_mask"] = router_padding_mask
 
-        output_orig = model(
-            input_ids=input_ids_rmpad,
-            attention_mask=attention_mask,
-            position_ids=position_ids_rmpad if mtp_enable_train else None,  # position_ids is only needed for MTP
-            packed_seq_params=packed_seq_params,
-            **model_kwargs,
-        )
+        with frozen_audio_forward(model, input_ids_rmpad, multi_modal_inputs):
+            output_orig = model(
+                input_ids=input_ids_rmpad,
+                attention_mask=attention_mask,
+                position_ids=position_ids_rmpad if mtp_enable_train else None,  # position_ids is only needed for MTP
+                packed_seq_params=packed_seq_params,
+                **model_kwargs,
+            )
 
         if post_process and logits_processor is not None:
             args = {
@@ -462,12 +466,13 @@ def gptmodel_forward_model_engine(
         else:
             attention_mask = attention_mask_bshd
 
-        output_orig = model(
-            input_ids=input_ids_bshd,
-            attention_mask=attention_mask,
-            position_ids=None if vision_model else position_ids_bshd,
-            **model_kwargs,
-        )
+        with frozen_audio_forward(model, input_ids_bshd, multi_modal_inputs):
+            output_orig = model(
+                input_ids=input_ids_bshd,
+                attention_mask=attention_mask,
+                position_ids=None if vision_model else position_ids_bshd,
+                **model_kwargs,
+            )
         if post_process and logits_processor is not None:
             args = {
                 k: preprocess_bshd_engine(

@@ -28,6 +28,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+import inspect
 import logging
 import os
 import random
@@ -167,6 +168,13 @@ class AgentLoopOutput(BaseModel):
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:
             output["teacher_logprobs"] = teacher_logprobs
+        if "teacher_sequence_mask" in output["extra_fields"]:
+            for key, dtype in (
+                ("teacher_sequence_logprob", torch.float32),
+                ("teacher_sequence_mask", torch.bool),
+                ("teacher_sequence_token_count", torch.int64),
+            ):
+                output[key] = torch.tensor(output["extra_fields"].pop(key), dtype=dtype)
         return output
 
 
@@ -965,24 +973,38 @@ class AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
-        current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-
-        multi_modal_inputs = build_multimodal_processor_inputs(
-            self.processor,
-            text=[current_text],
-            images=images,
-            videos=videos,
-            audio=audios,
-            mm_processor_kwargs=output.mm_processor_kwargs
+        processor_kwargs = (
+            output.mm_processor_kwargs
             if output.mm_processor_kwargs is not None
-            else self._get_mm_processor_kwargs(audios),
+            else self._get_mm_processor_kwargs(audios)
         )
-        multi_modal_inputs.pop("input_ids", None)
-        multi_modal_inputs.pop("attention_mask", None)
+        extract_audio_features = getattr(self.processor, "extract_audio_features", None)
+        direct_audio = audios is not None and callable(extract_audio_features)
+        if direct_audio:
+            # The opt-in audio processor already expanded the rollout prompt's
+            # audio pads. Reprocessing decoded IDs either loses their special
+            # tokens or expands them again; extract only the original waveform.
+            audio_inputs = extract_audio_features(audios, sampling_rate=processor_kwargs.get("sampling_rate"))
+            multi_modal_inputs.update(dict(audio_inputs.convert_to_tensors("pt")))
 
-        # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
-        # because np.array() only keeps the keys for BatchFeature.
-        multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
+        if not direct_audio or images is not None or videos is not None:
+            current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+            visual_kwargs = dict(processor_kwargs)
+            if direct_audio:
+                visual_kwargs.pop("sampling_rate", None)
+            processor_inputs = build_multimodal_processor_inputs(
+                self.processor,
+                text=[current_text],
+                images=images,
+                videos=videos,
+                audio=None if direct_audio else audios,
+                mm_processor_kwargs=visual_kwargs,
+            )
+            processor_inputs.pop("input_ids", None)
+            processor_inputs.pop("attention_mask", None)
+
+            # np.array() only keeps BatchFeature keys, so materialize a dict.
+            multi_modal_inputs.update(dict(processor_inputs.convert_to_tensors("pt")))
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
         if image_grid_thw is not None:
             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
@@ -1005,8 +1027,13 @@ class AgentLoopWorker:
             "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
             "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
         }
-        # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
-        if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
+        # Newer RoPE APIs require modality IDs even when audio-only feature
+        # extraction bypasses the processor call that normally creates them.
+        # Rebuild against the complete prompt/response, keeping older APIs intact.
+        if (
+            multi_modal_inputs.pop("mm_token_type_ids", None) is not None
+            or "mm_token_type_ids" in inspect.signature(self.processor.get_rope_index).parameters
+        ):
             mm_token_type_ids = torch.zeros_like(input_ids)
             image_token_id = get_processor_token_id(self.processor, "image")
             video_token_id = get_processor_token_id(self.processor, "video")
@@ -1119,12 +1146,72 @@ class AgentLoopWorker:
             started = time.monotonic()
             outcome = "failed"
             try:
-                teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                    sequence_ids=prompt_ids + response_ids,
-                    multi_modal_data=output.multi_modal_data,
-                    mm_processor_kwargs=output.mm_processor_kwargs,
-                    routing_key=routing_key,
+                is_audio = getattr(self.teacher_server_manager, "uses_audio_sequence_score", lambda _: False)(
+                    routing_key
                 )
+                if is_audio:
+                    from verl.experimental.teacher_loop.errors import TeacherScoringError
+
+                    eos_ids = set()
+                    generation_config = getattr(getattr(self, "model_config", None), "generation_config", None)
+                    for eos in (self.tokenizer.eos_token_id, getattr(generation_config, "eos_token_id", None)):
+                        eos_ids.update(eos if isinstance(eos, (list, tuple, set)) else [eos])
+                    eos_ids.discard(None)
+                    # vLLM also uses checkpoint generation_config EOS values,
+                    # which can differ from the tokenizer's chat EOS. These
+                    # are unpadded rollout IDs; masked/padded tails still fail.
+                    terminated = bool(response_ids) and response_ids[-1] in eos_ids
+                    truncated = bool(output.extra_fields.get("audio_student_truncated", False))
+                    if (
+                        not terminated
+                        or truncated
+                        or len(output.response_mask) != len(response_ids)
+                        or not all(output.response_mask)
+                    ):
+                        raise TeacherScoringError(
+                            "Audio sequence scoring requires a complete, assistant-only response with EOS."
+                        )
+                    text = self.tokenizer.decode(
+                        response_ids[:-1], skip_special_tokens=False, clean_up_tokenization_spaces=False
+                    )
+                    prompt_tail = self.tokenizer.decode(
+                        prompt_ids[-64:], skip_special_tokens=False, clean_up_tokenization_spaces=False
+                    )
+                    marker = "<|im_start|>assistant\n"
+                    if marker not in prompt_tail:
+                        raise TeacherScoringError("Cannot verify the student audio assistant prompt boundary.")
+                    trajectory = {
+                        "messages": list((sample_kwargs or {}).get("raw_prompt", [])),
+                        "response_text": text,
+                        "assistant_prefix": prompt_tail.rsplit(marker, 1)[1],
+                        "terminated": True,
+                        "truncated": False,
+                    }
+                    sequence = await self.teacher_server_manager.compute_teacher_sequence_score_single(
+                        sequence_ids=prompt_ids + response_ids,
+                        trajectory=trajectory,
+                        multi_modal_data=output.multi_modal_data,
+                        mm_processor_kwargs=output.mm_processor_kwargs,
+                        routing_key=routing_key,
+                    )
+                    if sequence.get("teacher_sequence_mask") is not True:
+                        raise TeacherScoringError("Audio teacher omitted the verified sequence score discriminator.")
+                    output.extra_fields.update(sequence)
+                    # Batch storage needs a common tensor schema. These zeros are never
+                    # supervision: teacher_sequence_mask excludes every audio token from k1.
+                    teacher_ids = torch.zeros((len(prompt_ids) + len(response_ids), 1), dtype=torch.int32)
+                    teacher_logprobs = torch.zeros_like(teacher_ids, dtype=torch.float32)
+                else:
+                    teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+                        sequence_ids=prompt_ids + response_ids,
+                        multi_modal_data=output.multi_modal_data,
+                        mm_processor_kwargs=output.mm_processor_kwargs,
+                        routing_key=routing_key,
+                    )
+                    if getattr(self.teacher_server_manager, "has_audio_teacher", False):
+                        output.extra_fields.update(
+                            teacher_sequence_logprob=0.0, teacher_sequence_mask=False, teacher_sequence_token_count=0
+                        )
                 outcome = "completed"
             except asyncio.CancelledError:
                 outcome = "cancelled"
@@ -1193,6 +1280,13 @@ class AgentLoopWorker:
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        if any("teacher_sequence_mask" in item.extra_fields for item in inputs):
+            for key, dtype in (
+                ("teacher_sequence_logprob", torch.float32),
+                ("teacher_sequence_mask", torch.bool),
+                ("teacher_sequence_token_count", torch.int64),
+            ):
+                optional_outputs[key] = torch.tensor([item.extra_fields.get(key, 0) for item in inputs], dtype=dtype)
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]

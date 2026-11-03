@@ -21,6 +21,9 @@ use_shm: False
 # whether to trust remote code.
 trust_remote_code: False
 
+# Opt-in Qwen3.5 audio feature extraction for training and prompt tokenization.
+enable_audio_processor: False
+
 # custom chat template for the model
 custom_chat_template: null
 

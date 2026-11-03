@@ -71,6 +71,15 @@ distillation_loss:
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
 
+  # Cross-tokenizer audio pilot: sequence teacher likelihood + student entropy
+  # surrogate, combined with the existing text k1 loss. Off preserves legacy OPD.
+  # Requires pure PG k1, seq-mean-token-mean, and exactly one PPO epoch.
+  audio_sequence_surrogate: false
+  audio_sequence_reward_scale: 1.0
+  audio_sequence_clip_ratio: 0.2
+  # No same-sample centering: the initial pilot intentionally has no baseline.
+  audio_sequence_baseline: none
+
 
 # Number of GPUs per node in the distillation teacher resource pool
 n_gpus_per_node: 8
@@ -114,6 +123,10 @@ teacher_models:
       retry_backoff_s: 1.0
       api_key_env: null
       unsupported_token_ids: []
+      protocol: text_token_ids
+      tokenizer_path: null
+      audio_prompt_length: 8192
+      audio_response_length: 2048
     num_replicas: 0
     inference:
       _target_: verl.workers.config.RolloutConfig

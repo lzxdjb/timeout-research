@@ -1,0 +1,146 @@
+schema_version: 1
+# Downloads use complete official archives. A normalization sample limit does not
+# reduce archive size. No downloads run unless --execute and a byte cap are set.
+datasets:
+  librispeech:
+    enabled: true
+    revision: openslr-12-original
+    homepage: https://www.openslr.org/12/
+    audio_license: CC-BY-4.0
+    annotation_license: CC-BY-4.0
+    assets:
+      - filename: train-clean-100.tar.gz
+        url: https://www.openslr.org/resources/12/train-clean-100.tar.gz
+        size_bytes: 6387309499
+        sha256: d4ddd1d5a6ab303066f14971d768ee43278a5f2a0aa43dc716b0e64ecbbbf6e2
+      - filename: dev-clean.tar.gz
+        url: https://www.openslr.org/resources/12/dev-clean.tar.gz
+        size_bytes: 337926286
+        sha256: 76f87d090650617fca0cac8f88b9416e0ebf80350acb97b343a85fa903728ab3
+        optional: true
+      - filename: test-clean.tar.gz
+        url: https://www.openslr.org/resources/12/test-clean.tar.gz
+        size_bytes: 346663984
+        sha256: 39fde525e59672dc6d1551919b1478f724438a95aa55f874b576be21967e6c23
+        optional: true
+  aishell1:
+    enabled: true
+    revision: openslr-33-2017
+    homepage: https://www.openslr.org/33/
+    audio_license: Apache-2.0
+    annotation_license: Apache-2.0
+    integrity_note: No publisher checksum found; verify exact byte size and retain a local SHA256 receipt.
+    assets:
+      - filename: data_aishell.tgz
+        url: https://www.openslr.org/resources/33/data_aishell.tgz
+        size_bytes: 15582913665
+      - filename: resource_aishell.tgz
+        url: https://www.openslr.org/resources/33/resource_aishell.tgz
+        size_bytes: 1246920
+        optional: true
+  fsd50k:
+    enabled: true
+    revision: zenodo-4060432
+    homepage: https://zenodo.org/records/4060432
+    audio_license: per-recording
+    annotation_license: CC-BY-4.0
+    assets:
+      - filename: FSD50K.ground_truth.zip
+        url: https://zenodo.org/api/records/4060432/files/FSD50K.ground_truth.zip/content
+        size_bytes: 334701
+        md5: ca27382c195e37d2269c4c866dd73485
+      - filename: FSD50K.metadata.zip
+        url: https://zenodo.org/api/records/4060432/files/FSD50K.metadata.zip/content
+        size_bytes: 6700838
+        md5: b9ea0c829a411c1d42adb9da539ed237
+      - filename: FSD50K.dev_audio.z01
+        url: https://zenodo.org/api/records/4060432/files/FSD50K.dev_audio.z01/content
+        size_bytes: 3221225472
+        md5: faa7cf4cc076fc34a44a479a5ed862a3
+      - filename: FSD50K.dev_audio.z02
+        url: https://zenodo.org/api/records/4060432/files/FSD50K.dev_audio.z02/content
+        size_bytes: 3221225472
+        md5: 8f9b66153e68571164fb1315d00bc7bc
+      - filename: FSD50K.dev_audio.z03
+        url: https://zenodo.org/api/records/4060432/files/FSD50K.dev_audio.z03/content
+        size_bytes: 3221225472
+        md5: 1196ef47d267a993d30fa98af54b7159
+      - filename: FSD50K.dev_audio.z04
+        url: https://zenodo.org/api/records/4060432/files/FSD50K.dev_audio.z04/content
+        size_bytes: 3221225472
+        md5: d088ac4e11ba53daf9f7574c11cccac9
+      - filename: FSD50K.dev_audio.z05
+        url: https://zenodo.org/api/records/4060432/files/FSD50K.dev_audio.z05/content
+        size_bytes: 3221225472
+        md5: 81356521aa159accd3c35de22da28c7f
+      - filename: FSD50K.dev_audio.zip
+        url: https://zenodo.org/api/records/4060432/files/FSD50K.dev_audio.zip/content
+        size_bytes: 2306663327
+        md5: c480d119b8f7a7e32fdb58f3ea4d6c5a
+  clotho_aqa:
+    enabled: true
+    revision: zenodo-6473207
+    homepage: https://zenodo.org/records/6473207
+    audio_license: per-recording
+    annotation_license: MIT
+    assets:
+      - filename: clotho_aqa_train.csv
+        url: https://zenodo.org/api/records/6473207/files/clotho_aqa_train.csv/content
+        size_bytes: 1453735
+        md5: 508513b91001ab17e641eaaa162ca045
+      - filename: clotho_aqa_val.csv
+        url: https://zenodo.org/api/records/6473207/files/clotho_aqa_val.csv/content
+        size_bytes: 428232
+        md5: 41b8f6d906a57d7a5a4ee02bbcdefcc9
+      - filename: clotho_aqa_test.csv
+        url: https://zenodo.org/api/records/6473207/files/clotho_aqa_test.csv/content
+        size_bytes: 586749
+        md5: 6fd0e75dffba561805fa37c668ce99a4
+      - filename: clotho_aqa_metadata.csv
+        url: https://zenodo.org/api/records/6473207/files/clotho_aqa_metadata.csv/content
+        size_bytes: 427441
+        md5: e555d8a5a4b275ca7c437a33c0739d65
+      - filename: LICENSE.txt
+        url: https://zenodo.org/api/records/6473207/files/LICENSE.txt/content
+        size_bytes: 1467
+        md5: 41460130242fbd61fa2615a0e6622d3a
+      - filename: audio_files.zip
+        url: https://zenodo.org/api/records/6473207/files/audio_files.zip/content
+        size_bytes: 3140677494
+        md5: 48c2c46ccd71dc06121228e2ed68d6b9
+  nsynth:
+    enabled: true
+    revision: original-2017-jsonwav
+    homepage: https://magenta.tensorflow.org/datasets/nsynth
+    audio_license: CC-BY-4.0
+    annotation_license: CC-BY-4.0
+    integrity_note: Official GCS object has no published SHA/MD5; verify size and retain local SHA256 receipt.
+    assets:
+      - filename: nsynth-train.jsonwav.tar.gz
+        # HTTPS GCS bucket URL avoids the legacy hostname's invalid TLS certificate.
+        url: https://storage.googleapis.com/download.magenta.tensorflow.org/datasets/nsynth/nsynth-train.jsonwav.tar.gz
+        size_bytes: 23815298079
+  slurp:
+    enabled: false
+    revision: unpinned
+    homepage: https://github.com/pswietojanski/slurp
+    audio_license: CC-BY-NC-4.0
+    annotation_license: CC-BY-4.0
+    restricted: true
+    assets: []
+  audioskills:
+    enabled: false
+    revision: unpinned
+    homepage: https://huggingface.co/datasets/nvidia/AudioSkills
+    audio_license: per-source
+    annotation_license: NVIDIA-OneWay-Noncommercial
+    restricted: true
+    assets: []
+  afthink:
+    enabled: false
+    revision: unpinned
+    homepage: https://huggingface.co/datasets/nvidia/AF-Think
+    audio_license: per-source
+    annotation_license: NVIDIA-OneWay-Noncommercial
+    restricted: true
+    assets: []

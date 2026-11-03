@@ -179,7 +179,7 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
     return tokenizer
 
 
-def hf_processor(name_or_path, **kwargs):
+def hf_processor(name_or_path, *, enable_audio_processor=False, **kwargs):
     """Create a huggingface processor to process multimodal data.
 
     Args:
@@ -193,7 +193,12 @@ def hf_processor(name_or_path, **kwargs):
     from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizerBase
 
     try:
-        processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
+        if enable_audio_processor:
+            from .audio_processor import AudioQwen3VLProcessor
+
+            processor = AudioQwen3VLProcessor.from_pretrained(name_or_path, **kwargs)
+        else:
+            processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
         # In newer transformers, AutoProcessor may legitimately fall back to a
         # tokenizer backend (e.g. TokenizersBackend) for text-only models.
         # Treat it as "no multimodal processor" and let callers use hf_tokenizer.
@@ -201,6 +206,19 @@ def hf_processor(name_or_path, **kwargs):
             return None
 
         config = AutoConfig.from_pretrained(name_or_path, **kwargs)
+        if enable_audio_processor:
+            audio_config = getattr(config, "audio_config", None)
+            mel_bins = (
+                audio_config.get("num_mel_bins")
+                if isinstance(audio_config, dict)
+                else getattr(audio_config, "num_mel_bins", None)
+            )
+            if (
+                not getattr(config, "verl_omni_audio", False)
+                or processor.audio_token_id != getattr(config, "audio_token_id", None)
+                or processor.feature_extractor.feature_size != mel_bins
+            ):
+                raise ValueError("Audio processor token/features do not match the checkpoint's Omni configuration")
 
         # Bind vlm model's get_rope_index method to processor.
         processor.config = config
@@ -214,7 +232,7 @@ def hf_processor(name_or_path, **kwargs):
                 from transformers.models.qwen2_5_vl import Qwen2_5_VLModel
 
                 model_class = Qwen2_5_VLModel
-            case "Qwen3VLProcessor":
+            case "Qwen3VLProcessor" | "AudioQwen3VLProcessor":
                 from transformers.models.qwen3_vl import Qwen3VLModel
 
                 model_class = Qwen3VLModel
@@ -236,6 +254,8 @@ def hf_processor(name_or_path, **kwargs):
             if hasattr(model_class, "get_vision_position_ids"):
                 processor.get_vision_position_ids = types.MethodType(model_class.get_vision_position_ids, processor)
     except Exception as e:
+        if enable_audio_processor:
+            raise RuntimeError("Unable to construct the explicitly enabled audio processor") from e
         processor = None
         # TODO(haibin.lin): try-catch should be removed after adding transformer version req to setup.py to avoid
         # silent failure

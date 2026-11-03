@@ -490,6 +490,37 @@ class MegatronEngine(BaseEngine):
         )
         override_ddp_config = self._resolve_override_ddp_config()
 
+        audio_callbacks = []
+        if getattr(self.engine_config, "train_audio_projector", False):
+            if (
+                not self.vanilla_bridge
+                or self.bridge is None
+                or self.engine_config.use_megatron_fsdp
+                or self.peft_cls is not None
+                or self._qat_enabled
+            ):
+                raise ValueError(
+                    "train_audio_projector requires the legacy mbridge backend without FSDP, PEFT or QAT"
+                )
+            if self.is_value_model or self.model_config.mtp.enable:
+                raise ValueError("train_audio_projector supports language actors without MTP only")
+            if not getattr(self.model_config.hf_config, "verl_omni_audio", False):
+                raise ValueError("train_audio_projector requires a verl_omni_audio checkpoint")
+            from verl.models.mcore.audio_projector_bridge import configure_audio_projector_bridge
+            from verl.models.mcore.frozen_audio import install_trainable_audio_projector_adapters
+
+            configure_audio_projector_bridge(self.bridge)
+
+            def install_projector(model, **_kwargs):
+                self._frozen_audio_adapters.extend(
+                    install_trainable_audio_projector_adapters(
+                        [model], self.model_config.local_path, self.model_config.hf_config
+                    )
+                )
+                return model
+
+            audio_callbacks.append(install_projector)
+
         module, updated_tf_config = make_megatron_module(
             wrap_config=wrap_config,
             tf_config=self.tf_config,
@@ -500,6 +531,7 @@ class MegatronEngine(BaseEngine):
             override_ddp_config=override_ddp_config,
             peft_cls=self.peft_cls,
             peft_config=self.model_config.get("lora", None),
+            post_model_creation_callbacks=audio_callbacks,
         )
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
@@ -587,7 +619,18 @@ class MegatronEngine(BaseEngine):
         _check_dcp_unsupported_features(self.engine_config, self.model_config, tf_config=self.tf_config)
         validate_moe_loss_mask_config(self.engine_config, self.model_config, self.tf_config)
 
+        self._frozen_audio_adapters = []
         self.module = self._build_megatron_module()
+        if self.engine_config.frozen_audio:
+            if self.is_value_model or self.model_config.mtp.enable:
+                raise ValueError("frozen_audio supports language actors/references without MTP only")
+            if not getattr(self.model_config.hf_config, "verl_omni_audio", False):
+                raise ValueError("frozen_audio requires the checkpoint's verl_omni_audio model configuration")
+            from verl.models.mcore.frozen_audio import install_frozen_audio_adapters
+
+            self._frozen_audio_adapters = install_frozen_audio_adapters(
+                self.module, self.model_config.local_path, self.model_config.hf_config
+            )
         if self.engine_config.moe_loss_respects_train_sample_mask:
             validate_moe_loss_mask_config(self.engine_config, self.model_config, self.tf_config)
             install_moe_loss_mask_support(self.module)
@@ -657,6 +700,7 @@ class MegatronEngine(BaseEngine):
             provider=self.provider,
             peft_cls=self.peft_cls,
             use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
+            train_audio_projector=getattr(self.engine_config, "train_audio_projector", False),
         )
 
         self.to(
@@ -754,6 +798,8 @@ class MegatronEngine(BaseEngine):
         elif device == "cpu":
             if model:
                 offload_megatron_model_to_cpu(self.module)
+                for adapter in getattr(self, "_frozen_audio_adapters", []):
+                    adapter.offload()
             if optimizer and self.optimizer is not None:
                 offload_megatron_optimizer(self.optimizer)
         else:
