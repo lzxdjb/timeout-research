@@ -50,6 +50,8 @@ def run_audio_benchmarks(
     balanced across live rollout endpoints, which serve audio when
     ``rollout.enable_audio=True``. Set ``load_balance=False`` to retain the
     historical behavior of targeting only the first rollout endpoint.
+    Explicit ``temperature``, ``top_p``, ``top_k`` and ``max_tokens`` settings
+    override GAGE's benchmark defaults on generation requests only.
     """
 
     if not config or not bool(config.get("enabled", False)):
@@ -127,11 +129,19 @@ def run_audio_benchmarks(
     # The GAGE child accepts one OpenAI endpoint. Keep it on the same host as
     # this loopback router, which forwards to every rollout replica. An explicit
     # endpoint and single-replica runs keep their direct connection unchanged.
-    routing = (
-        AudioBenchmarkRouter(api_bases)
-        if len(api_bases) > 1 and bool(config.get("load_balance", True))
-        else nullcontext()
-    )
+    generation_overrides = {
+        key: config[key]
+        for key in ("temperature", "top_p", "top_k", "max_tokens")
+        if key in config and config[key] is not None
+    }
+    routing_bases = api_bases if bool(config.get("load_balance", True)) else api_bases[:1]
+    if generation_overrides:
+        # GAGE templates define their own sampling and its OpenAI adapter drops
+        # top_k. Apply explicit settings to the final HTTP request for every suite.
+        routing = AudioBenchmarkRouter(routing_bases, generation_overrides=generation_overrides)
+        logger.info("Audio benchmark generation overrides: %s", generation_overrides)
+    else:
+        routing = AudioBenchmarkRouter(routing_bases) if len(routing_bases) > 1 else nullcontext()
     # The suite and its children run on this host. Keep transient control files
     # off shared storage without moving any benchmark artifacts or weakening
     # the atomic per-sample journal writes. Respect an explicitly chosen root.
@@ -143,7 +153,7 @@ def run_audio_benchmarks(
         if router is not None:
             api_base = router.api_base
             command[command.index("--external-api-base") + 1] = api_base
-            logger.info("Audio benchmark replica routing: replicas=%s endpoints=%s", len(api_bases), api_bases)
+            logger.info("Audio benchmark replica routing: replicas=%s endpoints=%s", len(routing_bases), routing_bases)
         logger.info(
             "audio_benchmark_pressure step=%s run_id=%s benchmarks=%s max_samples=%s "
             "concurrency=%s api_base=%s expected_summary=%s",

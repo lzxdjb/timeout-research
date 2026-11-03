@@ -20,6 +20,8 @@ import torch
 from omegaconf import DictConfig
 from torch.nn import functional as F
 
+from verl.experimental.teacher_loop.errors import TeacherScoringError
+from verl.utils.async_rpc import RPCCancellationError
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import (
     DistillationConfig,
@@ -176,3 +178,44 @@ class AsyncTeacherLLMServerManager:
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
         return teacher_ids, teacher_logprobs
+
+    async def compute_image_teacher_logprobs_single(
+        self,
+        prompt_ids: list[int],
+        response_ids: list[int],
+        trajectory: dict,
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        routing_key: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Use the existing text teacher for opt-in, exact-token image reasoning."""
+        try:
+            key = self._resolve_teacher_key(routing_key)
+            teacher = self.teacher_model_configs[key]
+            if teacher.backend != "external" or not teacher.external.enable_image_candidate_scoring:
+                raise TeacherScoringError("Selected teacher does not explicitly enable image candidate scoring.")
+            data = multi_modal_data or {}
+            output = await self.teacher_client[key].generate(
+                request_id=uuid4().hex,
+                prompt_ids=prompt_ids + response_ids,
+                sampling_params=_get_teacher_sampling_params(teacher, self.distillation_loss_config),
+                image_data=data.get("images"),
+                video_data=data.get("videos"),
+                audio_data=data.get("audios"),
+                mm_processor_kwargs=mm_processor_kwargs,
+                image_candidate=True,
+                student_prompt_ids=prompt_ids,
+                response_ids=response_ids,
+                trajectory=trajectory,
+            )
+            ids = torch.tensor(output.extra_fields["prompt_ids"], dtype=torch.int32)
+            logprobs = torch.tensor(output.extra_fields["prompt_logprobs"], dtype=torch.float32)
+            if ids.shape != (len(prompt_ids) + len(response_ids), 1) or logprobs.shape != ids.shape:
+                raise TeacherScoringError("Image teacher returned targets with an invalid student-token tensor shape.")
+            return ids, logprobs
+        except (TeacherScoringError, RPCCancellationError):
+            raise
+        except Exception as exc:
+            # V1 must stop on missing/malformed image targets instead of
+            # refilling the batch with easier trajectories.
+            raise TeacherScoringError(f"Image teacher scoring failed: {str(exc)[:1000]}") from exc

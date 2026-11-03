@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from types import TracebackType
+from typing import Any
 
 import aiohttp
 from aiohttp import web
@@ -35,6 +38,23 @@ def _forward_headers(headers: CIMultiDictProxy[str]) -> Iterable[tuple[str, str]
     return [(name, value) for name, value in headers.items() if name.lower() not in excluded]
 
 
+def _generation_overrides(values: Mapping[str, Any] | None) -> dict[str, int | float]:
+    """Validate explicit audio evaluation sampling settings without adding defaults."""
+    overrides = dict(values or {})
+    unknown = overrides.keys() - {"temperature", "top_p", "top_k", "max_tokens"}
+    if unknown:
+        raise ValueError(f"Unsupported audio generation overrides: {sorted(unknown)}")
+    for key, value in overrides.items():
+        if key in {"temperature", "top_p"}:
+            valid = type(value) in {int, float} and math.isfinite(value)
+            valid = valid and (value >= 0 if key == "temperature" else 0 < value <= 1)
+        else:
+            valid = type(value) is int and (value > 0 or (key == "top_k" and value == -1))
+        if not valid:
+            raise ValueError(f"Invalid audio generation override {key}={value!r}")
+    return overrides
+
+
 class AudioBenchmarkRouter:
     """Expose live rollout replicas through one local OpenAI-compatible URL.
 
@@ -44,7 +64,9 @@ class AudioBenchmarkRouter:
     once; HTTP errors and response bytes pass through without generation retries.
     """
 
-    def __init__(self, upstream_api_bases: list[str]):
+    def __init__(
+        self, upstream_api_bases: list[str], *, generation_overrides: Mapping[str, Any] | None = None
+    ):
         if not upstream_api_bases:
             raise ValueError("Audio benchmark routing requires at least one upstream endpoint")
         self._upstreams = [str(base).rstrip("/") for base in upstream_api_bases]
@@ -58,6 +80,7 @@ class AudioBenchmarkRouter:
                 or parsed.fragment
             ):
                 raise ValueError(f"Expected an HTTP audio API base ending in /v1: {base!r}")
+        self._generation_overrides = _generation_overrides(generation_overrides)
         self._inflight = [0] * len(self._upstreams)
         self._next_upstream = 0
         self._api_base: str | None = None
@@ -206,11 +229,31 @@ class AudioBenchmarkRouter:
             # raw_path retains percent escapes and the original query string.
             target = URL(self._upstreams[index] + request.raw_path[len("/v1") :], encoded=True)
             assert self._session is not None
+            headers = list(_forward_headers(request.headers))
+            data = request.content.iter_chunked(64 * 1024) if request.can_read_body else None
+            if (
+                self._generation_overrides
+                and request.method == "POST"
+                and request.path in {"/v1/chat/completions", "/v1/completions"}
+            ):
+                try:
+                    payload = json.loads(await request.read())
+                    if not isinstance(payload, dict):
+                        raise ValueError("Expected a JSON object")
+                    payload.update(self._generation_overrides)
+                    if "max_tokens" in self._generation_overrides:
+                        payload.pop("max_completion_tokens", None)
+                    data = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+                except (ValueError, UnicodeDecodeError):
+                    return web.Response(status=400, text="Audio generation overrides require a JSON object\n")
+                # The updated JSON has a different length; aiohttp derives it
+                # from the bytes. top_k stays a top-level vLLM extension on wire.
+                headers = [(name, value) for name, value in headers if name.lower() != "content-length"]
             async with self._session.request(
                 request.method,
                 target,
-                headers=_forward_headers(request.headers),
-                data=request.content.iter_chunked(64 * 1024) if request.can_read_body else None,
+                headers=headers,
+                data=data,
                 allow_redirects=False,
             ) as upstream:
                 response = web.StreamResponse(

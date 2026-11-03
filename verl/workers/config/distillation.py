@@ -167,6 +167,9 @@ class ExternalTeacherConfig(BaseConfig):
     # Audio scoring is explicitly opt-in; text teachers retain the exact token-ID protocol.
     protocol: str = "text_token_ids"
     tokenizer_path: Optional[str] = None
+    # Reuse this text teacher and its concurrency budget for reasoning images.
+    # Normal text/audio callers retain their existing protocols.
+    enable_image_candidate_scoring: bool = False
     audio_prompt_length: int = 8192
     audio_response_length: int = 2048
 
@@ -186,6 +189,11 @@ class ExternalTeacherConfig(BaseConfig):
             raise ValueError("External teacher retry count and backoff must be nonnegative.")
         if self.protocol not in {"text_token_ids", "audio_candidate_score"}:
             raise ValueError(f"Unknown external teacher protocol {self.protocol!r}.")
+        if self.enable_image_candidate_scoring:
+            if self.protocol != "text_token_ids":
+                raise ValueError("Image candidate scoring requires the existing text_token_ids teacher protocol.")
+            if not self.tokenizer_path or not os.path.isdir(self.tokenizer_path):
+                raise ValueError("Image candidate scoring requires a local external.tokenizer_path directory.")
         if self.protocol == "audio_candidate_score":
             if not self.tokenizer_path or not os.path.isdir(self.tokenizer_path):
                 raise ValueError("Audio candidate scoring requires a local external.tokenizer_path directory.")

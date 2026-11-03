@@ -1202,12 +1202,45 @@ class AgentLoopWorker:
                     teacher_ids = torch.zeros((len(prompt_ids) + len(response_ids), 1), dtype=torch.int32)
                     teacher_logprobs = torch.zeros_like(teacher_ids, dtype=torch.float32)
                 else:
-                    teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                        sequence_ids=prompt_ids + response_ids,
-                        multi_modal_data=output.multi_modal_data,
-                        mm_processor_kwargs=output.mm_processor_kwargs,
-                        routing_key=routing_key,
+                    from verl.trainer.distillation.reasoning_utils import (
+                        image_reasoning_trajectory,
+                        is_reasoning_sample,
                     )
+
+                    images = (output.multi_modal_data or {}).get("images")
+                    if is_reasoning_sample(self.config, sample_kwargs or {}) and images is not None and len(images):
+                        if len(output.response_mask) != len(response_ids) or not all(output.response_mask):
+                            from verl.experimental.teacher_loop.errors import TeacherScoringError
+
+                            raise TeacherScoringError("Image reasoning requires assistant-only response tokens")
+                        eos_ids = {self.tokenizer.eos_token_id}
+                        generation_config = getattr(getattr(self, "model_config", None), "generation_config", None)
+                        eos = getattr(generation_config, "eos_token_id", None)
+                        eos_ids.update(eos if isinstance(eos, (list, tuple, set)) else [eos])
+                        eos_ids.discard(None)
+                        trajectory = image_reasoning_trajectory(
+                            self.tokenizer, prompt_ids, response_ids,
+                            (sample_kwargs or {}).get("raw_prompt", []), eos_ids,
+                        )
+                        teacher_ids, teacher_logprobs = (
+                            await self.teacher_server_manager.compute_image_teacher_logprobs_single(
+                                prompt_ids=prompt_ids,
+                                response_ids=response_ids,
+                                trajectory=trajectory,
+                                multi_modal_data=output.multi_modal_data,
+                                mm_processor_kwargs=output.mm_processor_kwargs,
+                                routing_key=routing_key,
+                            )
+                        )
+                    else:
+                        teacher_ids, teacher_logprobs = (
+                            await self.teacher_server_manager.compute_teacher_logprobs_single(
+                                sequence_ids=prompt_ids + response_ids,
+                                multi_modal_data=output.multi_modal_data,
+                                mm_processor_kwargs=output.mm_processor_kwargs,
+                                routing_key=routing_key,
+                            )
+                        )
                     if getattr(self.teacher_server_manager, "has_audio_teacher", False):
                         output.extra_fields.update(
                             teacher_sequence_logprob=0.0, teacher_sequence_mask=False, teacher_sequence_token_count=0

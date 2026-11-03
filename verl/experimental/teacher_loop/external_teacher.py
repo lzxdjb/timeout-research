@@ -92,6 +92,7 @@ class ExternalTeacherScorer:
         self._phase_timing = phase_timing
         self._phase_metrics = PhaseMetrics()
         self._audio_codec = None
+        self._image_codec = None
 
     def _get_audio_codec(self):
         if self._audio_codec is None:
@@ -99,6 +100,13 @@ class ExternalTeacherScorer:
 
             self._audio_codec = AudioCandidateCodec(self.config)
         return self._audio_codec
+
+    def _get_image_codec(self):
+        if self._image_codec is None:
+            from verl.experimental.teacher_loop.image_candidate import ImageCandidateCodec
+
+            self._image_codec = ImageCandidateCodec(self.config)
+        return self._image_codec
 
     @contextmanager
     def _timed_phase(self, phase: str):
@@ -140,9 +148,11 @@ class ExternalTeacherScorer:
         return self._session
 
     async def _request(self, method: str, path: str, payload: Optional[dict] = None) -> dict:
+        # vLLM's token-native inference API is rooted alongside OpenAI /v1.
+        base = self._base_url.removesuffix("/v1") if path.startswith("/inference/") else self._base_url
         for attempt in range(self.config.max_retries + 1):
             try:
-                async with self._get_session().request(method, self._base_url + path, json=payload) as response:
+                async with self._get_session().request(method, base + path, json=payload) as response:
                     if response.status == 429 or response.status == 408 or response.status >= 500:
                         # Retriable service errors are never replaced with fake teacher targets.
                         response.raise_for_status()
@@ -178,7 +188,37 @@ class ExternalTeacherScorer:
             )
         if self.config.protocol == "audio_candidate_score":
             await asyncio.to_thread(self._get_audio_codec)
+        if self.config.enable_image_candidate_scoring:
+            await asyncio.to_thread(self._get_image_codec)
         return {"model_name": self.config.model_name, "max_model_len": served_limit}
+
+    async def score_image_candidate(
+        self,
+        prompt_ids: list[int],
+        response_ids: list[int],
+        trajectory: dict,
+        image_data=None,
+        mm_processor_kwargs=None,
+    ) -> dict[str, list]:
+        if not self.config.enable_image_candidate_scoring or self.config.protocol != "text_token_ids":
+            raise ValueError("Image candidate scoring requires explicit enable_image_candidate_scoring=True.")
+        if self._unsupported_ids.intersection(response_ids):
+            raise ValueError("Image response contains token IDs unsupported by the external teacher tokenizer.")
+        with self._timed_phase("teacher_score"):
+            codec = self._get_image_codec()
+            payload, expected = await asyncio.to_thread(
+                codec.prepare, prompt_ids, response_ids, trajectory, image_data, mm_processor_kwargs
+            )
+            with self._timed_phase("teacher_queue"):
+                await self._semaphore.acquire()
+            try:
+                with self._timed_phase("teacher_http"):
+                    rendered = await self._request("POST", "/chat/completions/render", payload)
+                    request, expected = await asyncio.to_thread(codec.prepare_scoring, rendered, expected)
+                    result = await self._request("POST", "/inference/v1/generate", request)
+            finally:
+                self._semaphore.release()
+            return codec.parse(result, expected)
 
     async def score_audio_candidate(self, trajectory: dict, audio_data=None, mm_processor_kwargs=None) -> dict:
         if self.config.protocol != "audio_candidate_score":
@@ -240,6 +280,7 @@ class ExternalTeacherClient(LLMServerClient):
         super().__init__(config=config)
         self._scoring_handle = scoring_handle
         self._protocol = getattr(external_config, "protocol", "text_token_ids")
+        self._enable_image_candidate_scoring = getattr(external_config, "enable_image_candidate_scoring", False)
 
     async def generate(
         self,
@@ -254,6 +295,22 @@ class ExternalTeacherClient(LLMServerClient):
         **kwargs,
     ) -> TokenOutput:
         try:
+            if kwargs.get("image_candidate", False):
+                if not self._enable_image_candidate_scoring or self._protocol != "text_token_ids":
+                    raise ValueError("Image scoring requires explicit enable_image_candidate_scoring=True.")
+                if video_data or audio_data:
+                    raise ValueError("Image reasoning teacher does not accept audio/video trajectories.")
+                if sampling_params.get("prompt_logprobs", 0) != 0:
+                    raise NotImplementedError("Image teacher scoring supports sampled-token logprobs only.")
+                scoring_ref = self._scoring_handle.score_image_candidate.remote(
+                    kwargs.get("student_prompt_ids"),
+                    kwargs.get("response_ids"),
+                    kwargs.get("trajectory"),
+                    image_data,
+                    mm_processor_kwargs,
+                )
+                extra_fields = await await_cancellable_ray_ref(scoring_ref)
+                return TokenOutput(token_ids=[], extra_fields=extra_fields)
             if self._protocol == "audio_candidate_score":
                 if image_data or video_data:
                     raise ValueError("Audio sequence teacher does not accept image/video trajectories.")

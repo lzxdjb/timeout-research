@@ -42,6 +42,11 @@ from verl.trainer.distillation.config_utils import (
     opd_wait_for_scoring_on_cutoff,
     should_skip_hidden_reward,
 )
+from verl.trainer.distillation.reasoning_utils import (
+    is_reasoning_sample,
+    reasoning_profile_enabled,
+    skip_reasoning_task_reward,
+)
 from verl.trainer.ppo.v1.repeat_judge_queue import RepeatQueueError, progress_interval_seconds
 from verl.trainer.ppo.v1.utils import hidden_reward_was_skipped
 from verl.utils.async_rpc import GenerationCutoffState, RPCCancellationError, generation_cutoff_scope
@@ -922,6 +927,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 raise RuntimeError("Audio neutral task reward requires a verified audio teacher sequence score.")
             outputs[0].reward_score = 0.0
             outputs[0].extra_fields["audio_opd_task_reward_skipped"] = True
+        elif skip_reasoning_task_reward(self.config, outputs, kwargs, validate=validate):
+            pass
         elif should_skip_hidden_reward(self.config, validate=validate):
             # The SWE loop must have skipped the evaluator itself. Never fall
             # back to a reward worker if an outdated agent omitted the marker.
@@ -970,6 +977,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             keys.append(f"{uid}_{session_id}_{i}")
             field = output.as_dict()
             field.update(kwargs)
+            if reasoning_profile_enabled(self.config):
+                field["general_reasoning_mask"] = torch.tensor(is_reasoning_sample(self.config, kwargs))
             # do not store raw image/video
             field.pop("multi_modal_data", None)
             # TODO: uniform response_mask and loss_mask

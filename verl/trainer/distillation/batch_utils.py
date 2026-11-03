@@ -16,6 +16,7 @@
 import torch
 
 from verl.trainer.distillation.losses import _distillation_response_mask, _teacher_sequence_mask
+from verl.trainer.distillation.reasoning_utils import reasoning_row_mask
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import response_to_nested
 
@@ -36,10 +37,18 @@ def prepare_distillation_minibatch(data, dp_group=None):
         route = _teacher_sequence_mask(data, effective_mask)
         audio_count = int((effective_mask.any(dim=-1) & route).sum().item())
         route_counts = (audio_count, active_count - audio_count)
+        non_swe = route
+        if "general_reasoning_mask" in data:
+            reasoning = reasoning_row_mask(data, effective_mask)
+            if (reasoning & route).any():
+                raise ValueError("A reasoning row cannot use the audio sequence teacher")
+            general_count = int((effective_mask.any(dim=-1) & reasoning).sum().item())
+            route_counts = (audio_count, active_count - audio_count - general_count, general_count)
+            non_swe = route | reasoning
         if "tool_failure_normalizer" in data:
             # A shared SWE launcher can enable local tool costs. Audio has no
             # SWE calls and must not dilute that cost's trajectory denominator.
-            data["tool_failure_normalizer"] = data["tool_failure_normalizer"].masked_fill(route, 0.0)
+            data["tool_failure_normalizer"] = data["tool_failure_normalizer"].masked_fill(non_swe, 0.0)
     if data["response_mask"].is_nested:
         data["loss_mask"] = response_to_nested(effective_mask, data["response_mask"])
     else:
@@ -51,7 +60,7 @@ def prepare_distillation_minibatch(data, dp_group=None):
             active_count = sum(counts)
         else:
             torch.distributed.all_gather_object(counts, route_counts, dp_group)
-            route_counts = tuple(sum(values[i] for values in counts) for i in range(2))
+            route_counts = tuple(sum(values[i] for values in counts) for i in range(len(route_counts)))
             active_count = sum(route_counts)
     # Fully rejected batches are skipped by the existing engine safeguards; the
     # finite denominator also protects zero-loss microbatches on other backends.
@@ -62,3 +71,5 @@ def prepare_distillation_minibatch(data, dp_group=None):
             audio_sequence_global_count=route_counts[0],
             swe_sequence_global_count=route_counts[1],
         )
+        if len(route_counts) == 3:
+            tu.assign_non_tensor(data, general_sequence_global_count=route_counts[2])

@@ -19,6 +19,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.base_config import BaseConfig
+from verl.trainer.distillation.reasoning_utils import reasoning_row_mask
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.metric import AggregationType, Metric
@@ -159,6 +160,9 @@ def _opd_tool_failure_weights(config: ActorConfig, loss_config: DistillationLoss
         # penalize a single-turn audio response or gate its teacher reward.
         route = _teacher_sequence_mask(data, _distillation_response_mask(data))
         weights = weights.masked_fill(route.unsqueeze(-1), 0.0)
+    if "general_reasoning_mask" in data:
+        reasoning = reasoning_row_mask(data, _distillation_response_mask(data))
+        weights = weights.masked_fill(reasoning.unsqueeze(-1), 0.0)
     return weights
 
 
@@ -456,8 +460,10 @@ def _audio_sequence_distillation_loss(
     metrics["distillation/audio/accepted_sequences"] = Metric(
         AggregationType.SUM, int(audio_rows.sum().item()) * dp_size
     )
+    reasoning = reasoning_row_mask(data, response_mask)
+    swe_mask = text_mask & ~reasoning.unsqueeze(-1)
     metrics["distillation/swe/accepted_sequences"] = Metric(
-        AggregationType.SUM, int(text_mask.any(dim=-1).sum().item()) * dp_size
+        AggregationType.SUM, int(swe_mask.any(dim=-1).sum().item()) * dp_size
     )
     metrics["distillation/audio/finite_teacher_sequences"] = Metric(
         AggregationType.SUM, int(torch.isfinite(teacher_sequence).sum().item()) * dp_size
@@ -467,6 +473,27 @@ def _audio_sequence_distillation_loss(
     )
     metrics["distillation/audio/loss"] = Metric(AggregationType.SUM, audio_loss.detach())
     metrics["distillation/swe/loss"] = Metric(AggregationType.SUM, text_loss.detach())
+    if "general_reasoning_mask" in data:
+        general_mask = text_mask & reasoning.unsqueeze(-1)
+        # Retain the original combined token objective. Domain contributions
+        # use the same optimizer-minibatch denominator, solely for reporting.
+        with torch.no_grad():
+            for domain, domain_mask in (("swe", swe_mask), ("general", general_mask)):
+                contribution = text_loss.detach().new_zeros(())
+                if domain_mask.any():
+                    contribution, _ = get_policy_loss_fn(loss_config.policy_loss_mode)(
+                        old_log_prob=old,
+                        log_prob=student,
+                        advantages=text_advantages,
+                        response_mask=domain_mask,
+                        loss_agg_mode=config.loss_agg_mode,
+                        config=loss_config,
+                        rollout_is_weights=importance,
+                    )
+                metrics[f"distillation/{domain}/loss"] = Metric(AggregationType.SUM, contribution.detach())
+        metrics["distillation/general/accepted_sequences"] = Metric(
+            AggregationType.SUM, int(general_mask.any(dim=-1).sum().item()) * dp_size
+        )
     return total_loss, metrics
 
 

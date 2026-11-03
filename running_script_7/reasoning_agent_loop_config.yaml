@@ -1,0 +1,10 @@
+# Preserve the current SWE registry and add only the opt-in reasoning loop.
+- name: swe_tool_agent
+  _target_: recipe.swe_agent.agent_loop.SWEToolAgentLoop
+
+- name: terminal_bench_agent
+  _target_: recipe.swe_agent.terminal_bench_agent_loop.TerminalBenchAgentLoop
+  tool_config_path: recipe/swe_agent/config/terminal_bench_tool_config.yaml
+
+- name: general_reasoning_agent
+  _target_: verl.experimental.agent_loop.general_reasoning_agent_loop.GeneralReasoningAgentLoop

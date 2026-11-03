@@ -778,6 +778,8 @@ class PPOTrainer(ABC):
                 self.on_step_end()
                 metrics.update(self._consume_sync_metrics())
 
+            self._write_reasoning_training_metrics_snapshot(metrics)
+
             # 4. validate
             if self.config.trainer.test_freq > 0 and (
                 is_last_step or self.global_steps % self.config.trainer.test_freq == 0
@@ -1008,6 +1010,42 @@ class PPOTrainer(ABC):
         metrics = getattr(self, "_pending_sync_metrics", None) or {}
         self._pending_sync_metrics = {}
         return metrics
+
+    def _write_reasoning_training_metrics_snapshot(self, metrics: dict) -> None:
+        """Persist new-profile training health before potentially lengthy validation."""
+        if not self.config.trainer.get("general_reasoning", {}).get("enabled", False):
+            return
+        scalars = {}
+        non_finite = []
+        for key, value in metrics.items():
+            if isinstance(value, np.generic):
+                value = value.item()
+            elif isinstance(value, torch.Tensor) and value.ndim == 0:
+                value = value.detach().cpu().item()
+            if not isinstance(value, (int, float, bool)):
+                continue
+            if isinstance(value, float) and not math.isfinite(value):
+                non_finite.append(key)
+                value = "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+            scalars[key] = value
+        path = Path(self.config.trainer.default_local_dir) / "training_metrics" / f"step-{self.global_steps}.json"
+        write_json_atomic(
+            path,
+            {"step": int(self.global_steps), "metrics": scalars, "non_finite_metrics": sorted(non_finite)},
+        )
+        health = {
+            key: value
+            for key, value in scalars.items()
+            if key.startswith(("actor/", "distillation/"))
+            and ("loss" in key or "grad_norm" in key or key.endswith("/lr"))
+        }
+        logger.info(
+            "Pre-validation training metrics: step=%s metrics=%s non_finite_metrics=%s snapshot=%s",
+            self.global_steps,
+            health,
+            sorted(non_finite),
+            path,
+        )
 
     def on_sample_begin(self):
         """Called at the beginning of sampling batch from replay buffer."""
@@ -1399,7 +1437,9 @@ class PPOTrainer(ABC):
 
     def _validate(self) -> dict[str, float]:
         if _audio_validation_only(self.config):
-            return self._run_optional_audio_validation()
+            validation_metrics = self._run_optional_audio_validation()
+            validation_metrics.update(self._run_optional_general_reasoning_validation())
+            return validation_metrics
         strict = strict_validation_enabled()
         validation_started = time.monotonic()
         validation_attempts = []
@@ -1718,7 +1758,28 @@ class PPOTrainer(ABC):
             }
         validation_metrics.update(success_metrics)
         validation_metrics.update(self._run_optional_audio_validation())
+        validation_metrics.update(self._run_optional_general_reasoning_validation())
         return validation_metrics
+
+    def _run_optional_general_reasoning_validation(self) -> dict[str, float]:
+        """Run opt-in reasoning benchmarks even when SWE validation is skipped."""
+        reasoning_config = self.config.trainer.get("general_reasoning", {})
+        if not reasoning_config.get("enabled", False):
+            return {}
+        from verl.trainer.ppo.general_reasoning_benchmark import run_general_reasoning_validation
+
+        resolved = dict(reasoning_config)
+        resolved.setdefault("response_length", int(self.config.data.max_response_length))
+        resolved.setdefault("max_prompt_length", int(self.config.data.max_prompt_length))
+        resolved.setdefault("max_model_len", int(self.config.actor_rollout_ref.rollout.max_model_len))
+        if not resolved.get("output_dir"):
+            resolved["output_dir"] = str(Path(self.config.trainer.validation_data_dir) / "general_reasoning")
+        return run_general_reasoning_validation(
+            resolved,
+            list(self.llm_server_manager.get_addresses()),
+            int(self.global_steps),
+            tokenizer=self.tokenizer,
+        )
 
     def _write_validation_audit(self, attempts, observations, *, status=None, error=None):
         samples = int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
@@ -2715,6 +2776,8 @@ class PPOTrainer(ABC):
         ]
         if local_penalty_enabled:
             fields.append("responses")
+        if self.config.get("trainer", {}).get("general_reasoning", {}).get("enabled", False):
+            fields.append("general_reasoning_mask")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         extra_fields = data.pop("extra_fields").tolist()
@@ -2906,7 +2969,10 @@ class PPOTrainer(ABC):
                     extra.update(train_exclusion_code=code, train_exclusion_reason=",".join(reasons) or "none",
                                  train_sample_mask=bool(active[i]))
             trajectory_ids = [key.rsplit("_", 1)[0] for key in batch.keys]
-            normalizer = trajectory_normalizer(active, trajectory_ids)
+            penalty_active = active
+            if "general_reasoning_mask" in data.batch:
+                penalty_active = active & ~data.batch["general_reasoning_mask"].bool()
+            normalizer = trajectory_normalizer(penalty_active, trajectory_ids)
             for name, enabled in (
                 ("tool_failure", tool_failure_enabled),
                 ("tool_repeat", tool_repeat_enabled),
@@ -2938,7 +3004,7 @@ class PPOTrainer(ABC):
                     additional["edit_cost"] = tool_config.get("tool_repeat_penalty_edit_cost", 0.01)
                     additional["command_cost"] = tool_config.get("tool_repeat_penalty_command_cost", 0.01)
                 weights, counts = build_cost_weights(
-                    data.batch["responses"], data.batch["response_mask"], extra_fields, active,
+                    data.batch["responses"], data.batch["response_mask"], extra_fields, penalty_active,
                     cost=tool_config.get(name + "_penalty_cost", 0.02),
                     cap=cap,
                     warmup_steps=tool_config.get(name + "_penalty_warmup_steps", 10),
@@ -2947,7 +3013,7 @@ class PPOTrainer(ABC):
                     **additional,
                 )
                 data.batch[name + "_weights"] = weights
-                data.batch[name + "_active"] = active
+                data.batch[name + "_active"] = penalty_active
                 data.batch[name + "_normalizer"] = normalizer
                 data.batch["advantages"] = gate_positive_credit(data.batch["advantages"], weights)
                 counts["active"] = round(float(normalizer.sum()))
