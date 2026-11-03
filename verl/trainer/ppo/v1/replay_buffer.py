@@ -62,6 +62,14 @@ def rollout_diagnostics(extra) -> dict:
                   "hidden_pass", "hidden_reward_skipped", "hidden_reward_scored", "hidden_reward_status",
                   "reward_placeholder", "verification_attempted", "verification_passed", "verification_meaningful",
                   "verification_meaningful_reason", "system_prompt_sha256"})
+    if values.get("audio_opd_candidate_excluded", False) in (1, True):
+        # Persist only the new profile's explicit exclusion evidence. Do not
+        # include arbitrary audio fields such as waveform bytes or media paths.
+        exact.update({
+            "audio_opd_candidate_excluded", "audio_opd_exclusion_reason", "audio_response_tokens",
+            "audio_response_cap", "audio_last_token_id", "audio_native_finish_reason", "audio_native_stop_reason",
+            "audio_response_has_eos", "audio_student_truncated",
+        })
     prefixes = ("edit_diagnostics_", "command_evidence_", "trajectory_", "partial_hidden_reward_", "repeat_reward_", "tool_repeat_", "thinking_repeat_", "observed_infrastructure_failure",
                 "private_evaluator_", "hidden_test_count", "hidden_test_commands_", "hidden_tests_total_", "hidden_tests_passed_",
                 "oom_", "public_verification_", "public_patch_", "public_hidden_workspace_", "final_patch_")

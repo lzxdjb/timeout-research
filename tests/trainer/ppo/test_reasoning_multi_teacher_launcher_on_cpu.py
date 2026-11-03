@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from hydra.core.override_parser.overrides_parser import OverridesParser
+from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -30,7 +31,9 @@ def launch_env(tmp_path):
         "'SWE_AGENT_ROLLOUT_TRAINING_COMPLETION_RATIO_THRESHOLD', "
         "'SWE_AGENT_ROLLOUT_VALIDATION_COMPLETION_RATIO_THRESHOLD', "
         "'SWE_AGENT_ROLLOUT_TRAINING_RESPONSE_LENGTH', 'SWE_AGENT_ROLLOUT_VALIDATION_RESPONSE_LENGTH', "
-        "'MAX_RESPONSE_LENGTH', 'MAX_PROMPT_LENGTH']\n"
+        "'MAX_RESPONSE_LENGTH', 'MAX_PROMPT_LENGTH', 'SWE_AGENT_TRAINING_SKIP_HIDDEN_REWARD', "
+        "'SWE_AGENT_OPD_CANCEL_ON_CUTOFF', 'SWE_AGENT_OPD_CUTOFF_WAIT_FOR_SCORING', "
+        "'SWE_AGENT_OPD_PHASE_TIMING']\n"
         "print(json.dumps({'argv':sys.argv[1:], 'env':{name:os.environ.get(name) for name in names}}))\n"
         "PY\n"
     )
@@ -298,6 +301,9 @@ def test_validation_only_profile_skips_swe_and_sets_both_benchmark_decoders(laun
     assert values["trainer.val_before_train"] is True
     assert values["distillation.enabled"] is False
     assert values["distillation.skip_hidden_reward"] is False
+    assert values["distillation.cancel_pending_on_cutoff"] is False
+    assert values["distillation.wait_for_scoring_on_cutoff"] is False
+    assert values["distillation.phase_timing"] is False
     assert values["trainer.save_freq"] == 0
     assert values["trainer.audio_benchmark.max_samples"] is None
     assert values["trainer.general_reasoning"]["max_samples"] == -1
@@ -306,3 +312,40 @@ def test_validation_only_profile_skips_swe_and_sets_both_benchmark_decoders(laun
         assert values[f"{decoder}.temperature"] == 0.6
         assert values[f"{decoder}.top_k"] == 20
         assert values[f"{decoder}.top_p"] == 0.95
+
+
+def test_validation_only_profile_passes_runtime_preflight_without_starting_ray(launch_env, monkeypatch):
+    # Other CPU suites may select the CUDA platform; this test needs no GPU.
+    monkeypatch.setattr("verl.utils.device.get_device_capability", lambda *args: (None, None))
+    from verl.trainer import main_ppo
+    from verl.trainer.distillation.config_utils import opd_wait_for_scoring_on_cutoff
+
+    exported, values = launch(launch_env, suffix="reasoning_validation_only")
+    # Supply Hydra defaults and environment-backed switches normally supplied
+    # by the downstream SWE wrapper, then apply the actual profile overrides.
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {"actor": {"policy_loss": {}}, "rollout": {"full_determinism": False}},
+            "reward": {"reward_model": {"enable": False, "rollout": {}}},
+        }
+    )
+    for flag, variable in (
+        ("skip_hidden_reward", "SWE_AGENT_TRAINING_SKIP_HIDDEN_REWARD"),
+        ("cancel_pending_on_cutoff", "SWE_AGENT_OPD_CANCEL_ON_CUTOFF"),
+        ("wait_for_scoring_on_cutoff", "SWE_AGENT_OPD_CUTOFF_WAIT_FOR_SCORING"),
+        ("phase_timing", "SWE_AGENT_OPD_PHASE_TIMING"),
+    ):
+        OmegaConf.update(config, f"distillation.{flag}", exported[variable] == "1", force_add=True)
+    for key, value in values.items():
+        OmegaConf.update(config, key, value, force_add=True)
+
+    class ReachedRayBoundary(Exception):
+        pass
+
+    def stop_before_ray():
+        raise ReachedRayBoundary
+
+    monkeypatch.setattr(main_ppo.ray, "is_initialized", stop_before_ray)
+    assert opd_wait_for_scoring_on_cutoff(config) is False
+    with pytest.raises(ReachedRayBoundary):
+        main_ppo.run_ppo(config, task_runner_class=None)

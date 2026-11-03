@@ -916,17 +916,39 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         if audio_sequence_training:
             if len(outputs) != 1:
                 raise RuntimeError("Audio sequence OPD requires a single-turn trajectory.")
-            await self._compute_teacher_logprobs(
+            from verl.trainer.distillation.reasoning_audio import exclude_incomplete_audio_candidate
+
+            excluded = exclude_incomplete_audio_candidate(
+                self.config,
                 outputs[0],
-                prompt_ids=outputs[0].prompt_ids,
-                response_ids=outputs[0].response_ids,
-                validate=False,
-                sample_kwargs=kwargs,
+                kwargs,
+                tokenizer=getattr(self, "tokenizer", None),
+                model_config=getattr(self, "model_config", None),
             )
-            if outputs[0].extra_fields.get("teacher_sequence_mask") is not True:
-                raise RuntimeError("Audio neutral task reward requires a verified audio teacher sequence score.")
-            outputs[0].reward_score = 0.0
-            outputs[0].extra_fields["audio_opd_task_reward_skipped"] = True
+            if excluded:
+                logger.warning(
+                    "Excluded incomplete reasoning-profile audio candidate: uid=%s session=%s "
+                    "reason=%s response_tokens=%s response_cap=%s last_token=%s finish_reason=%s",
+                    uid,
+                    session_id,
+                    outputs[0].extra_fields["audio_opd_exclusion_reason"],
+                    len(outputs[0].response_ids),
+                    outputs[0].extra_fields["audio_response_cap"],
+                    outputs[0].response_ids[-1],
+                    outputs[0].extra_fields["audio_native_finish_reason"],
+                )
+            else:
+                await self._compute_teacher_logprobs(
+                    outputs[0],
+                    prompt_ids=outputs[0].prompt_ids,
+                    response_ids=outputs[0].response_ids,
+                    validate=False,
+                    sample_kwargs=kwargs,
+                )
+                if outputs[0].extra_fields.get("teacher_sequence_mask") is not True:
+                    raise RuntimeError("Audio neutral task reward requires a verified audio teacher sequence score.")
+                outputs[0].reward_score = 0.0
+                outputs[0].extra_fields["audio_opd_task_reward_skipped"] = True
         elif skip_reasoning_task_reward(self.config, outputs, kwargs, validate=validate):
             pass
         elif should_skip_hidden_reward(self.config, validate=validate):
@@ -1030,6 +1052,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "unverified_trajectory": evaluator_group_excluded,
                 }
             )
+            if audio_sequence_training and extra_fields.get("audio_opd_candidate_excluded", False):
+                # Only the opt-in reasoning profile publishes this marker.
+                # It must reach the trainer's existing row mask before any
+                # objective can interpret the neutral transport placeholders.
+                tags[-1]["train_sample_mask"] = False
+                tags[-1]["audio_opd_candidate_excluded"] = True
+                tags[-1]["audio_opd_exclusion_reason"] = extra_fields["audio_opd_exclusion_reason"]
             if validate and strict_validation_enabled():
                 # Publish the same strict evidence the final metric uses, before
                 # the sampler counts a task toward the completion threshold.

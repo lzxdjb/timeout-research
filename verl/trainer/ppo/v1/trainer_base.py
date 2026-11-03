@@ -881,6 +881,13 @@ class PPOTrainer(ABC):
                 logger.info("Repeat trainer sample_end partition=train global_step=%s selected=%d seconds=%.3f",
                             self.global_steps, len(batch.keys), time.monotonic() - sample_started)
             metrics.update(off_policy_metrics)
+            if self.config.trainer.get("general_reasoning", {}).get("enabled", False):
+                metrics["training/audio_opd/excluded_incomplete_sequences"] = float(
+                    sum(
+                        bool(tag.get("audio_opd_candidate_excluded", False))
+                        for tag in batch.tags if not tag.get("is_padding", False)
+                    )
+                )
             if opd_phase_timing_enabled(self.config):
                 metrics.update(self.agent_loop_manager.pop_opd_phase_metrics())
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature

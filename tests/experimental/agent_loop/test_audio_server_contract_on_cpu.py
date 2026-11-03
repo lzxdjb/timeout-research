@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LLM_SERVER_SOURCE = REPO_ROOT / "verl/workers/rollout/llm_server.py"
@@ -65,3 +68,44 @@ def test_vllm_generate_includes_audio_and_mm_processor_kwargs() -> None:
     source = VLLM_SERVER_SOURCE.read_text(encoding="utf-8")
     assert 'multi_modal_data["audio"] = audio_data' in source
     assert 'prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs' in source
+
+
+@pytest.mark.parametrize(
+    "finish_reason,native_stop_reason,expected_stop_reason",
+    [("length", None, "completed"), ("stop", 4, "completed"), ("abort", None, "aborted")],
+)
+def test_vllm_keeps_native_termination_without_changing_stop_reason(
+    finish_reason, native_stop_reason, expected_stop_reason
+) -> None:
+    # Execute the production termination block without importing GPU backends.
+    module = _load_module_ast(VLLM_SERVER_SOURCE)
+    generate_fn = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "generate"
+    )
+    start = next(
+        index
+        for index, node in enumerate(generate_fn.body)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "finish_reason" for target in node.targets)
+    )
+    end = next(
+        index
+        for index, node in enumerate(generate_fn.body[start:], start)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "num_preempted" for target in node.targets)
+    )
+    termination = ast.Module(body=generate_fn.body[start:end], type_ignores=[])
+    native_output = SimpleNamespace(finish_reason=finish_reason)
+    if native_stop_reason is not None:
+        native_output.stop_reason = native_stop_reason
+    namespace = {"final_res": SimpleNamespace(outputs=[native_output]), "extra_fields": {}}
+    exec(compile(termination, str(VLLM_SERVER_SOURCE), "exec"), namespace)
+
+    assert namespace["stop_reason"] == expected_stop_reason
+    assert namespace["extra_fields"]["generation_finish_reason"] == finish_reason
+    if native_stop_reason is None:
+        assert "generation_stop_reason" not in namespace["extra_fields"]
+    else:
+        assert namespace["extra_fields"]["generation_stop_reason"] == native_stop_reason

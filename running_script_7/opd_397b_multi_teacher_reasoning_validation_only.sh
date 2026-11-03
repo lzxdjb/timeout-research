@@ -7,6 +7,9 @@ export EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35_audio_reasoning_eval_$(date -u
 export TRAIN_FILES='[]' VAL_FILES='[]'
 export TRAIN_BATCH_SIZE=64 PPO_MINI_BATCH_SIZE=64 ROLLOUT_N=1 TOTAL_TRAINING_STEPS=1
 export SAVE_FREQ=0 TEST_FREQ=0 VAL_BEFORE_TRAIN=True
+# Align the inherited startup settings and banner with teacher-free evaluation.
+export SWE_AGENT_TRAINING_SKIP_HIDDEN_REWARD=0 SWE_AGENT_OPD_CANCEL_ON_CUTOFF=0
+export SWE_AGENT_OPD_CUTOFF_WAIT_FOR_SCORING=0 SWE_AGENT_OPD_PHASE_TIMING=0
 export MAX_PROMPT_LENGTH=8192 MAX_RESPONSE_LENGTH=252000
 export max_prompt_length="$MAX_PROMPT_LENGTH" max_response_length="$MAX_RESPONSE_LENGTH"
 export AUDIO_MAX_RESPONSE_LENGTH=4096
@@ -23,6 +26,9 @@ exec bash "$script_dir/opd_397b_multi_teacher_reasoning_projector.sh" \
   trainer.resume_mode=disable \
   distillation.enabled=False \
   distillation.skip_hidden_reward=False \
+  distillation.cancel_pending_on_cutoff=False \
+  distillation.wait_for_scoring_on_cutoff=False \
+  distillation.phase_timing=False \
   actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
   actor_rollout_ref.rollout.val_kwargs.top_k=20 \
   actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \

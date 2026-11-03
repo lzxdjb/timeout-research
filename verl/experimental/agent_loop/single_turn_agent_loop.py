@@ -92,6 +92,17 @@ class SingleTurnAgentLoop(AgentLoopBase):
             output.extra_fields["audio_student_truncated"] = (
                 len(output.token_ids) > response_length or output.stop_reason == "aborted"
             )
+            from verl.trainer.distillation.reasoning_utils import reasoning_profile_enabled
+
+            if reasoning_profile_enabled(getattr(self, "config", {})):
+                output.extra_fields["audio_student_truncated"] |= output.extra_fields.get(
+                    "generation_finish_reason"
+                ) in {"length", "abort"}
+                output.extra_fields.update(
+                    audio_student_response_length=response_length,
+                    audio_student_response_tokens=len(output.token_ids),
+                    audio_student_stop_reason=output.stop_reason,
+                )
 
         if use_continuous_token:
             merge_result, response_mask, response_logprobs = await self.ct_merge_assistant_token(

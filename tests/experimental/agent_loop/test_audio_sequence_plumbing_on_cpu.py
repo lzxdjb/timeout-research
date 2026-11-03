@@ -73,6 +73,58 @@ def test_single_turn_audio_budget_and_thinking_override_are_local(route):
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("reasoning_enabled", [True, False])
+@pytest.mark.parametrize(
+    "finish_reason,stop_reason,token_ids,legacy_truncated",
+    [
+        ("length", "completed", [3] * 8, False),
+        ("stop", "completed", [3] * 7 + [4], False),
+        ("abort", "completed", [3] * 4, False),
+        (None, "aborted", [3] * 4, True),
+        ("stop", "completed", [3] * 9, True),
+    ],
+)
+def test_reasoning_audio_preserves_native_termination_diagnostics(
+    reasoning_enabled, finish_reason, stop_reason, token_ids, legacy_truncated
+):
+    loop = object.__new__(SingleTurnAgentLoop)
+    loop.config = _config()
+    loop.config.trainer = {"general_reasoning": {"enabled": reasoning_enabled}}
+    loop.rollout_config = SimpleNamespace(full_determinism=False)
+    loop.response_length = 20
+    loop.apply_chat_template_kwargs = {"enable_thinking": True}
+    loop.process_multi_modal_info = AsyncMock(return_value={"audios": ["actual.wav"]})
+    loop._get_mm_processor_kwargs = lambda audios: {}
+    loop.enable_continuous_token = False
+    loop.apply_chat_template = AsyncMock(return_value=[1, 2])
+    loop.server_manager = SimpleNamespace(
+        generate=AsyncMock(
+            return_value=TokenOutput(
+                token_ids=token_ids,
+                stop_reason=stop_reason,
+                extra_fields={"generation_finish_reason": finish_reason},
+            )
+        )
+    )
+
+    output = asyncio.run(
+        loop.run({"max_tokens": 20}, teacher_route="audio", raw_prompt=[{"role": "user", "content": "Listen"}])
+    )
+
+    expected_truncated = legacy_truncated or (reasoning_enabled and finish_reason in {"length", "abort"})
+    assert output.extra_fields["audio_student_truncated"] is expected_truncated
+    assert output.response_ids == token_ids[:8]
+    assert output.response_mask == [1] * min(len(token_ids), 8)
+    assert output.extra_fields["generation_finish_reason"] == finish_reason
+    diagnostic_keys = {"audio_student_response_length", "audio_student_response_tokens", "audio_student_stop_reason"}
+    if reasoning_enabled:
+        assert output.extra_fields["audio_student_response_length"] == 8
+        assert output.extra_fields["audio_student_response_tokens"] == len(token_ids)
+        assert output.extra_fields["audio_student_stop_reason"] == stop_reason
+    else:
+        assert diagnostic_keys.isdisjoint(output.extra_fields)
+
+
 @pytest.mark.parametrize("verified", [True, False])
 def test_v1_audio_reward_bypass_requires_verified_sequence_score(monkeypatch, verified):
     worker_class = agent_loop_tq.AgentLoopWorkerTQ.__ray_metadata__.modified_class

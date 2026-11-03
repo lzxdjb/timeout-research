@@ -1170,6 +1170,11 @@ class AgentLoopWorker:
                     ):
                         raise TeacherScoringError(
                             "Audio sequence scoring requires a complete, assistant-only response with EOS."
+                            f" response_tokens={len(response_ids)} last_token="
+                            f"{response_ids[-1] if response_ids else None} eos_ids={sorted(eos_ids)}"
+                            f" truncated={truncated} mask_tokens={len(output.response_mask)}"
+                            f" assistant_only={all(output.response_mask)}"
+                            f" finish_reason={output.extra_fields.get('generation_finish_reason')}"
                         )
                     text = self.tokenizer.decode(
                         response_ids[:-1], skip_special_tokens=False, clean_up_tokenization_spaces=False

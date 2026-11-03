@@ -60,6 +60,8 @@ def hidden_reward_was_skipped(extra: Any) -> bool:
         return False
     reward_info = extra.get("reward_extra_info", {})
     reward_info = reward_info if isinstance(reward_info, dict) else {}
+    if extra.get("audio_opd_candidate_excluded", reward_info.get("audio_opd_candidate_excluded", False)) in (1, True):
+        return True
     if extra.get("general_opd_task_reward_skipped", reward_info.get("general_opd_task_reward_skipped", False)):
         return True
     return extra.get("hidden_reward_skipped", reward_info.get("hidden_reward_skipped", 0)) in (1, True)
