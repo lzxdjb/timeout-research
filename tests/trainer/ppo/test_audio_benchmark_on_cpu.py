@@ -31,13 +31,17 @@ def _write_summary(
     run_id: str,
     status: str = "completed",
     benchmark_status: str = "completed",
+    benchmark_id: str = "aishell2",
+    metrics: list[dict] | None = None,
 ) -> None:
-    child_summary = path.parent / "aishell2" / "summary.json"
+    child_summary = path.parent / benchmark_id / "summary.json"
     child_summary.parent.mkdir(parents=True, exist_ok=True)
     child_summary.write_text(
         json.dumps(
             {
-                "metrics": [
+                "metrics": metrics
+                if metrics is not None
+                else [
                     {
                         "metric_id": "aishell2_cer",
                         "raw_values": {"cer": 12.5},
@@ -54,7 +58,7 @@ def _write_summary(
                 "status": status,
                 "benchmarks": [
                     {
-                        "benchmark_id": "aishell2",
+                        "benchmark_id": benchmark_id,
                         "status": benchmark_status,
                         "summary": {"summary_path": str(child_summary)},
                     }
@@ -255,6 +259,119 @@ def test_read_metrics_preserves_genuine_suite_failure(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="completed_with_failures.*failed benchmarks: aishell2"):
         audio_benchmark._read_metrics(summary, expected_run_id="failed-run")
+
+
+@pytest.mark.parametrize(
+    ("benchmark_id", "metric_id", "name", "tasks", "scores"),
+    [
+        (
+            "librispeech",
+            "librispeech_wer",
+            "wer",
+            ("librispeech_test_clean_full_eval", "librispeech_test_other_full_eval"),
+            (8.518518518518519, 0.0),
+        ),
+        (
+            "wenetspeech",
+            "wenetspeech_cer",
+            "cer",
+            ("wenetspeech_test_net_full_eval", "wenetspeech_test_meeting_full_eval"),
+            (0.0, 33.65079365079365),
+        ),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_read_metrics_keeps_both_asr_splits_without_an_ambiguous_alias(
+    tmp_path: Path, caplog, benchmark_id, metric_id, name, tasks, scores, reverse
+) -> None:
+    rows = [
+        {
+            "metric_id": metric_id,
+            "task_id": task,
+            "count": count,
+            "raw_values": {name: score},
+            "values": {name: f"{score:.5f}"},
+        }
+        for task, score, count in zip(tasks, scores, (3, 2), strict=True)
+    ]
+    if reverse:
+        rows.reverse()
+    summary = tmp_path / "suite_summary.json"
+    _write_summary(summary, run_id="split-run", benchmark_id=benchmark_id, metrics=rows)
+
+    result = audio_benchmark._read_metrics(summary, expected_run_id="split-run")
+
+    assert result == {
+        **{
+            f"val-audio/{benchmark_id}/{task}/{metric_id}/{name}": score
+            for task, score in zip(tasks, scores, strict=True)
+        },
+        "val-audio/completed": 1.0,
+    }
+    legacy_key = f"val-audio/{benchmark_id}/{metric_id}/{name}"
+    assert f"Omitting ambiguous GAGE audio metric key {legacy_key}" in caplog.text
+
+
+def test_read_metrics_keeps_single_task_alias_and_existing_value_parsing(tmp_path: Path) -> None:
+    summary = tmp_path / "suite_summary.json"
+    _write_summary(
+        summary,
+        run_id="single-run",
+        metrics=[
+            {
+                "metric_id": "aishell2_cer",
+                "task_id": "aishell2_test",
+                "values": {"cer": "12.50000", "enabled": True, "description": "not a score"},
+            }
+        ],
+    )
+
+    assert audio_benchmark._read_metrics(summary) == {
+        "val-audio/aishell2/aishell2_test/aishell2_cer/cer": 12.5,
+        "val-audio/aishell2/aishell2_cer/cer": 12.5,
+        "val-audio/completed": 1.0,
+    }
+
+
+def test_read_metrics_keeps_distinct_metric_aliases_across_tasks(tmp_path: Path) -> None:
+    summary = tmp_path / "suite_summary.json"
+    _write_summary(
+        summary,
+        run_id="clotho-run",
+        benchmark_id="clothoaqa",
+        metrics=[
+            {
+                "metric_id": f"clothoaqa_{split}_filtered_accuracy",
+                "task_id": f"clothoaqa_{split}_filtered_full_eval",
+                "raw_values": {"accuracy": score},
+            }
+            for split, score in (("val", 0.5), ("test", 1.0))
+        ],
+    )
+
+    assert audio_benchmark._read_metrics(summary) == {
+        "val-audio/clothoaqa/clothoaqa_val_filtered_full_eval/clothoaqa_val_filtered_accuracy/accuracy": 0.5,
+        "val-audio/clothoaqa/clothoaqa_test_filtered_full_eval/clothoaqa_test_filtered_accuracy/accuracy": 1.0,
+        "val-audio/clothoaqa/clothoaqa_val_filtered_accuracy/accuracy": 0.5,
+        "val-audio/clothoaqa/clothoaqa_test_filtered_accuracy/accuracy": 1.0,
+        "val-audio/completed": 1.0,
+    }
+
+
+@pytest.mark.parametrize("task_id", [None, "duplicate_task"])
+def test_read_metrics_warns_and_omits_duplicate_keys_instead_of_overwriting(tmp_path: Path, caplog, task_id) -> None:
+    summary = tmp_path / "suite_summary.json"
+    _write_summary(
+        summary,
+        run_id="duplicate-run",
+        metrics=[
+            {"metric_id": "aishell2_cer", "task_id": task_id, "raw_values": {"cer": value}}
+            for value in (12.5, 20.0)
+        ],
+    )
+
+    assert audio_benchmark._read_metrics(summary) == {"val-audio/completed": 1.0}
+    assert "Omitting ambiguous GAGE audio metric key val-audio/aishell2/aishell2_cer/cer" in caplog.text
 
 
 def test_success_without_expected_summary_reports_recent_runs(

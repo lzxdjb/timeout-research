@@ -220,6 +220,7 @@ def _discover_model(api_base: str, api_key: str) -> str:
 
 
 def _read_metrics(summary_path: Path, *, expected_run_id: str | None = None) -> dict[str, float]:
+    """Keep each GAGE task's scores and only retain unambiguous legacy keys."""
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
     actual_run_id = str(payload.get("run_id") or "")
     if expected_run_id is not None and actual_run_id != expected_run_id:
@@ -247,7 +248,7 @@ def _read_metrics(summary_path: Path, *, expected_run_id: str | None = None) -> 
             f"GAGE audio suite {actual_run_id or '<missing>'!r} status is {status!r}; "
             f"failed benchmarks: {detail}; summary: {summary_path}"
         )
-    metrics: dict[str, float] = {}
+    metric_values: dict[str, list[float]] = {}
     for benchmark in payload.get("benchmarks", []):
         if not isinstance(benchmark, dict):
             continue
@@ -260,6 +261,7 @@ def _read_metrics(summary_path: Path, *, expected_run_id: str | None = None) -> 
             if not isinstance(item, dict):
                 continue
             metric_id = str(item.get("metric_id") or "metric")
+            task_id = str(item.get("task_id") or "").strip()
             values = item.get("raw_values") or item.get("values") or {}
             if isinstance(values, dict):
                 for name, value in values.items():
@@ -269,7 +271,19 @@ def _read_metrics(summary_path: Path, *, expected_run_id: str | None = None) -> 
                         except ValueError:
                             continue
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
-                        metrics[f"val-audio/{benchmark_id}/{metric_id}/{name}"] = float(value)
+                        legacy_key = f"val-audio/{benchmark_id}/{metric_id}/{name}"
+                        metric_values.setdefault(legacy_key, []).append(float(value))
+                        if task_id:
+                            task_key = f"val-audio/{benchmark_id}/{task_id}/{metric_id}/{name}"
+                            metric_values.setdefault(task_key, []).append(float(value))
+    metrics: dict[str, float] = {}
+    for key, values in metric_values.items():
+        if len(values) == 1:
+            metrics[key] = values[0]
+        else:
+            # Split WER/CER cannot be combined by averaging percentages. Omit
+            # ambiguous keys instead of silently selecting the last split.
+            logger.warning("Omitting ambiguous GAGE audio metric key %s (%s rows); see task scores", key, len(values))
     metrics["val-audio/completed"] = 1.0
     return metrics
 
