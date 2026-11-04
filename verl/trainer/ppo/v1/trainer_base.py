@@ -1546,35 +1546,8 @@ class PPOTrainer(ABC):
                     # restore the synchronized rollout weights for the next batch.
                     self.checkpoint_manager.wake_up_replicas()
 
-            if self.timeout_prediction_enabled:
-                # Validation normally skips policy inference.  Compute the same
-                # features as training only when the opt-in predictor is enabled.
-                batch = self._compute_old_log_prob(batch, metrics={})
-                prediction_data = tq.kv_batch_get(
-                    keys=batch.keys,
-                    partition_id=batch.partition_id,
-                    select_fields=["response_mask", "rm_scores", "old_log_probs", "extra_fields"],
-                )
-                prediction_extra_fields = prediction_data.pop("extra_fields").tolist()
-                prediction_data = DataProto(batch=prediction_data.to_padded_tensor())
-                predicted_scores, _train_mask, _calibration_mask = self._apply_v1_timeout_prediction(
-                    prediction_data,
-                    batch.tags,
-                    prediction_extra_fields,
-                )
-                tq.kv_batch_put(
-                    keys=batch.keys,
-                    partition_id=batch.partition_id,
-                    fields=TensorDict(
-                        {
-                            "rm_scores": response_to_nested(
-                                predicted_scores, prediction_data.batch["response_mask"]
-                            )
-                        },
-                        batch_size=len(batch),
-                    ),
-                )
-
+            # Timeout reward prediction is training-only. Preserve the evaluator's
+            # observed validation scores, including when the training head is enabled.
             # 4. collect necessary data for logging
             # For multi-output agent loops, only use the final output per session for metrics.
             # Keys have format {uid}_{session_id}_{index}; keep only the highest index per session.

@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from verl.trainer.ppo.timeout_prediction import (
@@ -22,7 +23,7 @@ def test_conformal_radius_uses_true_class_for_negative_and_zero_rewards():
     )
     rewards = torch.tensor([-0.1, 0.0, 1.0])
     # Residuals are 0.2, 0.3, and 0.3; with delta=0.25 the calibrated rank is 3.
-    assert conformal_radius(probabilities, rewards, delta=0.25) == 0.3
+    assert conformal_radius(probabilities, rewards, delta=0.25) == pytest.approx(0.3)
 
 
 def test_build_timeout_rewards_keeps_only_confident_timeout_rows():
@@ -40,7 +41,7 @@ def test_build_timeout_rewards_keeps_only_confident_timeout_rows():
         keep_mask,
         assignment="terminal",
     )
-    assert scores[1].tolist() == [0.0, 0.0, 0.0, -0.1]
+    assert scores[1].tolist() == pytest.approx([0.0, 0.0, 0.0, -0.1])
     assert train_mask.tolist() == [[True, True, True, False], [True, True, True, True]]
 
 

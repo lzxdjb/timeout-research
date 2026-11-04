@@ -33,6 +33,7 @@ def _write_summary(
     benchmark_status: str = "completed",
     benchmark_id: str = "aishell2",
     metrics: list[dict] | None = None,
+    tasks: list[dict] | None = None,
 ) -> None:
     child_summary = path.parent / benchmark_id / "summary.json"
     child_summary.parent.mkdir(parents=True, exist_ok=True)
@@ -60,7 +61,7 @@ def _write_summary(
                     {
                         "benchmark_id": benchmark_id,
                         "status": benchmark_status,
-                        "summary": {"summary_path": str(child_summary)},
+                        "summary": {"summary_path": str(child_summary), "tasks": tasks or []},
                     }
                 ],
             }
@@ -354,6 +355,89 @@ def test_read_metrics_keeps_distinct_metric_aliases_across_tasks(tmp_path: Path)
         "val-audio/clothoaqa/clothoaqa_test_filtered_full_eval/clothoaqa_test_filtered_accuracy/accuracy": 1.0,
         "val-audio/clothoaqa/clothoaqa_val_filtered_accuracy/accuracy": 0.5,
         "val-audio/clothoaqa/clothoaqa_test_filtered_accuracy/accuracy": 1.0,
+        "val-audio/completed": 1.0,
+    }
+
+
+def test_read_metrics_preserves_corpus_and_mean_scores_including_large_errors(tmp_path: Path) -> None:
+    summary = tmp_path / "suite_summary.json"
+    rows = [
+        {
+            "metric_id": metric_id,
+            "task_id": f"wenetspeech_test_{split}_full_eval",
+            "raw_values": {"cer": score},
+            "count": 2,
+            "metadata": {"samples": 2},
+        }
+        for split, scores in (("net", (15.0, 125.0)), ("meeting", (20.0, 200.0)))
+        for metric_id, score in zip(
+            ("wenetspeech_corpus_cer", "wenetspeech_utterance_mean_cer"), scores, strict=True
+        )
+    ]
+    tasks = [
+        {"task_id": f"wenetspeech_test_{split}_full_eval", "sample_count": 2}
+        for split in ("net", "meeting")
+    ]
+    _write_summary(summary, run_id="corpus-run", benchmark_id="wenetspeech", metrics=rows, tasks=tasks)
+
+    metrics = audio_benchmark._read_metrics(summary)
+
+    assert metrics == {
+        **{
+            f"val-audio/wenetspeech/{row['task_id']}/{row['metric_id']}/cer": row["raw_values"]["cer"]
+            for row in rows
+        },
+        "val-audio/completed": 1.0,
+    }
+
+
+@pytest.mark.parametrize("metric_id", ["wenetspeech_corpus_cer", "librispeech_corpus_wer", "aishell1_cer"])
+@pytest.mark.parametrize(
+    "problem", ["metric_count", "metadata_count", "missing_split", "duplicate", "task_failed", "preprocess_failed"]
+)
+def test_read_metrics_rejects_incomplete_corpus_scores(tmp_path: Path, problem: str, metric_id: str) -> None:
+    summary = tmp_path / "suite_summary.json"
+    tasks = [{"task_id": split, "sample_count": 2} for split in ("net", "meeting")]
+    rows = [
+        {
+            "metric_id": metric_id,
+            "task_id": task["task_id"],
+            "count": 2,
+            "metadata": {"samples": 2},
+            "raw_values": {"cer": 20.0},
+        }
+        for task in tasks
+    ]
+    if problem == "metric_count":
+        rows[0]["count"] = 1
+    elif problem == "metadata_count":
+        rows[0]["metadata"]["samples"] = 1
+    elif problem == "missing_split":
+        rows.pop()
+    elif problem == "duplicate":
+        rows.append(rows[0])
+    elif problem == "task_failed":
+        tasks[0]["execution"] = {"status": "failed"}
+    else:
+        tasks[0]["dataset_metadata"] = {"preprocess_failure_count": 1}
+    _write_summary(summary, run_id="partial-corpus", benchmark_id=metric_id.split("_")[0], metrics=rows, tasks=tasks)
+
+    with pytest.raises(RuntimeError, match="GAGE corpus score"):
+        audio_benchmark._read_metrics(summary)
+
+
+def test_read_metrics_keeps_complete_aishell_corpus_score(tmp_path: Path) -> None:
+    summary = tmp_path / "suite_summary.json"
+    rows = [{
+        "metric_id": "aishell1_cer", "task_id": "aishell1_test_full_eval",
+        "count": 2, "metadata": {"samples": 2}, "raw_values": {"cer": 5.0},
+    }]
+    tasks = [{"task_id": "aishell1_test_full_eval", "sample_count": 2}]
+    _write_summary(summary, run_id="aishell-corpus", benchmark_id="aishell1", metrics=rows, tasks=tasks)
+
+    assert audio_benchmark._read_metrics(summary) == {
+        "val-audio/aishell1/aishell1_test_full_eval/aishell1_cer/cer": 5.0,
+        "val-audio/aishell1/aishell1_cer/cer": 5.0,
         "val-audio/completed": 1.0,
     }
 

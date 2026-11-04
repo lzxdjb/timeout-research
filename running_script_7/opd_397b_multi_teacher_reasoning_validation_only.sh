@@ -35,8 +35,8 @@ exec bash "$script_dir/opd_397b_multi_teacher_reasoning_projector.sh" \
   trainer.general_reasoning.temperature=0.6 \
   trainer.general_reasoning.top_k=20 \
   trainer.general_reasoning.top_p=0.95 \
-  +trainer.audio_benchmark.temperature=0.6 \
-  +trainer.audio_benchmark.top_k=20 \
-  +trainer.audio_benchmark.top_p=0.95 \
+  +trainer.audio_benchmark.temperature=0.0 \
+  +trainer.audio_benchmark.top_k=1 \
+  +trainer.audio_benchmark.top_p=1.0 \
   +trainer.audio_benchmark.max_tokens=4096 \
   "$@"

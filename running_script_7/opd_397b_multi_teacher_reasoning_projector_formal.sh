@@ -23,6 +23,9 @@ export AUDIO_BENCHMARK_LOAD_BALANCE=True AUDIO_BENCHMARK_FAILURE_POLICY=error
 unset TRAIN_FILES VAL_FILES GAGE_EVAL_MAX_SAMPLES GENERAL_REASONING_VAL_FILES OPD_MIX_SCHEDULE
 
 exec bash "$script_dir/opd_397b_multi_teacher_reasoning_projector.sh" \
+  +trainer.audio_benchmark.temperature=0.0 \
+  +trainer.audio_benchmark.top_k=1 \
+  +trainer.audio_benchmark.top_p=1.0 \
   +trainer.audio_benchmark.max_tokens=4096 \
   data.filter_overlong_prompts_workers=16 \
   "$@"

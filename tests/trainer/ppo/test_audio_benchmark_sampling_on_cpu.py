@@ -16,6 +16,7 @@ from verl.trainer.ppo import audio_benchmark
 from verl.trainer.ppo.audio_benchmark_router import AudioBenchmarkRouter
 
 SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_tokens": 4096}
+GREEDY = {"temperature": 0.0, "top_p": 1.0, "top_k": 1, "max_tokens": 4096}
 
 
 @pytest.fixture
@@ -67,7 +68,8 @@ def _post(api_base, path, body):
 
 
 @pytest.mark.parametrize("path", ["/chat/completions", "/completions"])
-def test_explicit_sampling_reaches_upstream_and_preserves_input(endpoint, path):
+@pytest.mark.parametrize("sampling", [SAMPLING, GREEDY])
+def test_explicit_sampling_reaches_upstream_and_preserves_input(endpoint, path, sampling):
     api_base, received = endpoint
     original = {
         "model": "student",
@@ -79,14 +81,14 @@ def test_explicit_sampling_reaches_upstream_and_preserves_input(endpoint, path):
         "chat_template_kwargs": {"enable_thinking": False},
         "stream": True,
     }
-    with AudioBenchmarkRouter([api_base], generation_overrides=SAMPLING) as router:
+    with AudioBenchmarkRouter([api_base], generation_overrides=sampling) as router:
         assert _post(router.api_base, path, json.dumps(original).encode())[0] == 200
     forwarded_path, body, headers = received.get(timeout=5)
     assert forwarded_path == f"/v1{path}"
     assert headers["Authorization"] == "Bearer x"
     assert int(headers["Content-Length"]) == len(body)
     expected = {key: value for key, value in original.items() if key != "max_completion_tokens"}
-    assert json.loads(body) == {**expected, **SAMPLING}
+    assert json.loads(body) == {**expected, **sampling}
 
 
 def test_sampling_does_not_change_non_generation_requests(endpoint):
@@ -126,7 +128,8 @@ def test_invalid_sampling_fails_before_starting_router(values):
 
 
 @pytest.mark.parametrize("load_balance", [False, True])
-def test_all_six_suites_use_sampling_on_single_replica(monkeypatch, tmp_path, endpoint, load_balance):
+@pytest.mark.parametrize("sampling", [SAMPLING, GREEDY])
+def test_all_six_suites_use_sampling_on_single_replica(monkeypatch, tmp_path, endpoint, load_balance, sampling):
     api_base, received = endpoint
     runner = tmp_path / "gage/scripts/run/run_suite.sh"
     runner.parent.mkdir(parents=True)
@@ -157,7 +160,7 @@ def test_all_six_suites_use_sampling_on_single_replica(monkeypatch, tmp_path, en
             "output_dir": str(tmp_path / "results"),
             "benchmarks": suites,
             "load_balance": load_balance,
-            **SAMPLING,
+            **sampling,
         },
         server_addresses=[api_base],
         model_path="/model",
@@ -167,4 +170,4 @@ def test_all_six_suites_use_sampling_on_single_replica(monkeypatch, tmp_path, en
     assert result == {"val-audio/completed": 1.0}
     for _ in suites:
         payload = json.loads(received.get(timeout=5)[1])
-        assert {key: payload[key] for key in SAMPLING} == SAMPLING
+        assert {key: payload[key] for key in sampling} == sampling

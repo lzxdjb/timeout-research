@@ -283,6 +283,17 @@ def test_formal_profile_applies_requested_budgets_and_evaluates_all_examples(lau
     audio = values["distillation.teacher_models.audio_teacher"]
     assert audio["external"]["audio_response_length"] == audio["inference"]["response_length"] == 4096
     assert values["trainer.audio_benchmark.max_tokens"] == 4096
+    assert values["trainer.audio_benchmark.temperature"] == 0.0
+    assert values["trainer.audio_benchmark.top_k"] == 1
+    assert values["trainer.audio_benchmark.top_p"] == 1.0
+    # Audio benchmark overrides must not alter training or reasoning decoding.
+    assert values["actor_rollout_ref.rollout.temperature"] == 1.0
+    assert values["actor_rollout_ref.rollout.top_k"] == -1
+    assert values["actor_rollout_ref.rollout.top_p"] == 1.0
+    assert values["trainer.general_reasoning"]["temperature"] == 1.0
+    assert values["trainer.general_reasoning"]["top_k"] == -1
+    assert values["trainer.general_reasoning"]["top_p"] == 1.0
+    assert "trainer.general_reasoning.temperature" not in values
     assert values["trainer.audio_benchmark.max_samples"] is None
     assert values["trainer.general_reasoning"]["max_samples"] == -1
     assert len(values["trainer.audio_benchmark.benchmarks"]) == 6
@@ -383,10 +394,13 @@ def test_validation_only_profile_skips_swe_and_sets_both_benchmark_decoders(laun
     assert values["trainer.audio_benchmark.max_samples"] is None
     assert values["trainer.general_reasoning"]["max_samples"] == -1
     assert values["trainer.audio_benchmark.max_tokens"] == 4096
-    for decoder in ("actor_rollout_ref.rollout.val_kwargs", "trainer.general_reasoning", "trainer.audio_benchmark"):
+    for decoder in ("actor_rollout_ref.rollout.val_kwargs", "trainer.general_reasoning"):
         assert values[f"{decoder}.temperature"] == 0.6
         assert values[f"{decoder}.top_k"] == 20
         assert values[f"{decoder}.top_p"] == 0.95
+    assert values["trainer.audio_benchmark.temperature"] == 0.0
+    assert values["trainer.audio_benchmark.top_k"] == 1
+    assert values["trainer.audio_benchmark.top_p"] == 1.0
 
 
 def test_validation_only_profile_passes_runtime_preflight_without_starting_ray(launch_env, monkeypatch):

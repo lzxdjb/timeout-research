@@ -422,7 +422,7 @@ def test_validation_dispatch_is_bounded_when_worker_is_unresponsive(monkeypatch)
         manager.generate_sequences(batch)
 
 
-def validation_trainer(monkeypatch, tmp_path, confirmed, successes):
+def validation_trainer(monkeypatch, tmp_path, confirmed, successes, *, timeout_prediction_enabled=False):
     """Drive the actual trainer and sampler with in-memory queue storage."""
     import torch
     from omegaconf import OmegaConf
@@ -444,10 +444,18 @@ def validation_trainer(monkeypatch, tmp_path, confirmed, successes):
     trainer.replay_buffer = harness.buffer
     harness.buffer.validation_refill_fn = trainer._refill_validation_groups
     trainer.reward_loop_manager = SimpleNamespace(reward_loop_worker_handles=[object()])
-    trainer.timeout_prediction_enabled = False
+    trainer.timeout_prediction_enabled = timeout_prediction_enabled
+
+    def fail_prediction(*args, **kwargs):
+        pytest.fail("Validation must not run policy inference, timeout prediction, or predictor updates")
+
+    trainer._compute_old_log_prob = fail_prediction
+    trainer._apply_v1_timeout_prediction = fail_prediction
+    trainer._update_v1_timeout_predictor = fail_prediction
     trainer.tokenizer = SimpleNamespace(pad_token_id=0, decode=lambda *a, **kw: "decoded")
     trainer._maybe_log_val_generations = lambda **kw: None
-    trainer._dump_generations = lambda **kw: None
+    trainer.validation_dumps = []
+    trainer._dump_generations = lambda **kw: trainer.validation_dumps.append(copy.deepcopy(kw))
     trainer._run_optional_audio_validation = lambda: {}
     trainer.val_dataloader = [
         dict(
@@ -466,10 +474,9 @@ def validation_trainer(monkeypatch, tmp_path, confirmed, successes):
 
     def dispatch(batch):
         dispatches.append(batch)
-        for uid in batch["uid"]:
+        for uid, info in zip(batch["uid"], batch["extra_info"], strict=True):
             uid = str(uid)
-            tag = harness.state["val"][uid]
-            tid = tag["task_id"]
+            tid = tu.unwrap_non_tensor_data(info)["task_id"]
             if tid not in confirmed:
                 continue
             passed = int(tid in successes)
@@ -502,22 +509,65 @@ def validation_trainer(monkeypatch, tmp_path, confirmed, successes):
     "confirmed,successes", [({"0", "2"}, {"0"}), (set(), set()), ({"0", "1", "2", "3"}, {"0", "2"})]
 )
 def test_full_validation_accounts_for_multiple_batches_and_empty_results(monkeypatch, tmp_path, confirmed, successes):
-    trainer, harness, _ = validation_trainer(monkeypatch, tmp_path, confirmed, successes)
+    runs = []
+    for timeout_prediction_enabled in (False, True):
+        run_path = tmp_path / str(timeout_prediction_enabled)
+        trainer, harness, _ = validation_trainer(
+            monkeypatch, run_path, confirmed, successes,
+            timeout_prediction_enabled=timeout_prediction_enabled,
+        )
+        metrics = trainer._validate()
+        prefix = "val-core/bench/fixed_roster/"
+        assert metrics[prefix + "expected_tasks"] == 4
+        assert metrics[prefix + "coverage"] == len(confirmed) / 4
+        assert metrics[prefix + "success_lower@1"] == len(successes) / 4
+        assert metrics[prefix + "success_upper@1"] == (len(successes) + 4 - len(confirmed)) / 4
+        assert metrics[prefix + "known_failures"] == len(confirmed - successes)
+        assert metrics[prefix + "unresolved"] == 4 - len(confirmed)
+        assert ("val-core/bench/reward/mean@1" in metrics) == (len(confirmed) == 4)
+        audit = json.loads((run_path / "validation_audit/12.json").read_text())
+        assert len(audit["tasks"]) == 4 and len(audit["attempts"]) == 4
+        assert audit["status"] == ("complete" if len(confirmed) == 4 else "incomplete")
+        (dump,) = trainer.validation_dumps
+        dumped_scores = {
+            gt["instance_id"]: score for gt, score in zip(dump["gts"], dump["scores"], strict=True)
+        }
+        assert dumped_scores == {task: float(task in successes) for task in confirmed}
+        assert set(dump["scores"]) <= {0.0, 1.0}
+        assert dump["scores"] == dump["reward_extra_infos_dict"].get("hidden_pass", [])
+        assert not harness.state["val"]
+        runs.append((metrics, dumped_scores, audit["tasks"], audit["status"]))
+    assert runs[0] == runs[1]
+
+
+def test_nonstrict_validation_preserves_binary_rewards_with_training_predictor_enabled(monkeypatch, tmp_path):
+    confirmed, successes = {"0", "1", "2", "3"}, {"0", "2"}
+    trainer, harness, _ = validation_trainer(
+        monkeypatch, tmp_path, confirmed, successes, timeout_prediction_enabled=True,
+    )
+    monkeypatch.setenv("SWE_AGENT_VALIDATION_STRICT_ACCOUNTING", "0")
+
     metrics = trainer._validate()
-    prefix = "val-core/bench/fixed_roster/"
-    assert metrics[prefix + "expected_tasks"] == 4
-    assert metrics[prefix + "coverage"] == len(confirmed) / 4
-    assert metrics[prefix + "success_lower@1"] == len(successes) / 4
-    assert metrics[prefix + "success_upper@1"] == (len(successes) + 4 - len(confirmed)) / 4
-    assert ("val-core/bench/reward/mean@1" in metrics) == (len(confirmed) == 4)
-    audit = json.loads((tmp_path / "validation_audit/12.json").read_text())
-    assert len(audit["tasks"]) == 4 and len(audit["attempts"]) == 4
-    assert audit["status"] == ("complete" if len(confirmed) == 4 else "incomplete")
-    assert not harness.state["val"]
+
+    (dump,) = trainer.validation_dumps
+    assert {
+        gt["instance_id"]: score for gt, score in zip(dump["gts"], dump["scores"], strict=True)
+    } == {task: float(task in successes) for task in confirmed}
+    assert set(dump["scores"]) == {0.0, 1.0}
+    assert dump["scores"] == dump["reward_extra_infos_dict"]["hidden_pass"]
+    assert metrics["val-core/bench/reward/mean@1"] == 0.5
+    assert metrics["val-aux/bench/reward/mean@1"] == 0.5
+    assert not harness.cancelled and not harness.state["val"]
 
 
-def test_validation_deadline_skips_later_batches_without_changing_denominator(monkeypatch, tmp_path):
-    trainer, harness, dispatches = validation_trainer(monkeypatch, tmp_path, {"0", "2"}, {"0", "2"})
+@pytest.mark.parametrize("timeout_prediction_enabled", [False, True])
+def test_validation_deadline_skips_later_batches_without_changing_denominator(
+    monkeypatch, tmp_path, timeout_prediction_enabled
+):
+    trainer, harness, dispatches = validation_trainer(
+        monkeypatch, tmp_path, {"0", "2"}, {"0", "2"},
+        timeout_prediction_enabled=timeout_prediction_enabled,
+    )
     batches = trainer.val_dataloader
 
     def batches_with_delay():
@@ -533,8 +583,11 @@ def test_validation_deadline_skips_later_batches_without_changing_denominator(mo
     assert metrics["validation/fixed_roster/deadline_reached"] == 1
 
 
-def test_validation_cleanup_failure_leaves_durable_error_audit(monkeypatch, tmp_path):
-    trainer, harness, _ = validation_trainer(monkeypatch, tmp_path, {"0"}, {"0"})
+@pytest.mark.parametrize("timeout_prediction_enabled", [False, True])
+def test_validation_cleanup_failure_leaves_durable_error_audit(monkeypatch, tmp_path, timeout_prediction_enabled):
+    trainer, harness, _ = validation_trainer(
+        monkeypatch, tmp_path, {"0"}, {"0"}, timeout_prediction_enabled=timeout_prediction_enabled,
+    )
 
     def fail(*args, **kwargs):
         raise RuntimeError("cleanup was not acknowledged")

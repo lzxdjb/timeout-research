@@ -257,6 +257,7 @@ def _read_metrics(summary_path: Path, *, expected_run_id: str | None = None) -> 
         if not summary_file:
             continue
         child = json.loads(Path(str(summary_file)).read_text(encoding="utf-8"))
+        _validate_corpus_coverage(benchmark, child)
         for item in child.get("metrics", []):
             if not isinstance(item, dict):
                 continue
@@ -286,6 +287,58 @@ def _read_metrics(summary_path: Path, *, expected_run_id: str | None = None) -> 
             logger.warning("Omitting ambiguous GAGE audio metric key %s (%s rows); see task scores", key, len(values))
     metrics["val-audio/completed"] = 1.0
     return metrics
+
+
+def _validate_corpus_coverage(benchmark: Mapping[str, Any], child: Mapping[str, Any]) -> None:
+    """Reject incomplete new corpus scores instead of publishing a subset."""
+    primary_ids = {"wenetspeech_corpus_cer", "librispeech_corpus_wer", "aishell1_cer"}
+    corpus_rows = [
+        row for row in child.get("metrics", []) if isinstance(row, dict) and row.get("metric_id") in primary_ids
+    ]
+    if not corpus_rows:
+        return
+    benchmark_id = str(benchmark.get("benchmark_id") or "unknown")
+    tasks = benchmark.get("summary", {}).get("tasks", [])
+    task_map = {str(task.get("task_id") or ""): task for task in tasks if isinstance(task, dict)}
+    if not task_map or "" in task_map or len(task_map) != len(tasks):
+        raise RuntimeError(f"GAGE corpus score {benchmark_id}: missing or duplicate task coverage")
+    for metric_id in {row["metric_id"] for row in corpus_rows}:
+        rows = [row for row in corpus_rows if row["metric_id"] == metric_id]
+        row_map = {str(row.get("task_id") or ""): row for row in rows}
+        if set(row_map) != set(task_map) or len(row_map) != len(rows):
+            raise RuntimeError(f"GAGE corpus score {benchmark_id}/{metric_id}: missing or duplicate task metrics")
+        for task_id, task in task_map.items():
+            row = row_map[task_id]
+            expected = task.get("sample_count")
+            count = row.get("count")
+            metadata = row.get("metadata") or {}
+            metadata_count = metadata.get("samples")
+            if (
+                isinstance(expected, bool)
+                or not isinstance(expected, int)
+                or expected < 0
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count != expected
+                or isinstance(metadata_count, bool)
+                or not isinstance(metadata_count, int)
+                or metadata_count != expected
+            ):
+                raise RuntimeError(
+                    f"GAGE corpus score {benchmark_id}/{task_id}/{metric_id}: "
+                    f"incomplete sample coverage (metric={count}, task={expected}, "
+                    f"metadata={metadata_count}); refusing to publish a partial score"
+                )
+            execution_status = task.get("execution", {}).get("status", "completed")
+            if execution_status != "completed":
+                raise RuntimeError(
+                    f"GAGE corpus score {benchmark_id}/{task_id}: task status {execution_status!r} is incomplete"
+                )
+            if task.get("dataset_metadata", {}).get("preprocess_failure_count", 0):
+                raise RuntimeError(
+                    f"GAGE corpus score {benchmark_id}/{task_id}: preprocessing failures; "
+                    "refusing to publish a partial score"
+                )
 
 
 def _safe_component(value: str) -> str:

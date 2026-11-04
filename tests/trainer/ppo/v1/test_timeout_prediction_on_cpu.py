@@ -1,7 +1,6 @@
-from types import SimpleNamespace
-
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from verl.protocol import DataProto
@@ -55,9 +54,11 @@ def test_v1_completion_cutoff_prediction_excludes_infrastructure_rows() -> None:
 
 def _filter_trainer(adv_estimator: str = "grpo", rollout_n: int = 8):
     trainer = object.__new__(_TestTrainer)
-    trainer.config = SimpleNamespace(
-        algorithm=SimpleNamespace(adv_estimator=adv_estimator),
-        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(n=rollout_n)),
+    trainer.config = OmegaConf.create(
+        {
+            "algorithm": {"adv_estimator": adv_estimator},
+            "actor_rollout_ref": {"rollout": {"n": rollout_n}},
+        }
     )
     return trainer
 
