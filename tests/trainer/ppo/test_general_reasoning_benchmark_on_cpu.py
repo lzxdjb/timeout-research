@@ -20,7 +20,7 @@ class Tokenizer:
 
 
 @contextmanager
-def _student_server(calls, *, fail=False):
+def _student_server(calls, *, fail=False, solution_by_prompt=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -51,6 +51,8 @@ def _student_server(calls, *, fail=False):
                 return
             prompt = payload["messages"][-1]["content"]
             solution = r"\boxed{B}" if prompt.endswith("-0") else "The answer is B"
+            if solution_by_prompt and prompt in solution_by_prompt:
+                solution = solution_by_prompt[prompt]
             self.wfile.write(
                 json.dumps(
                     {
@@ -112,16 +114,47 @@ def test_http_validation_uses_student_replicas_and_separate_binary_metrics(tmp_p
     assert metrics["val-general/overall/count"] == 10.0
     for name in benchmark._BENCHMARKS:
         assert metrics[f"val-general/{name}/acc"] == 0.5
+    assert metrics["val-general/bbh/answer_acc"] == 1.0
+    assert metrics["val-general/bbh/representation_acc"] == 1.0
+    assert "val-general/overall/answer_acc" not in metrics
+    assert "val-general/gpqa_diamond/answer_acc" not in metrics
     output = next((tmp_path / "out").iterdir())
     summary = json.loads((output / "summary.json").read_text())
     assert summary["step"] == 7 and summary["status"] == "completed"
     records = [json.loads(line) for line in (output / "samples.jsonl").read_text().splitlines()]
     assert len(records) == 10 and {row["reward"]["score"] for row in records} == {0.0, 1.0}
+    bbh_records = [row for row in records if row["benchmark"] == "bbh"]
+    assert {row["bbh_validation"]["answer_source"] for row in bbh_records} == {"boxed", "explicit"}
+    assert all(row["extra_info"]["answer_type"] == "multiple_choice" for row in bbh_records)
+    assert all("bbh_validation" not in row for row in records if row["benchmark"] != "bbh")
 
 
 def test_smoke_limit_is_per_dataset(tmp_path):
     config = _config(tmp_path, limit=1)
     assert len(benchmark._load_rows(config)) == 5
+
+
+def test_live_bbh_metrics_recover_late_option_without_changing_strict_reward(tmp_path):
+    config = _config(tmp_path, limit=1)
+    path = tmp_path / "bbh.parquet"
+    rows = pq.read_table(path).to_pylist()
+    prompt = "Which is correct?\n(A) first\n(K) last"
+    rows[0].update(
+        prompt=[{"role": "user", "content": prompt}],
+        reward_model={"ground_truth": "(K)"},
+        extra_info={"answer_type": "exact", "meta_json": '{"task":"tracking_shuffled_objects_seven_objects"}'},
+    )
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    with _student_server([], solution_by_prompt={prompt: r"\boxed{K}"}) as base:
+        metrics = benchmark.run_general_reasoning_validation(config, [base], 2, tokenizer=Tokenizer())
+    assert metrics["val-general/bbh/acc"] == 0.0
+    assert metrics["val-general/bbh/format_valid"] == 1.0
+    assert metrics["val-general/bbh/answer_acc"] == metrics["val-general/bbh/representation_acc"] == 1.0
+    records = [json.loads(line) for line in next((tmp_path / "out").glob("*/samples.jsonl")).read_text().splitlines()]
+    record = next(row for row in records if row["benchmark"] == "bbh")
+    assert record["reward"]["score"] == record["reward"]["acc"] == 0.0
+    assert record["bbh_validation"]["option_labels"] == ["A", "K"]
+    assert record["bbh_validation"]["task"] == "tracking_shuffled_objects_seven_objects"
 
 
 def test_response_budget_reserves_the_rendered_prompt_context(tmp_path):
@@ -173,3 +206,18 @@ def test_prompt_budget_is_checked_before_generation(tmp_path):
 
 def test_disabled_profile_does_not_read_files_or_require_endpoints():
     assert benchmark.run_general_reasoning_validation({"enabled": False}, [], 1) == {}
+
+
+def test_metrics_accept_legacy_journals_without_new_bbh_fields():
+    record = {
+        "benchmark": "bbh",
+        "reward": {"score": 0.0, "acc": 0.0, "deterministic_acc": 1.0, "format_valid": 0.0},
+        "response_tokens": 10,
+        "finish_reason": "stop",
+    }
+    metrics = benchmark._metrics([record])
+    assert metrics["val-general/bbh/acc"] == 0.0
+    assert "val-general/bbh/answer_acc" not in metrics
+    enriched = {**record, "reward": {**record["reward"], "answer_acc": 1.0, "representation_acc": 1.0}}
+    mixed_metrics = benchmark._metrics([record, enriched])
+    assert "val-general/bbh/answer_acc" not in mixed_metrics

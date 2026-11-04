@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import aiohttp
 
+from verl.trainer.ppo.bbh_validation_scoring import score_bbh_validation
 from verl.utils.reward_score.swe_audio_reasoning_opd import compute_general_score
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,7 @@ def _prompt_length(tokenizer, messages: list[dict]) -> int:
 
 
 def _metrics(records: list[dict]) -> dict[str, float]:
+    """Aggregate fraction-valued scores; optional BBH metrics stay BBH-only."""
     grouped = defaultdict(list)
     for record in records:
         grouped[record["benchmark"]].append(record)
@@ -92,6 +94,12 @@ def _metrics(records: list[dict]) -> dict[str, float]:
         metrics[f"{prefix}/count"] = float(len(samples))
         for key in ("score", "acc", "deterministic_acc", "format_valid"):
             metrics[f"{prefix}/{key}"] = sum(float(item["reward"][key]) for item in samples) / len(samples)
+        if name == "bbh":
+            for key in ("answer_acc", "representation_acc"):
+                # Older journals do not contain these fields. Do not publish a
+                # partial-roster mean or mix these BBH-only scores into overall.
+                if all(key in item["reward"] for item in samples):
+                    metrics[f"{prefix}/{key}"] = sum(float(item["reward"][key]) for item in samples) / len(samples)
         metrics[f"{prefix}/response_tokens_mean"] = sum(item["response_tokens"] for item in samples) / len(samples)
         metrics[f"{prefix}/truncated_fraction"] = sum(item["finish_reason"] == "length" for item in samples) / len(
             samples
@@ -214,6 +222,12 @@ async def _run_requests(config, api_bases, rows, tokenizer, journal) -> list[dic
                         info,
                         reasoning_reward_path=config.get("reasoning_reward_path"),
                     )
+                    bbh_validation = None
+                    if row["benchmark"] == "bbh":
+                        bbh_validation = score_bbh_validation(solution, reward_spec["ground_truth"], messages, info)
+                        # Preserve score/acc/format_valid from the shared strict
+                        # scorer. These extra fields are validation diagnostics.
+                        reward.update({key: bbh_validation[key] for key in ("answer_acc", "representation_acc")})
                     usage = result.get("usage") or {}
                     record = {
                         "index": index,
@@ -223,6 +237,7 @@ async def _run_requests(config, api_bases, rows, tokenizer, journal) -> list[dic
                         "student_api_base": base,
                         "prompt": messages,
                         "ground_truth": reward_spec["ground_truth"],
+                        "extra_info": info,
                         "response": solution,
                         "reasoning_content": message.get("reasoning_content", message.get("reasoning")),
                         "reward": reward,
@@ -231,6 +246,8 @@ async def _run_requests(config, api_bases, rows, tokenizer, journal) -> list[dic
                         "response_tokens": int(usage.get("completion_tokens", 0)),
                         "requested_max_tokens": max_tokens,
                     }
+                    if bbh_validation is not None:
+                        record["bbh_validation"] = bbh_validation
                     journal.write(json.dumps(record, ensure_ascii=False) + "\n")
                     journal.flush()
                     return record
