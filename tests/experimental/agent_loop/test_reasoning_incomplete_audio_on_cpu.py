@@ -19,11 +19,14 @@ from verl.utils import tensordict_utils as tu
 from verl.workers.config import ActorConfig, DistillationLossConfig
 
 
-def _worker(monkeypatch, *, reasoning=True):
+def _worker(monkeypatch, *, reasoning=True, audio_exclusion=False):
     worker_class = agent_loop_tq.AgentLoopWorkerTQ.__ray_metadata__.modified_class
     worker = object.__new__(worker_class)
     worker.config = OmegaConf.create({
-        "trainer": {"general_reasoning": {"enabled": reasoning}},
+        "trainer": {
+            "general_reasoning": {"enabled": reasoning},
+            "audio_opd": {"exclude_incomplete_sequences": audio_exclusion},
+        },
         "distillation": {
             "enabled": True,
             "teacher_key": "teacher_route",
@@ -90,8 +93,11 @@ def _postprocess(worker, output):
     )
 
 
-def test_capped_candidate_is_published_masked_without_any_teacher_or_task_reward(monkeypatch):
-    worker, published = _worker(monkeypatch)
+@pytest.mark.parametrize("reasoning,audio_exclusion", [(True, False), (False, True)])
+def test_capped_candidate_is_published_masked_without_any_teacher_or_task_reward(
+    monkeypatch, reasoning, audio_exclusion
+):
+    worker, published = _worker(monkeypatch, reasoning=reasoning, audio_exclusion=audio_exclusion)
     output = _output()
     asyncio.run(_postprocess(worker, output))
     worker._compute_teacher_logprobs.assert_not_awaited()
@@ -100,6 +106,7 @@ def test_capped_candidate_is_published_masked_without_any_teacher_or_task_reward
     assert published["tags"][0]["train_sample_mask"] is False
     assert published["tags"][0]["audio_opd_candidate_excluded"] is True
     assert published["fields"]["teacher_sequence_mask"].tolist() == [False]
+    assert ("general_reasoning_mask" in published["fields"]) is reasoning
     assert output.response_ids == [2, 3]
     assert output.extra_fields["reward_extra_info"]["audio_response_tokens"] == 2
 
@@ -107,10 +114,10 @@ def test_capped_candidate_is_published_masked_without_any_teacher_or_task_reward
     assert mask.tolist() == [False]
 
 
-@pytest.mark.parametrize("reasoning", [False, True])
+@pytest.mark.parametrize("reasoning,audio_exclusion", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("eos", [55, 77])
-def test_complete_audio_uses_existing_teacher_and_reward_bypass(monkeypatch, reasoning, eos):
-    worker, published = _worker(monkeypatch, reasoning=reasoning)
+def test_complete_audio_uses_existing_teacher_and_reward_bypass(monkeypatch, reasoning, audio_exclusion, eos):
+    worker, published = _worker(monkeypatch, reasoning=reasoning, audio_exclusion=audio_exclusion)
     asyncio.run(_postprocess(worker, _output(eos=eos)))
     worker._compute_teacher_logprobs.assert_awaited_once()
     worker.teacher_server_manager.compute_teacher_sequence_score_single.assert_awaited_once()
@@ -126,8 +133,9 @@ def test_legacy_profile_keeps_strict_incomplete_audio_failure(monkeypatch):
     assert not published
 
 
-def test_real_teacher_failure_remains_fatal_in_reasoning_profile(monkeypatch):
-    worker, published = _worker(monkeypatch)
+@pytest.mark.parametrize("reasoning,audio_exclusion", [(True, False), (False, True)])
+def test_real_teacher_failure_remains_fatal_in_opted_in_profiles(monkeypatch, reasoning, audio_exclusion):
+    worker, published = _worker(monkeypatch, reasoning=reasoning, audio_exclusion=audio_exclusion)
     worker.teacher_server_manager.compute_teacher_sequence_score_single.side_effect = TeacherScoringError(
         "Teacher endpoint failed"
     )
@@ -136,8 +144,9 @@ def test_real_teacher_failure_remains_fatal_in_reasoning_profile(monkeypatch):
     assert not published
 
 
-def test_published_exclusion_has_zero_gradient_and_does_not_dilute_normalizers(monkeypatch):
-    worker, published = _worker(monkeypatch)
+@pytest.mark.parametrize("reasoning,audio_exclusion", [(True, False), (False, True)])
+def test_published_exclusion_has_zero_gradient_and_does_not_dilute_normalizers(monkeypatch, reasoning, audio_exclusion):
+    worker, published = _worker(monkeypatch, reasoning=reasoning, audio_exclusion=audio_exclusion)
     asyncio.run(_postprocess(worker, _output()))
     row_mask = _v1_train_sample_mask_from_tags(
         ["swe_0_0", "audio_0_0", *published["keys"]], [{}, {}, *published["tags"]],
@@ -180,3 +189,4 @@ def test_published_exclusion_has_zero_gradient_and_does_not_dilute_normalizers(m
     torch.testing.assert_close(student.grad, torch.tensor([-.25, -.5, 0., -3., -3., 0., 0., 0., 0.]))
     assert metrics["distillation/audio/accepted_sequences"].aggregate() == 1
     assert metrics["distillation/swe/accepted_sequences"].aggregate() == 1
+    assert "distillation/general/accepted_sequences" not in metrics

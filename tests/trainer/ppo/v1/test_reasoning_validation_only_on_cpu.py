@@ -81,8 +81,10 @@ def test_audio_and_reasoning_validate_without_swe_or_teachers(monkeypatch):
 
 
 @pytest.mark.parametrize("reasoning", [None, {"enabled": False}])
-def test_existing_audio_only_profile_still_runs_only_audio(monkeypatch, reasoning):
+@pytest.mark.parametrize("audio_exclusion", [False, True])
+def test_existing_audio_only_profile_still_runs_only_audio(monkeypatch, reasoning, audio_exclusion):
     trainer = _trainer(reasoning)
+    trainer.config.trainer.audio_opd = {"exclude_incomplete_sequences": audio_exclusion}
     runner = Mock(side_effect=AssertionError("Disabled reasoning must not run"))
     monkeypatch.setattr(general_reasoning_benchmark, "run_general_reasoning_validation", runner)
     assert trainer._validate() == {"val-audio/completed": 1.0}
@@ -149,8 +151,10 @@ def test_standalone_fit_validates_and_exits_with_no_initial_validation_flag(monk
     assert trainer.global_steps == 0
 
 
-def test_training_snapshot_preserves_scalar_metrics_and_reports_nonfinite(tmp_path, caplog):
-    trainer = _trainer({"enabled": True})
+@pytest.mark.parametrize("reasoning,snapshot", [(True, False), (False, True)])
+def test_training_snapshot_preserves_scalar_metrics_and_reports_nonfinite(tmp_path, caplog, reasoning, snapshot):
+    trainer = _trainer({"enabled": reasoning})
+    trainer.config.trainer.training_metrics_snapshot = {"enabled": snapshot}
     trainer.config.trainer.default_local_dir = str(tmp_path)
     trainer.global_steps = 3
     metrics = {
@@ -194,15 +198,19 @@ def test_training_snapshot_preserves_scalar_metrics_and_reports_nonfinite(tmp_pa
 
 
 @pytest.mark.parametrize("reasoning", [None, {"enabled": False}])
-def test_existing_profiles_do_not_write_training_snapshots(tmp_path, reasoning):
+@pytest.mark.parametrize("audio_exclusion", [False, True])
+def test_existing_profiles_do_not_write_training_snapshots(tmp_path, reasoning, audio_exclusion):
     trainer = _trainer(reasoning)
+    trainer.config.trainer.audio_opd = {"exclude_incomplete_sequences": audio_exclusion}
     trainer.config.trainer.default_local_dir = str(tmp_path)
     trainer._write_reasoning_training_metrics_snapshot({"actor/pg_loss": 1.0})
     assert list(tmp_path.iterdir()) == []
 
 
-def test_snapshot_is_available_before_validation_and_includes_weight_sync(tmp_path, monkeypatch):
-    trainer = _trainer({"enabled": True})
+@pytest.mark.parametrize("reasoning,snapshot", [(True, False), (False, True)])
+def test_snapshot_is_available_before_validation_and_includes_weight_sync(tmp_path, monkeypatch, reasoning, snapshot):
+    trainer = _trainer({"enabled": reasoning})
+    trainer.config.trainer.training_metrics_snapshot = {"enabled": snapshot}
     trainer.config.trainer.update(
         {"default_local_dir": str(tmp_path), "val_only": False, "total_epochs": 1, "save_freq": 1, "test_freq": 2}
     )
@@ -248,3 +256,33 @@ def test_snapshot_is_available_before_validation_and_includes_weight_sync(tmp_pa
 
     with pytest.raises(RuntimeError, match="Stop before long validation"):
         trainer.fit(SimpleNamespace(cancel_sequences=Mock()))
+
+
+@pytest.mark.parametrize("reasoning,audio_exclusion", [(False, False), (True, False), (False, True)])
+def test_training_exclusion_count_is_opted_in_and_ignores_padding(monkeypatch, reasoning, audio_exclusion):
+    monkeypatch.setenv("SWE_AGENT_REPEAT_REWARD_MODE", "off")
+    monkeypatch.setenv("VERL_GRPO_GOLDEN_REPLAY_ENABLED", "0")
+    trainer = _trainer({"enabled": reasoning})
+    trainer.config.trainer.audio_opd = {"exclude_incomplete_sequences": audio_exclusion}
+    trainer.config.actor_rollout_ref.rollout.temperature = 1
+    trainer.use_reference_policy = trainer.use_critic = False
+    batch = trainer_base.KVBatchMeta(
+        partition_id="train",
+        keys=["complete_0_0", "excluded_0_0", "padding_0_0"],
+        tags=[{}, {"audio_opd_candidate_excluded": True}, {"audio_opd_candidate_excluded": True, "is_padding": True}],
+    )
+    trainer.replay_buffer = SimpleNamespace(sample=lambda **_: (batch, {}), golden_replay_enabled=False)
+    trainer.reward_loop_manager = SimpleNamespace(reward_loop_worker_handles=None)
+    trainer.on_sample_begin = trainer.on_sample_end = lambda: None
+    trainer._balance_batch = trainer._compute_old_log_prob = trainer._compute_advantage = lambda batch, **_: batch
+    trainer._compute_reward_colocate = lambda batch, **_: batch
+    trainer._has_active_training_samples = lambda _: False
+
+    metrics = {}
+    trainer._step_once(metrics, {}, 1)
+
+    name = "training/audio_opd/excluded_incomplete_sequences"
+    if reasoning or audio_exclusion:
+        assert metrics[name] == 1.0
+    else:
+        assert name not in metrics

@@ -1,9 +1,9 @@
-"""Exclude locally incomplete audio candidates only in the reasoning OPD profile."""
+"""Exclude locally incomplete audio candidates only in opted-in OPD profiles."""
 
 import torch
 
 from verl.trainer.distillation.config_utils import audio_teacher_for_sample, is_pure_distillation
-from verl.trainer.distillation.reasoning_utils import reasoning_profile_enabled
+from verl.trainer.distillation.reasoning_utils import audio_incomplete_exclusion_enabled
 
 
 def _get(config, key, default=None):
@@ -29,7 +29,11 @@ def exclude_incomplete_audio_candidate(config, output, sample, *, tokenizer, mod
     usual strict path. Complete candidates, other profiles, and validation are
     unchanged. Response IDs and their masks are never rewritten.
     """
-    if validate or not reasoning_profile_enabled(config) or not is_pure_distillation(config.get("distillation")):
+    if (
+        validate
+        or not audio_incomplete_exclusion_enabled(config)
+        or not is_pure_distillation(config.get("distillation"))
+    ):
         return False
     teacher = audio_teacher_for_sample(config, sample)
     if teacher is None:

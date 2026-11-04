@@ -9,6 +9,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.trainer.distillation.reasoning_audio import exclude_incomplete_audio_candidate
+from verl.trainer.distillation.reasoning_utils import audio_incomplete_exclusion_enabled, is_reasoning_sample
 from verl.trainer.ppo.v1.replay_buffer import rollout_diagnostics
 from verl.trainer.ppo.v1.utils import hidden_reward_was_skipped, v1_success_values
 
@@ -49,6 +50,30 @@ def _exclude(config=None, output=None, sample=None, **kwargs):
         {"teacher_route": "audio"} if sample is None else sample,
         tokenizer=SimpleNamespace(eos_token_id=55), **kwargs,
     )
+
+
+@pytest.mark.parametrize("reasoning,audio_exclusion", [(False, False), (True, False), (False, True), (True, True)])
+def test_audio_exclusion_opt_in_is_independent_of_reasoning_routes(reasoning, audio_exclusion):
+    config = _config()
+    config.trainer.general_reasoning.enabled = reasoning
+    config.trainer.audio_opd = {"exclude_incomplete_sequences": audio_exclusion}
+    assert audio_incomplete_exclusion_enabled(config) is (reasoning or audio_exclusion)
+    assert is_reasoning_sample(config, {"is_general_reasoning": True}) is reasoning
+
+
+def test_audio_exclusion_defaults_off_without_a_reasoning_profile():
+    assert not audio_incomplete_exclusion_enabled({})
+    assert not audio_incomplete_exclusion_enabled({"trainer": {"audio_opd": {}}})
+
+
+@pytest.mark.parametrize("validate", [False, True])
+def test_separate_audio_opt_in_excludes_training_candidates_only(validate):
+    config = _config()
+    config.trainer.general_reasoning.enabled = False
+    config.trainer.audio_opd = {"exclude_incomplete_sequences": True}
+    output = _output(generation_finish_reason="length")
+    assert _exclude(config, output, validate=validate) is (not validate)
+    assert ("audio_opd_candidate_excluded" in output.extra_fields) is (not validate)
 
 
 @pytest.mark.parametrize("gate", ["profile_off", "validation", "distillation_off", "task_rewards", "swe", "unknown"])

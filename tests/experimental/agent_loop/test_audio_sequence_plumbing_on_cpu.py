@@ -73,7 +73,7 @@ def test_single_turn_audio_budget_and_thinking_override_are_local(route):
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("reasoning_enabled", [True, False])
+@pytest.mark.parametrize("reasoning_enabled,audio_exclusion", [(True, False), (False, False), (False, True)])
 @pytest.mark.parametrize(
     "finish_reason,stop_reason,token_ids,legacy_truncated",
     [
@@ -85,11 +85,14 @@ def test_single_turn_audio_budget_and_thinking_override_are_local(route):
     ],
 )
 def test_reasoning_audio_preserves_native_termination_diagnostics(
-    reasoning_enabled, finish_reason, stop_reason, token_ids, legacy_truncated
+    reasoning_enabled, audio_exclusion, finish_reason, stop_reason, token_ids, legacy_truncated
 ):
     loop = object.__new__(SingleTurnAgentLoop)
     loop.config = _config()
-    loop.config.trainer = {"general_reasoning": {"enabled": reasoning_enabled}}
+    loop.config.trainer = {
+        "general_reasoning": {"enabled": reasoning_enabled},
+        "audio_opd": {"exclude_incomplete_sequences": audio_exclusion},
+    }
     loop.rollout_config = SimpleNamespace(full_determinism=False)
     loop.response_length = 20
     loop.apply_chat_template_kwargs = {"enable_thinking": True}
@@ -111,13 +114,14 @@ def test_reasoning_audio_preserves_native_termination_diagnostics(
         loop.run({"max_tokens": 20}, teacher_route="audio", raw_prompt=[{"role": "user", "content": "Listen"}])
     )
 
-    expected_truncated = legacy_truncated or (reasoning_enabled and finish_reason in {"length", "abort"})
+    enabled = reasoning_enabled or audio_exclusion
+    expected_truncated = legacy_truncated or (enabled and finish_reason in {"length", "abort"})
     assert output.extra_fields["audio_student_truncated"] is expected_truncated
     assert output.response_ids == token_ids[:8]
     assert output.response_mask == [1] * min(len(token_ids), 8)
     assert output.extra_fields["generation_finish_reason"] == finish_reason
     diagnostic_keys = {"audio_student_response_length", "audio_student_response_tokens", "audio_student_stop_reason"}
-    if reasoning_enabled:
+    if enabled:
         assert output.extra_fields["audio_student_response_length"] == 8
         assert output.extra_fields["audio_student_response_tokens"] == len(token_ids)
         assert output.extra_fields["audio_student_stop_reason"] == stop_reason

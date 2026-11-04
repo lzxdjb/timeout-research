@@ -6,6 +6,14 @@ def reasoning_profile_enabled(config):
     return bool(trainer.get("general_reasoning", {}).get("enabled", False))
 
 
+def audio_incomplete_exclusion_enabled(config):
+    """Keep the reasoning guard available to separately opted-in audio profiles."""
+    trainer = config.get("trainer", {})
+    return reasoning_profile_enabled(config) or bool(
+        trainer.get("audio_opd", {}).get("exclude_incomplete_sequences", False)
+    )
+
+
 def is_reasoning_sample(config, sample):
     if not reasoning_profile_enabled(config):
         return False

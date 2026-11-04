@@ -927,7 +927,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             )
             if excluded:
                 logger.warning(
-                    "Excluded incomplete reasoning-profile audio candidate: uid=%s session=%s "
+                    "Excluded incomplete audio OPD candidate: uid=%s session=%s "
                     "reason=%s response_tokens=%s response_cap=%s last_token=%s finish_reason=%s",
                     uid,
                     session_id,
@@ -1053,7 +1053,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 }
             )
             if audio_sequence_training and extra_fields.get("audio_opd_candidate_excluded", False):
-                # Only the opt-in reasoning profile publishes this marker.
+                # Only opted-in audio OPD profiles publish this marker.
                 # It must reach the trainer's existing row mask before any
                 # objective can interpret the neutral transport placeholders.
                 tags[-1]["train_sample_mask"] = False

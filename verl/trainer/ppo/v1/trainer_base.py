@@ -56,6 +56,7 @@ from verl.trainer.distillation.config_utils import (
     requires_teacher_resource_pool,
     should_skip_hidden_reward,
 )
+from verl.trainer.distillation.reasoning_utils import audio_incomplete_exclusion_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.audio_benchmark import run_audio_benchmarks
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -881,7 +882,7 @@ class PPOTrainer(ABC):
                 logger.info("Repeat trainer sample_end partition=train global_step=%s selected=%d seconds=%.3f",
                             self.global_steps, len(batch.keys), time.monotonic() - sample_started)
             metrics.update(off_policy_metrics)
-            if self.config.trainer.get("general_reasoning", {}).get("enabled", False):
+            if audio_incomplete_exclusion_enabled(self.config):
                 metrics["training/audio_opd/excluded_incomplete_sequences"] = float(
                     sum(
                         bool(tag.get("audio_opd_candidate_excluded", False))
@@ -1019,8 +1020,12 @@ class PPOTrainer(ABC):
         return metrics
 
     def _write_reasoning_training_metrics_snapshot(self, metrics: dict) -> None:
-        """Persist new-profile training health before potentially lengthy validation."""
-        if not self.config.trainer.get("general_reasoning", {}).get("enabled", False):
+        """Persist opted-in training health before potentially lengthy validation."""
+        trainer_config = self.config.trainer
+        if not (
+            trainer_config.get("general_reasoning", {}).get("enabled", False)
+            or trainer_config.get("training_metrics_snapshot", {}).get("enabled", False)
+        ):
             return
         scalars = {}
         non_finite = []

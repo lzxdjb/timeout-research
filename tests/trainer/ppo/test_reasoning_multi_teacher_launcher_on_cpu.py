@@ -293,6 +293,81 @@ def test_formal_profile_applies_requested_budgets_and_evaluates_all_examples(lau
         assert exported[f"SWE_AGENT_ROLLOUT_{phase}_RESPONSE_LENGTH"] == "252000"
 
 
+def test_swe_audio_formal_removes_reasoning_and_preserves_current_formal_settings(launch_env):
+    # Simulate switching profiles in a shell with stale reasoning paths/quotas.
+    inherited, _ = launch(launch_env, suffix="reasoning_projector_formal")
+    launch_env.update(
+        MODEL_PATH="/models/chosen-hf-checkpoint",
+        TRAIN_FILES=inherited["TRAIN_FILES"],
+        VAL_FILES='["/old/reasoning-validation.parquet"]',
+        OPD_MIX_SCHEDULE=inherited["OPD_MIX_SCHEDULE"],
+        GENERAL_REASONING_VAL_FILES='["/old/aime_2024.parquet"]',
+    )
+    exported, values = launch(launch_env, suffix="projector_formal")
+    files = json.loads(exported["TRAIN_FILES"])
+    assert len(files) == 2
+    assert files[0].endswith("swe_rebench_v2_reference_verified_snapshot_2000.parquet")
+    assert files[1].endswith("audio_opd_pilot_v1/train.opd.parquet")
+    assert len(json.loads(exported["VAL_FILES"])) == 1
+    assert "swe_bench_verified_reference_verified_repeat2_500_images_v1" in exported["VAL_FILES"]
+    assert exported["MODEL_PATH"] == "/models/chosen-hf-checkpoint"
+    assert values["trainer.resume_mode"] == "disable"
+    assert values["trainer.general_reasoning.enabled"] is False
+    assert "trainer.general_reasoning" not in values
+    assert values["data.custom_cls.path"] == "pkg://verl.utils.dataset.audio_opd_dataset"
+    assert values["data.custom_cls.name"] == "AudioOPDMixedDataset"
+    assert values["reward.custom_reward_function.path"].endswith("/swe_audio_opd.py")
+    assert "actor_rollout_ref.rollout.agent.agent_loop_config_path" not in values
+    phases = json.loads(exported["OPD_MIX_SCHEDULE"])
+    assert [phase["steps"] for phase in phases] == [20, 60, 20]
+    assert [phase["quotas"] for phase in phases] == [
+        {"swe": 16, "audio_librispeech": 18, "audio_aishell1": 18, "audio_clotho_aqa": 12},
+        {"swe": 32, "audio_librispeech": 12, "audio_aishell1": 12, "audio_clotho_aqa": 8},
+        {"swe": 48, "audio_librispeech": 6, "audio_aishell1": 6, "audio_clotho_aqa": 4},
+    ]
+    assert values["trainer.audio_opd.exclude_incomplete_sequences"] is True
+    assert values["trainer.training_metrics_snapshot.enabled"] is True
+    assert values["actor_rollout_ref.rollout.n"] == 8
+    assert values["data.train_batch_size"] == values["actor_rollout_ref.actor.ppo_mini_batch_size"] == 64
+    assert values["actor_rollout_ref.actor.optim.lr"] == 1e-6
+    assert values["trainer.total_training_steps"] == 100
+    assert values["trainer.save_freq"] == 1 and values["trainer.test_freq"] == 2
+    assert values["trainer.val_before_train"] is False
+    assert exported["MAX_RESPONSE_LENGTH"] == "252000" and exported["MAX_PROMPT_LENGTH"] == "8192"
+    assert values["actor_rollout_ref.rollout.max_model_len"] == 260192
+    for phase, cutoff in (("TRAINING", "0.96"), ("VALIDATION", "0.98")):
+        assert exported[f"SWE_AGENT_ROLLOUT_{phase}_COMPLETION_RATIO_THRESHOLD"] == cutoff
+        assert exported[f"SWE_AGENT_ROLLOUT_{phase}_RESPONSE_LENGTH"] == "252000"
+    audio = values["distillation.teacher_models.audio_teacher"]
+    assert audio["external"]["audio_response_length"] == audio["inference"]["response_length"] == 8192
+    assert audio["external"]["base_url"] == "http://10.248.102.8:18090"
+    assert values["distillation.teacher_models.swe_teacher"]["external"]["base_url"] == "http://10.248.102.92:18090"
+    assert values["trainer.audio_benchmark.max_tokens"] == 4096
+    assert values["trainer.audio_benchmark.max_samples"] is None
+    assert values["trainer.audio_benchmark.enabled"] is True
+    assert values["trainer.audio_benchmark.benchmarks"] == [
+        "aishell1", "librispeech", "wenetspeech", "clothoaqa", "rul_muchomusic", "voicebench_bbh",
+    ]
+    assert values["actor_rollout_ref.actor.megatron.train_audio_projector"] is True
+    assert values["actor_rollout_ref.ref.megatron.frozen_audio"] is True
+    assert values["distillation.distillation_loss.audio_sequence_surrogate"] is True
+    assert values["distillation.distillation_loss.use_task_rewards"] is False
+    assert exported["SWE_AGENT_TRAINING_TOOL_FAILURE_PENALTY_ENABLED"] == "1"
+    assert exported["SWE_AGENT_TRAINING_TOOL_FAILURE_PENALTY_COST"] == "0.02"
+    assert exported["SWE_AGENT_TRAINING_TOOL_FAILURE_PENALTY_CAP"] == "0.30"
+
+
+def test_swe_audio_formal_accepts_audio_cap_override_and_requires_explicit_weights(launch_env):
+    missing = launch(launch_env, suffix="projector_formal", success=False)
+    assert missing.returncode != 0
+    assert "Set MODEL_PATH" in missing.stderr
+    launch_env.update(MODEL_PATH="/models/chosen-hf-checkpoint", AUDIO_MAX_RESPONSE_LENGTH="16384")
+    _, values = launch(launch_env, suffix="projector_formal")
+    audio = values["distillation.teacher_models.audio_teacher"]
+    assert audio["external"]["audio_response_length"] == audio["inference"]["response_length"] == 16384
+    assert values["trainer.audio_benchmark.max_tokens"] == 4096
+
+
 def test_validation_only_profile_skips_swe_and_sets_both_benchmark_decoders(launch_env):
     exported, values = launch(launch_env, suffix="reasoning_validation_only")
     assert json.loads(exported["TRAIN_FILES"]) == json.loads(exported["VAL_FILES"]) == []
