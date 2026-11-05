@@ -117,7 +117,7 @@ def test_partial_quota_phase_change_never_consumes_unrequested_source_rows():
     first = [next(stream) for _ in range(13)]
     counts = Counter(pool[index]["source"] for index in first)
     assert sum(sampler.cursors.values()) == 13
-    assert sampler.state_dict()["version"] == 2
+    assert sampler.state_dict()["version"] == 3
     sampler.set_step(21)
     following = [next(stream) for _ in range(64)]
     assert Counter(pool[index]["source"] for index in following) == SCHEDULE[1]["quotas"]

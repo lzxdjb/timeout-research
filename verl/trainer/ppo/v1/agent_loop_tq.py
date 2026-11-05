@@ -50,6 +50,7 @@ from verl.trainer.distillation.reasoning_utils import (
 from verl.trainer.ppo.v1.repeat_judge_queue import RepeatQueueError, progress_interval_seconds
 from verl.trainer.ppo.v1.utils import hidden_reward_was_skipped
 from verl.utils.async_rpc import GenerationCutoffState, RPCCancellationError, generation_cutoff_scope
+from verl.utils.audio_rl import audio_rl_enabled, audio_rl_for_sample, exclude_incomplete_audio_rl_candidate
 from verl.utils.ray_utils import auto_await
 from verl.utils.swe_cutoff_debug import cutoff_debug_enabled, reconcile_cutoff_sessions, write_cutoff_debug_event
 from verl.utils.swe_validation import positive_seconds, strict_validation_enabled
@@ -912,8 +913,22 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
         from verl.trainer.distillation.config_utils import audio_teacher_for_sample
 
+        audio_rl = audio_rl_for_sample(self.config, kwargs)
+        audio_rl_excluded = False
+        if audio_rl is not None and not validate:
+            if len(outputs) != 1:
+                raise RuntimeError("Audio RL requires a single-turn trajectory")
+            audio_rl_excluded = exclude_incomplete_audio_rl_candidate(
+                self.config, outputs[0], kwargs,
+                tokenizer=getattr(self, "tokenizer", None),
+                model_config=getattr(self, "model_config", None),
+            )
         audio_sequence_training = not validate and audio_teacher_for_sample(self.config, kwargs) is not None
-        if audio_sequence_training:
+        if audio_rl_excluded:
+            # A local length/abort exclusion has no measured reward. Keep it
+            # out of both actor loss and GRPO statistics; never invent teacher data.
+            pass
+        elif audio_sequence_training:
             if len(outputs) != 1:
                 raise RuntimeError("Audio sequence OPD requires a single-turn trajectory.")
             from verl.trainer.distillation.reasoning_audio import exclude_incomplete_audio_candidate
@@ -964,7 +979,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
         final_output = outputs[-1]
         # TODO: Support output:list[AgentLoopOutput]
-        if not audio_sequence_training:
+        if not audio_sequence_training and not audio_rl_excluded:
             await self._compute_teacher_logprobs(
                 final_output,
                 prompt_ids=final_output.prompt_ids,
@@ -1052,6 +1067,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "unverified_trajectory": evaluator_group_excluded,
                 }
             )
+            if audio_rl_enabled(self.config):
+                source = kwargs.get("data_source", "")
+                tags[-1]["mixed_rl_source"] = source if source.startswith("audio_") else "swe"
+            if audio_rl_excluded:
+                tags[-1]["train_sample_mask"] = False
+                tags[-1]["audio_rl_candidate_excluded"] = True
+                tags[-1]["audio_rl_exclusion_reason"] = extra_fields["audio_rl_exclusion_reason"]
             if audio_sequence_training and extra_fields.get("audio_opd_candidate_excluded", False):
                 # Only opted-in audio OPD profiles publish this marker.
                 # It must reach the trainer's existing row mask before any

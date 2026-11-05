@@ -9,6 +9,26 @@ from collections import defaultdict
 from torch.utils.data import Sampler
 
 
+def dataset_content_fingerprint(dataframe):
+    """Hash ordered, unformatted OPD rows independently of HF cache provenance.
+
+    HF fingerprints include filter closures and cache timestamps. Our prompt
+    filter captures OmegaConf parent links, so even trainer resume settings can
+    change that fingerprint without changing a single training row. OPD Parquet
+    rows contain JSON-compatible prompts, references, routing and audio paths.
+    Stream their canonical representation to also detect edits within a source
+    pool, which a hash of just source indices would miss.
+    """
+    digest = hashlib.sha256(b"verl.audio-opd.rows.v1\n")
+    for batch in dataframe.with_format(None).iter(batch_size=128):
+        columns = list(batch)
+        for values in zip(*(batch[column] for column in columns), strict=True):
+            row = dict(zip(columns, values, strict=True))
+            digest.update(json.dumps(row, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            digest.update(b"\n")
+    return digest.hexdigest()
+
+
 class AudioOPDQuotaSampler(Sampler):
     """Shuffle/cycle each source independently, keeping all state in the loader checkpoint.
 
@@ -52,6 +72,12 @@ class AudioOPDQuotaSampler(Sampler):
             "schedule": self.schedule,
             "batch_size": self.batch_size,
         }
+        self.legacy_identity = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        self.dataset_fingerprint = dataset_content_fingerprint(dataset.dataframe)
+        identity["fingerprint"] = self.dataset_fingerprint
+        # The quota list is shuffled from mapping insertion order. Keep that
+        # order in the identity to preserve exact continuation after a restart.
+        identity["quota_source_order"] = [list(phase["quotas"]) for phase in self.schedule]
         self.identity = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         self.rng = random.Random(0 if seed is None else seed)
         self.orders = {source: list(indices) for source, indices in self.groups.items()}
@@ -110,8 +136,11 @@ class AudioOPDQuotaSampler(Sampler):
     def state_dict(self):
         return copy.deepcopy(
             {
-                "version": 2,
+                "version": 3,
                 "identity": self.identity,
+                "dataset_fingerprint": self.dataset_fingerprint,
+                "schedule": self.schedule,
+                "batch_size": self.batch_size,
                 "rng": self.rng.getstate(),
                 "orders": self.orders,
                 "cursors": self.cursors,
@@ -123,8 +152,21 @@ class AudioOPDQuotaSampler(Sampler):
         )
 
     def load_state_dict(self, state):
-        if state.get("version") != 2 or state.get("identity") != self.identity:
-            raise ValueError("Cannot resume OPD sampler with different data, batch size or curriculum")
+        version = state.get("version")
+        expected_identity = {2: self.legacy_identity, 3: self.identity}.get(version)
+        if expected_identity is None or state.get("identity") != expected_identity:
+            detail = (
+                " Version-2 checkpoints also depend on the HF cache fingerprint; "
+                "use scripts/audio_data/migrate_opd_sampler_checkpoint.py with the original filtered Arrow dataset "
+                "to convert them without resetting sampling."
+                if version == 2
+                else ""
+            )
+            raise ValueError(
+                "Cannot resume OPD sampler with different data, batch size or curriculum "
+                f"(version={version}, saved_identity={state.get('identity')}, current_identity={expected_identity})."
+                + detail
+            )
         self.rng.setstate(state["rng"])
         self.orders = copy.deepcopy(state["orders"])
         self.cursors = copy.deepcopy(state["cursors"])

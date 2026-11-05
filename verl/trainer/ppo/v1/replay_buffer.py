@@ -70,6 +70,12 @@ def rollout_diagnostics(extra) -> dict:
             "audio_response_cap", "audio_last_token_id", "audio_native_finish_reason", "audio_native_stop_reason",
             "audio_response_has_eos", "audio_student_truncated",
         })
+    if values.get("audio_rl_candidate_excluded", False) in (1, True):
+        exact.update({
+            "audio_rl_candidate_excluded", "audio_rl_exclusion_reason", "audio_response_tokens",
+            "audio_response_cap", "audio_last_token_id", "audio_native_finish_reason", "audio_native_stop_reason",
+            "audio_response_has_eos", "audio_rl_response_truncated",
+        })
     prefixes = ("edit_diagnostics_", "command_evidence_", "trajectory_", "partial_hidden_reward_", "repeat_reward_", "tool_repeat_", "thinking_repeat_", "observed_infrastructure_failure",
                 "private_evaluator_", "hidden_test_count", "hidden_test_commands_", "hidden_tests_total_", "hidden_tests_passed_",
                 "oom_", "public_verification_", "public_patch_", "public_hidden_workspace_", "final_patch_")

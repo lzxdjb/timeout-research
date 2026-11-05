@@ -1314,6 +1314,11 @@ class PPOTrainer(ABC):
         elif os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
+            if self.config.data.get("opd_source_mix", None):
+                # Validate the lazily restored sampler before initial validation,
+                # which can take hours. OPD uses zero workers; creating this
+                # iterator restores state without consuming a training prompt.
+                self.train_dataloader_it = iter(self.train_dataloader)
         else:
             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -2881,9 +2886,13 @@ class PPOTrainer(ABC):
             self._update_v1_timeout_predictor(data, prediction_targets)
 
         evaluator_mask = _v1_unverified_sample_mask_from_tags(batch.keys, batch.tags)
-        if unverified_trajectory_ratio_threshold("train") is not None or not bool(evaluator_mask.all()):
-            data.batch["grpo_valid_sample_mask"] = evaluator_mask
+        from verl.trainer.ppo.v1.audio_rl import audio_rl_grpo_valid_mask
+
+        grpo_mask = audio_rl_grpo_valid_mask(self.config, batch.keys, batch.tags, evaluator_mask)
+        if unverified_trajectory_ratio_threshold("train") is not None or not bool(grpo_mask.all()):
+            data.batch["grpo_valid_sample_mask"] = grpo_mask
         exclusion_codes |= (~evaluator_mask.to(exclusion_codes.device)).long() * 32
+        exclusion_codes |= (evaluator_mask & ~grpo_mask).to(exclusion_codes.device).long() * 64
 
         self._apply_v1_task_filter(data, extra_fields, metrics, direct_fields)
         task_excluded = data.non_tensor_batch.get("task_filter_excluded")
@@ -2948,7 +2957,7 @@ class PPOTrainer(ABC):
                     code = int(exclusion_codes[i])
                     reasons = [reason for bit, reason in ((1, "padding"), (2, "completion_ratio_cutoff"),
                         (4, "tag_mask"), (8, "timeout_prediction"), (16, "infrastructure_filter"),
-                        (32, "evaluator_uncertainty")) if code & bit]
+                        (32, "evaluator_uncertainty"), (64, "incomplete_audio")) if code & bit]
                     if not bool(active[i]) and not reasons:
                         reasons = ["infrastructure_or_empty_response"]
                     extra.update(train_exclusion_code=code, train_exclusion_reason=",".join(reasons) or "none",
@@ -3373,6 +3382,12 @@ class PPOTrainer(ABC):
             )["train_sample_mask"].tolist()
         except (KeyError, TypeError, ValueError):
             mask_values = _v1_train_sample_mask_from_tags(rollout_batch.keys, rollout_batch.tags).tolist()
+        from verl.trainer.ppo.v1.audio_rl import audio_rl_source_metrics
+
+        sampler = getattr(getattr(self, "train_dataloader", None), "sampler", None)
+        metrics.update(audio_rl_source_metrics(
+            self.config, rollout_batch.keys, rollout_batch.tags, mask_values, getattr(sampler, "draw_counts", {})
+        ))
         metrics.update(
             compute_v1_trajectory_debug_metrics(
                 batch_keys=rollout_batch.keys,

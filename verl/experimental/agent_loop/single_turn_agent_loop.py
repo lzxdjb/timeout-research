@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.utils.audio_rl import audio_rl_for_sample
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -41,7 +42,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
         messages = list(kwargs["raw_prompt"])
         from verl.trainer.distillation.config_utils import audio_teacher_for_sample
 
-        audio_teacher = audio_teacher_for_sample(getattr(self, "config", None), kwargs)
+        audio_rl = audio_rl_for_sample(getattr(self, "config", None), kwargs)
+        audio_teacher = (
+            None if audio_rl is not None else audio_teacher_for_sample(getattr(self, "config", None), kwargs)
+        )
         response_length = self.response_length
         if audio_teacher is not None:
             # This loop instance belongs to one trajectory; do not mutate shared data config.
@@ -51,6 +55,17 @@ class SingleTurnAgentLoop(AgentLoopBase):
             sampling_params["max_tokens"] = min(
                 int(sampling_params.get("max_tokens", response_length)), response_length
             )
+        elif audio_rl is not None:
+            self.apply_chat_template_kwargs = {
+                **self.apply_chat_template_kwargs,
+                "enable_thinking": audio_rl["enable_thinking"],
+            }
+            response_length = min(response_length, audio_rl["response_length"])
+            sampling_params = dict(sampling_params)
+            response_length = min(int(sampling_params.get("max_tokens", response_length)), response_length)
+            if response_length <= 0:
+                raise ValueError("Audio RL generation max_tokens must be positive")
+            sampling_params["max_tokens"] = response_length
 
         # 1. extract multimodal inputs from messages
         multi_modal_data = await self.process_multi_modal_info(messages)
@@ -103,6 +118,14 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     audio_student_response_tokens=len(output.token_ids),
                     audio_student_stop_reason=output.stop_reason,
                 )
+        elif audio_rl is not None:
+            output.extra_fields.update(
+                audio_response_cap=response_length,
+                audio_response_tokens=len(output.token_ids),
+                audio_rl_response_truncated=len(output.token_ids) > response_length,
+                audio_rl_finish_reason=output.extra_fields.get("generation_finish_reason"),
+                audio_rl_stop_reason=output.stop_reason,
+            )
 
         if use_continuous_token:
             merge_result, response_mask, response_logprobs = await self.ct_merge_assistant_token(

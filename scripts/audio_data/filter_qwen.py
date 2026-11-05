@@ -14,19 +14,22 @@ import copy
 import hashlib
 import io
 import json
+import math
 import os
+import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections import Counter, deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .common import read_jsonl, record_fingerprint, stable_hash, write_jsonl
+from .progress import Progress
 
 PROMPT_VERSION = "audio-grounded-review-v1"
 BLIND_PROMPT = """Listen to the attached audio and answer the task using only audible evidence.
@@ -480,14 +483,30 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--max-audio-bytes", type=int, default=25 * 1024 * 1024)
     parser.add_argument("--max-duration", type=float, default=120.0)
+    parser.add_argument("--progress", choices=("auto", "on", "off"), default="auto")
+    parser.add_argument("--progress-interval", type=float, default=2.0, help="Seconds between progress heartbeats")
+    parser.add_argument("--checkpoint-dir", type=Path, help="Persist completed reviews here and resume on rerun")
+    parser.add_argument(
+        "--checkpoint-interval", type=int, default=1, help="Commit every N completed reviews (default: 1)"
+    )
+    parser.add_argument(
+        "--reset-checkpoint", action="store_true", help="Discard checkpoint state; retain reviewer cache"
+    )
     args = parser.parse_args(argv)
     if args.concurrency < 1 or args.retries < 0 or args.max_samples < 0:
         parser.error("concurrency must be positive; retries and max-samples must be nonnegative")
-    if min(args.timeout, args.max_duration, args.max_audio_bytes, args.max_tokens) <= 0:
-        parser.error("timeout, limits, and max-tokens must be positive")
+    if any(
+        not math.isfinite(value) or value <= 0
+        for value in (args.timeout, args.max_duration, args.max_audio_bytes, args.max_tokens, args.progress_interval)
+    ):
+        parser.error("timeout, limits, max-tokens, and progress-interval must be finite and positive")
+    if args.checkpoint_interval < 1:
+        parser.error("checkpoint-interval must be positive")
+    if args.reset_checkpoint and args.checkpoint_dir is None:
+        parser.error("reset-checkpoint requires checkpoint-dir")
     report_path = args.report or args.output.with_suffix(".report.json")
-    if report_path.resolve() in {args.input.resolve(), args.output.resolve()}:
-        parser.error("report must differ from input and output manifests")
+    if len({args.input.resolve(), args.output.resolve(), report_path.resolve()}) != 3:
+        parser.error("input, output, and report must differ")
     config = ReviewConfig(
         base_url=args.base_url,
         model=args.model,
@@ -500,6 +519,17 @@ def main(argv: list[str] | None = None) -> None:
         max_duration=args.max_duration,
         audio_base=args.input.resolve().parent,
     )
+    from .audit_checkpoint import discover_reviewer, run_audit
+
+    if args.checkpoint_dir is not None:
+        report = run_audit(sys.modules[__name__], args, config, report_path)
+        print(
+            json.dumps(
+                {key: report[key] for key in ("records", "selected", "qwen_decisions")} | {"report": str(report_path)},
+                sort_keys=True,
+            )
+        )
+        return
     reviewer = None
     counts = Counter()
     decisions = Counter()
@@ -508,7 +538,13 @@ def main(argv: list[str] | None = None) -> None:
 
     def finish(entry):
         item, selected = entry
-        result = item.result() if isinstance(item, Future) else item
+        if isinstance(item, Future):
+            while not item.done():
+                wait([item], timeout=args.progress_interval)
+                refresh()
+            result = item.result()
+        else:
+            result = item
         counts["records"] += 1
         stage = result.get("qc", {}).get("qwen", {})
         decisions[stage.get("decision", "not_reviewed")] += 1
@@ -517,7 +553,16 @@ def main(argv: list[str] | None = None) -> None:
             counts["review_errors"] += any(
                 reason.startswith(("review_failed:", "model_discovery_failed:")) for reason in stage.get("reasons", [])
             )
+        bar.update()
+        refresh()
         return result
+
+    def refresh():
+        bar.label = (
+            f"Qwen audit selected={counts['selected']} cache_hits={counts['cache_hits']} "
+            f"errors={counts['review_errors']} concurrency={args.concurrency}"
+        )
+        bar.refresh()
 
     def reviewed_records():
         nonlocal reviewer
@@ -528,7 +573,9 @@ def main(argv: list[str] | None = None) -> None:
                 selected = eligible and counts["selected"] < args.max_samples
                 if selected:
                     if reviewer is None:
-                        reviewer = QwenReviewer(config)
+                        reviewer = discover_reviewer(
+                            sys.modules[__name__], config, progress=args.progress, interval=args.progress_interval
+                        )
                     counts["selected"] += 1
                     item = executor.submit(reviewer.review, record)
                 elif eligible:
@@ -545,7 +592,8 @@ def main(argv: list[str] | None = None) -> None:
             while pending:
                 yield finish(pending.popleft())
 
-    write_jsonl(args.output, reviewed_records())
+    with Progress("Qwen audit", mode=args.progress, interval=args.progress_interval) as bar:
+        write_jsonl(args.output, reviewed_records())
     report = {
         "schema_version": 1,
         "input": str(args.input),
