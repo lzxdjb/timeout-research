@@ -1,0 +1,5 @@
+# Local SSH identities must not be committed.
+id_*
+*.pem
+*.key
+.secrets/

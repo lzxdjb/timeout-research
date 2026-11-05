@@ -1,0 +1,12 @@
+# Add this block to /Users/lzx/.ssh/config on your local computer.
+# Replace DLC_IP_FROM_LOG with the DLC container IP printed in its task log.
+# AtlantaDSW must already be configured and able to reach the DLC container.
+Host AtlantaDLC-LZX
+  HostName DLC_IP_FROM_LOG
+  Port 2222
+  User root
+  IdentityFile /Users/lzx/.ssh/id_rsa
+  IdentitiesOnly yes
+  ProxyJump AtlantaDSW
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
